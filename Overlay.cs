@@ -34,71 +34,121 @@ public sealed class Overlay
         _gui = gui; _clientState = clientState; _targets = targets;
     }
 
+    /// <summary>
+    /// Draws every track's segments (the parts that are actually output are bright, hidden parts are dimmed),
+    /// a marker at every hard cut, each track's node frustums, and the playheads.
+    /// </summary>
+    /// <param name="previewFrame">Our playhead (timeline frame), or null.</param>
+    /// <param name="externalFrame">XAT-sync playhead (timeline frame), or null.</param>
     /// <param name="selected">Node to highlight (reference compare).</param>
-    public void Draw(CameraPath? path, IReadOnlyList<Keyframe> keys, float? externalPlayhead, Keyframe? selected = null)
+    public void Draw(ShotComposer? comp, CamTimeline tl, float? previewFrame, float? externalFrame, Keyframe? selected = null)
     {
         if(!Enabled || !_clientState.IsGPosing) return;
         if(!CameraCapture.TryGetBase(_targets, out var basePos, out var baseRot, out _, out _)) return;
-        if(selected != null) SelectedKey = -1;
+        // a composer built for a different track list (track just added / removed) is stale for this frame
+        if(comp != null && comp.TrackCount != tl.Tracks.Count) comp = null;
 
         var dl = ImGui.GetBackgroundDrawList();
         Vector3 ToWorld(Vector3 rel) => Vector3.Transform(rel, baseRot) + basePos;
 
-        // ---- path polyline ----
-        if(ShowPath && path != null)
+        // ---- paths, per track / per segment ----
+        if(ShowPath && comp != null)
         {
-            const float fps = 30f;
-            int n = Math.Max(2, (int)(path.Duration * fps) + 1);
-            var pts = new Vector3[n];
-            for(int i = 0; i < n; i++) pts[i] = ToWorld(path.Sample(MathF.Min(i / fps, path.Duration)).Pos);
-
+            float step = MathF.Max(1f, tl.Fps / 30f); // ~30 samples per second
             float maxSpeed = 1e-3f;
-            var speeds = new float[n];
-            for(int i = 1; i < n; i++) { speeds[i] = Vector3.Distance(pts[i - 1], pts[i]) * fps; maxSpeed = MathF.Max(maxSpeed, speeds[i]); }
+            for(int t = 0; t < comp.TrackCount; t++)
+                if(comp.SequenceOf(t) is { } seq)
+                    for(float f = seq.Start; f < seq.End; f += step)
+                        if(seq.SpeedAt(f) is float v) maxSpeed = MathF.Max(maxSpeed, v);
 
-            for(int i = 1; i < n; i++)
+            for(int t = comp.TrackCount - 1; t >= 0; t--) // lower tracks first, top track drawn last
             {
-                uint col = SpeedColors ? SpeedColor(speeds[i] / maxSpeed) : 0xFF33DDFF;
-                Line(dl, pts[i - 1], pts[i], col, 2.5f);
+                if(comp.SequenceOf(t) is not { } seq) continue;
+                bool trackActive = comp.IsActive(t);
+                foreach(var seg in seq.Segments)
+                {
+                    if(seg.Path == null) continue;
+                    Vector3? prev = null;
+                    for(float f = seg.Start; ; f += step)
+                    {
+                        bool last = f >= seg.End;
+                        if(last) f = seg.End;
+                        var p = ToWorld(seg.SampleAt(f).Pos);
+                        if(prev is Vector3 pv)
+                        {
+                            bool shown = trackActive && comp.TrackAt(f - step * 0.5f) == t;
+                            float speed = Vector3.Distance(pv, p) / (step / tl.Fps);
+                            uint col = SpeedColors ? SpeedColor(speed / maxSpeed) : tl.Tracks[t].Color;
+                            if(!shown) col = Dim(col);
+                            Line(dl, pv, p, col, shown ? 2.5f : 1.2f);
+                        }
+                        prev = p;
+                        if(last) break;
+                    }
+                }
             }
 
-            // tick marks every second
-            for(int sec = 1; sec < path.Duration; sec++)
-                Dot(dl, ToWorld(path.Sample(sec).Pos), 0xFFFFFFFF, 2.5f);
+            // a marker at every cut: outgoing pose -> incoming pose
+            foreach(int cf in comp.CutFrames)
+            {
+                var a = ToWorld(comp.Sample(cf - 1).Pos);
+                var b = ToWorld(comp.Sample(cf).Pos);
+                DashedLine(dl, a, b, 0xC0FFFFFF);
+                if(_gui.WorldToScreen(b, out var sp) && IsSane(sp))
+                {
+                    dl.AddCircle(sp, 7, 0xFFFFFFFF, 12, 2f);
+                    dl.AddText(sp + new Vector2(9, 2), 0xFFFFFFFF, $"切 F{cf}");
+                }
+            }
         }
 
-        // ---- key cameras ----
+        // ---- key cameras, per track ----
         if(ShowFrustums)
         {
-            for(int i = 0; i < keys.Count; i++)
+            for(int t = 0; t < tl.Tracks.Count; t++)
             {
-                var k = keys[i];
-                bool sel = i == SelectedKey || (selected != null && ReferenceEquals(k, selected));
-                uint col = sel ? 0xFF00FFFF : 0xFFFFAA33;
-                DrawFrustum(dl, ToWorld(k.Pos), Quaternion.Normalize(baseRot * k.Rot), k.Fov, col, sel ? 2.5f : 1.5f);
-                if(ShowLabels && _gui.WorldToScreen(ToWorld(k.Pos), out var sp))
+                var track = tl.Tracks[t];
+                bool active = comp?.IsActive(t) ?? true;
+                for(int i = 0; i < track.Keys.Count; i++)
                 {
-                    var label = $"#{i + 1}  F{k.Frame}";
-                    dl.AddText(sp + new Vector2(8, -18), 0xFF000000, label);
-                    dl.AddText(sp + new Vector2(7, -19), col, label);
+                    var k = track.Keys[i];
+                    bool sel = selected != null && ReferenceEquals(k, selected);
+                    uint col = sel ? 0xFF00FFFF : active ? track.Color : Dim(track.Color);
+                    DrawFrustum(dl, ToWorld(k.Pos), Quaternion.Normalize(baseRot * k.Rot), k.Fov, col, sel ? 2.5f : 1.5f);
+                    if(ShowLabels && _gui.WorldToScreen(ToWorld(k.Pos), out var sp) && IsSane(sp))
+                    {
+                        var label = tl.Tracks.Count > 1 ? $"{track.Name} #{i + 1}  F{k.Frame}" : $"#{i + 1}  F{k.Frame}";
+                        if(k.CutIn) label += " ✂";
+                        dl.AddText(sp + new Vector2(8, -18), 0xFF000000, label);
+                        dl.AddText(sp + new Vector2(7, -19), col, label);
+                    }
                 }
             }
         }
 
         // ---- playheads ----
-        if(path != null)
+        if(comp != null)
         {
-            if(PreviewTime is float pt)
+            if(previewFrame is float pf)
             {
-                var s = path.Sample(pt);
+                var s = comp.Sample(pf);
                 DrawFrustum(dl, ToWorld(s.Pos), Quaternion.Normalize(baseRot * s.Rot), s.Fov, 0xFF55FF55, 3f);
             }
-            if(externalPlayhead is float et)
+            if(externalFrame is float ef)
             {
-                var s = path.Sample(et);
+                var s = comp.Sample(ef);
                 DrawFrustum(dl, ToWorld(s.Pos), Quaternion.Normalize(baseRot * s.Rot), s.Fov, 0xFFFF55FF, 2f);
             }
         }
+    }
+
+    private static uint Dim(uint abgr) => (abgr & 0x00FFFFFF) | 0x50000000;
+
+    private void DashedLine(ImDrawListPtr dl, Vector3 a, Vector3 b, uint col)
+    {
+        const int n = 12;
+        for(int i = 0; i < n; i += 2)
+            Line(dl, Vector3.Lerp(a, b, i / (float)n), Vector3.Lerp(a, b, (i + 1) / (float)n), col, 1.5f);
     }
 
     private void DrawFrustum(ImDrawListPtr dl, Vector3 eye, Quaternion worldRot, float fov, uint col, float thick)

@@ -203,6 +203,46 @@ public sealed class BrioBridge
 
     public bool TimelineLoop => Get(Get(Get(_config, "Configuration"), "Timeline"), "Loop") is true;
 
+    /// <summary>
+    /// Freezes / unfreezes the GPose target's animation through Brio's ActionTimelineCapability so Brio's own
+    /// speed hook keeps it at that speed (needed when we scrub the animation ourselves).
+    /// </summary>
+    public bool SetTargetAnimationFrozen(nint gameObjectAddress, bool frozen)
+        => SetTargetAnimationSpeed(gameObjectAddress, frozen ? 0f : null);
+
+    /// <summary>
+    /// Sets the GPose target's overall animation speed through Brio (same as Brio's speed / freeze controls).
+    /// <paramref name="speed"/> null = remove the override (back to the game's own speed).
+    /// </summary>
+    public bool SetTargetAnimationSpeed(nint gameObjectAddress, float? speed)
+    {
+        if(_asm == null) return false;
+        var em = GetService(_asm, _asm.GetType("Brio.Entities.EntityManager"));
+        var tCap = _asm.GetType("Brio.Capabilities.Actor.ActionTimelineCapability");
+        if(em == null || tCap == null) return false;
+        if(Call(em, "TryGetAllActors") is not IEnumerable actors) return false;
+
+        foreach(var actor in actors)
+        {
+            if(Get(actor, "GameObject") is not Dalamud.Game.ClientState.Objects.Types.IGameObject go || go.Address != gameObjectAddress)
+                continue;
+            if(Get(actor, "Capabilities") is not IEnumerable caps) return false;
+            var cap = caps.Cast<object>().FirstOrDefault(c => tCap.IsInstanceOfType(c));
+            if(cap == null) return false;
+            if(speed is float s) Call(cap, "SetOverallSpeedOverride", s);
+            else Call(cap, "ResetOverallSpeedOverride");
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>Plays / pauses Brio's Vivacity timeline (TimelineService.TogglePlay only flips the state).</summary>
+    public void SetTimelinePlaying(bool playing)
+    {
+        if(_timeline == null) return;
+        if(TimelineIsPlaying != playing) Call(_timeline, "TogglePlay");
+    }
+
     /// <summary>Moves Brio's Vivacity playhead (fractional frames allowed) and applies it to all timeline hosts.</summary>
     public void SetTimelineTime(double frame)
     {
@@ -324,15 +364,17 @@ public sealed class BrioBridge
 
     public void ClearTrack(FreeCam cam) => GetTrackKeyframes(cam)?.Clear();
 
-    public readonly record struct FreeCamKey(int Frame, Vector3 Position, float Yaw, float Pitch, float Roll, float FovOffset);
+    /// <param name="Step">Hard cut: Brio holds the previous key's value until this frame, then jumps (InterpolationMode.Step).</param>
+    public readonly record struct FreeCamKey(int Frame, Vector3 Position, float Yaw, float Pitch, float Roll, float FovOffset, bool Step = false);
 
-    /// <summary>Writes free-cam keyframes into the camera's timeline track (linear: Bezier with straight handles).</summary>
+    /// <summary>Writes free-cam keyframes into the camera's timeline track (linear: Bezier with straight handles; Step for cuts).</summary>
     public void AddCameraKeys(FreeCam cam, IEnumerable<FreeCamKey> keys)
     {
         var track = Get(cam.Capability, "_track") ?? throw new InvalidOperationException("找不到相机轨道");
         var add = _tTrack!.GetMethod("AddCameraKeyframe", Inst) ?? throw new InvalidOperationException("找不到 AddCameraKeyframe");
         var all = Enum.Parse(_tCamComponents!, "All");
         var bezier = Enum.Parse(_tInterp!, "Bezier");
+        var step = Enum.Parse(_tInterp!, "Step");
         var vc = Get(cam.Entity, "VirtualCamera");
 
         // keep lens fields Brio does not use for free cams as they currently are
@@ -351,9 +393,11 @@ public sealed class BrioBridge
             SetStructField(ref kf, "FoV", k.FovOffset);
             SetStructField(ref kf, "PivotRotation", k.Roll);
 
-            var tk = add.Invoke(track, [k.Frame, kf, all, bezier]);
+            var tk = add.Invoke(track, [k.Frame, kf, all, k.Step ? step : bezier]);
             if(tk != null)
             {
+                // AddCameraKeyframe merges into an existing key without changing its mode, so set it explicitly
+                Set(tk, "InterpolationMode", k.Step ? step : bezier);
                 // straight easing handles = linear interpolation between dense samples
                 Set(tk, "P1", new Vector2(1f / 3f, 1f / 3f));
                 Set(tk, "P2", new Vector2(2f / 3f, 2f / 3f));

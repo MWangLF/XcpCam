@@ -270,6 +270,136 @@ bool UnitAndHemi(List<XcpFrame> f)
     Check(maxDev < 0.25f && maxAng < 0.15f, "insert-from-path: rest of the path stays close to the original");
 }
 
+// ---------- 6d) Hard cuts within one track (plan 1) ----------
+{
+    var tl = new CamTimeline { Length = 600 };
+    // shot A: frames 0..60 moving; shot B starts at 61 (1 frame later) -> auto cut
+    tl.Keys.Add(new Keyframe { Frame = 0, Pos = new(0, 1.5f, 3), Rot = Yaw(0), Fov = 0.78f });
+    tl.Keys.Add(new Keyframe { Frame = 60, Pos = new(3, 1.5f, 0), Rot = Yaw(1.5f), Fov = 0.78f });
+    var b0 = new Keyframe { Frame = 61, Pos = new(-5, 2, -5), Rot = Yaw(4f), Fov = 0.6f };
+    tl.Keys.Add(b0);
+    tl.Keys.Add(new Keyframe { Frame = 120, Pos = new(-6, 2, 2), Rot = Yaw(5f), Fov = 0.6f });
+    tl.RefreshAutoCuts();
+    Check(b0.CutIn && b0.CutAuto && !tl.Keys[1].CutIn, "cut: node 1 frame after predecessor auto-enables CutIn");
+
+    var comp = ShotComposer.Create(tl, new PathSettings())!;
+    var at60 = comp.Sample(60); var at61 = comp.Sample(61);
+    Check(Vector3.Distance(at60.Pos, new Vector3(3, 1.5f, 0)) < 1e-3f, "cut: frame before cut = end of shot A");
+    Check(Vector3.Distance(at61.Pos, b0.Pos) < 1e-3f && MathF.Abs(MathF.Abs(Quaternion.Dot(at61.Rot, b0.Rot)) - 1) < 1e-4f,
+        "cut: cut frame = start of shot B (exact pose)");
+    Check(comp.CutFrames.Count == 1 && comp.CutFrames[0] == 61, $"cut: cut frames [{string.Join(",", comp.CutFrames)}]");
+
+    // shot A unaffected by shot B: compare with a track that only has shot A
+    // (A is not the last segment, so it has no end-ease — mirror that in the reference)
+    var tlA = new CamTimeline { Length = 600 };
+    tlA.Keys.Add(tl.Keys[0].Clone()); tlA.Keys.Add(tl.Keys[1].Clone());
+    var compA = ShotComposer.Create(tlA, new PathSettings { EaseEnd = false })!;
+    float devA = 0;
+    for(int f = 0; f <= 60; f++) devA = MathF.Max(devA, Vector3.Distance(comp.Sample(f).Pos, compA.Sample(f).Pos));
+    Check(devA < 1e-4f, $"cut: shot A independent of shot B (max dev {devA:0.0e0})");
+
+    // and moving shot B's nodes does not change shot A at all
+    var before = Enumerable.Range(0, 61).Select(f => comp.Sample(f).Pos).ToArray();
+    tl.Keys[3].Pos += new Vector3(10, 5, -7);
+    b0.Pos += new Vector3(-3, 1, 4);
+    var compMoved = ShotComposer.Create(tl, new PathSettings())!;
+    float devMoved = Enumerable.Range(0, 61).Max(f => Vector3.Distance(before[f], compMoved.Sample(f).Pos));
+    Check(devMoved < 1e-6f, $"cut: editing shot B leaves shot A untouched (max dev {devMoved:0.0e0})");
+    b0.Pos -= new Vector3(-3, 1, 4);
+    tl.Keys[3].Pos -= new Vector3(10, 5, -7);
+
+    // manual off survives while gap stays 1; moving away clears auto, moving back re-enables
+    b0.CutIn = false; b0.CutAuto = false;
+    tl.RefreshAutoCuts();
+    Check(!b0.CutIn, "cut: manual off is respected");
+    b0.Frame = 70; tl.RefreshAutoCuts();
+    b0.Frame = 61; tl.RefreshAutoCuts();
+    Check(b0.CutIn, "cut: moving back to +1 frame re-enables");
+
+    // fps change keeps the cut even though the gap becomes 2
+    tl.SetFps(60); tl.RefreshAutoCuts();
+    Check(b0.CutIn && b0.Frame - tl.Keys[1].Frame == 2, $"cut: survives 30->60fps (gap {b0.Frame - tl.Keys[1].Frame})");
+    tl.SetFps(30); tl.RefreshAutoCuts();
+    Check(b0.CutIn, "cut: survives 60->30fps");
+
+    // .xcp around the cut
+    var comp30 = ShotComposer.Create(tl, new PathSettings())!;
+    var xcp = comp30.BakeXcp(30);
+    Check(Vector3.Distance(xcp[60].Pos, new Vector3(3, 1.5f, 0)) < 1e-3f && Vector3.Distance(xcp[61].Pos, b0.Pos) < 1e-3f,
+        "cut: .xcp frames either side of the cut are A-end / B-start");
+
+    // bake plan at 60fps: key before the cut, Step key on the cut
+    var bk = comp30.BakeForTimeline(60, 10);
+    var stepKeys = bk.Where(k => k.Step).ToList();
+    Check(stepKeys.Count == 1 && stepKeys[0].Frame == 122 && bk.Any(k => k.Frame == 121 && !k.Step),
+        $"bake: Step key at cut ({string.Join(",", stepKeys.Select(k => k.Frame))}) and key before it");
+    Check(Vector3.Distance(bk.First(k => k.Frame == 121).Pose.Pos, new Vector3(3, 1.5f, 0)) < 1e-3f
+        && Vector3.Distance(stepKeys[0].Pose.Pos, b0.Pos) < 1e-3f, "bake: poses either side of the cut");
+}
+
+// ---------- 6e) Multiple tracks, top wins (plan 2) ----------
+{
+    var tl = new CamTimeline { Length = 600 };
+    var lower = tl.ActiveTrack;
+    lower.Keys.Add(new Keyframe { Frame = 0, Pos = new(0, 1, 3), Rot = Yaw(0), Fov = 0.78f });
+    lower.Keys.Add(new Keyframe { Frame = 200, Pos = new(3, 1, 0), Rot = Yaw(1.5f), Fov = 0.78f });
+    var upper = tl.AddTrack();
+    Check(tl.Tracks[0] == upper && tl.ActiveTrack == upper, "tracks: new track goes on top and becomes active");
+    upper.Keys.Add(new Keyframe { Frame = 80, Pos = new(-4, 2, -4), Rot = Yaw(3f), Fov = 0.6f });
+    upper.Keys.Add(new Keyframe { Frame = 120, Pos = new(-5, 2, -2), Rot = Yaw(3.5f), Fov = 0.6f });
+
+    var c = ShotComposer.Create(tl, new PathSettings())!;
+    Check(c.TrackAt(50) == 1 && c.TrackAt(80) == 0 && c.TrackAt(100) == 0 && c.TrackAt(121) == 1,
+        $"tracks: top wins where it covers ({c.TrackAt(50)},{c.TrackAt(80)},{c.TrackAt(100)},{c.TrackAt(121)})");
+    Check(c.CutFrames.SequenceEqual(new[] { 80, 121 }), $"tracks: cuts at track switches [{string.Join(",", c.CutFrames)}]");
+    Check(Vector3.Distance(c.Sample(80).Pos, new Vector3(-4, 2, -4)) < 1e-3f, "tracks: switch lands on the upper shot's first pose");
+
+    var lowerOnly = ShotSequence.Create(lower.Keys, new PathSettings(), 30)!;
+    Check(Vector3.Distance(c.Sample(150).Pos, lowerOnly.Sample(150).pose.Pos) < 1e-4f, "tracks: lower track continues on its own timing");
+
+    upper.Muted = true;
+    var cm = ShotComposer.Create(tl, new PathSettings())!;
+    Check(cm.CutFrames.Count == 0 && cm.TrackAt(100) == 1, "tracks: mute removes the upper track");
+    upper.Muted = false; lower.Solo = true;
+    var cs = ShotComposer.Create(tl, new PathSettings())!;
+    Check(cs.TrackAt(100) == 1 && cs.CutFrames.Count == 0, "tracks: solo shows only the soloed track");
+    lower.Solo = false;
+
+    // gap: no coverage between 120 and 200 if the lower track ends at 60
+    lower.Keys[1].Frame = 60;
+    var cg = ShotComposer.Create(tl, new PathSettings())!;
+    var gapPose = cg.Sample(150);
+    Check(Vector3.Distance(gapPose.Pos, new Vector3(-5, 2, -2)) < 1e-3f && cg.TrackAt(150) == 0, "tracks: gap holds the last shown shot");
+    Check(Vector3.Distance(cg.Sample(-10).Pos, new Vector3(0, 1, 3)) < 1e-4f, "tracks: before first coverage uses earliest shot");
+
+    // undo restores all tracks
+    tl.Snapshot();
+    tl.RemoveTrack(0);
+    Check(tl.Tracks.Count == 1, "tracks: remove");
+    tl.Undo();
+    Check(tl.Tracks.Count == 2 && tl.Tracks[0].Keys.Count == 2 && tl.Tracks[1].Keys.Count == 2, "tracks: undo restores all tracks");
+
+    // regression: removing a track leaves the previous composer with more tracks than the timeline;
+    // the composer must expose that so callers drop it (TimelineWidget / Overlay check TrackCount)
+    var stale = ShotComposer.Create(tl, new PathSettings())!;
+    tl.Snapshot();
+    tl.RemoveTrack(0);
+    Check(stale.TrackCount == 2 && tl.Tracks.Count == 1, "tracks: stale composer detectable after removing a track");
+    var fresh = ShotComposer.Create(tl, new PathSettings());
+    Check(fresh != null && fresh.TrackCount == 1 && fresh.Runs.All(r => r.Track == 0), "tracks: rebuilt composer matches the new track list");
+    // removing every key of the last track must not crash either
+    tl.Tracks[0].Keys.Clear();
+    Check(ShotComposer.Create(tl, new PathSettings()) == null, "tracks: empty timeline gives no composer (no crash)");
+    tl.Undo();
+
+    // move track down: priority flips
+    tl.MoveTrack(0, +1);
+    lower = tl.Tracks[0];
+    lower.Keys[1].Frame = 200;
+    var cf = ShotComposer.Create(tl, new PathSettings())!;
+    Check(cf.TrackAt(100) == 0 && cf.CutFrames.Count == 0, "tracks: moving a track down changes priority");
+}
+
 // ---------- 6c) Gizmo math: world matrix -> decompose -> relative -> world ----------
 {
     float worstG = 0;

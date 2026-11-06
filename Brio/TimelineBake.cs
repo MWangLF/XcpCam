@@ -2,22 +2,24 @@ using Dalamud.Plugin.Services;
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Linq;
 using System.Numerics;
 using XcpCam.Core;
 
 namespace XcpCam.BrioInterop;
 
 /// <summary>
-/// Mode 2: bake the path into a Brio free camera's Vivacity timeline track, so the timeline itself drives the
-/// camera (scrub / pause / loop all stay in sync). The relative path is placed in the world using the current
-/// GPose target, then converted to Brio free-cam yaw / pitch / roll (see <see cref="FreeCamMath"/>).
+/// Mode 2: bake the composed camera (all tracks, hard cuts included) into a Brio free camera's Vivacity timeline
+/// track, so the timeline itself drives the camera (scrub / pause / loop all stay in sync). Cuts become
+/// InterpolationMode.Step keys with a key on the frame before, so they are instantaneous in Brio.
+/// The relative path is placed in the world using the current GPose target, then converted to Brio free-cam
+/// yaw / pitch / roll (see <see cref="FreeCamMath"/>).
 /// </summary>
 public sealed class TimelineBake
 {
     private readonly BrioBridge _brio;
     private readonly IPluginLog _log;
 
-    public int StartFrame;
     public int StepFrames = 1;
     public bool ClearExisting = true;
     /// <summary>Base vertical FoV the free camera's FoV offset is added to (Brio default 0.78).</summary>
@@ -32,27 +34,33 @@ public sealed class TimelineBake
 
     public TimelineBake(BrioBridge brio, IPluginLog log) { _brio = brio; _log = log; }
 
-    public void Bake(BrioBridge.FreeCam cam, CameraPath path, Vector3 basePos, Quaternion baseRot)
+    /// <summary>Converts composed bake keys (relative poses) into Brio free-cam keys in world space.</summary>
+    public List<BrioBridge.FreeCamKey> ToFreeCamKeys(IReadOnlyList<BakeKey> keys, Vector3 basePos, Quaternion baseRot, out float maxPitch)
     {
-        int fps = _brio.TimelineFps;
-        int step = Math.Max(1, StepFrames);
-        int totalFrames = Math.Max(1, (int)MathF.Round(path.Duration * fps));
-
-        var keys = new List<BrioBridge.FreeCamKey>();
+        var list = new List<BrioBridge.FreeCamKey>(keys.Count);
         float? prevYaw = null;
-        float maxPitch = 0;
-        for(int f = 0; ; f += step)
+        maxPitch = 0;
+        foreach(var k in keys)
         {
-            if(f > totalFrames) f = totalFrames;
-            var s = path.Sample(f / (float)fps);
-            var worldPos = Vector3.Transform(s.Pos, baseRot) + basePos;
-            var worldRot = Quaternion.Normalize(baseRot * s.Rot);
-            var (yaw, pitch, roll) = FreeCamMath.FromWorldRotation(worldRot, prevYaw);
+            var worldPos = Vector3.Transform(k.Pose.Pos, baseRot) + basePos;
+            var worldRot = Quaternion.Normalize(baseRot * k.Pose.Rot);
+            // never unwrap across a cut: the new shot takes the short way from its own heading
+            var (yaw, pitch, roll) = FreeCamMath.FromWorldRotation(worldRot, k.Step ? null : prevYaw);
             prevYaw = yaw;
             maxPitch = MathF.Max(maxPitch, MathF.Abs(pitch));
-            keys.Add(new BrioBridge.FreeCamKey(StartFrame + f, worldPos, yaw, pitch, roll, s.Fov - BaseFov));
-            if(f == totalFrames) break;
+            list.Add(new BrioBridge.FreeCamKey(k.Frame, worldPos, yaw, pitch, roll, k.Pose.Fov - BaseFov, k.Step));
         }
+        return list;
+    }
+
+    public void Bake(BrioBridge.FreeCam cam, ShotComposer comp, Vector3 basePos, Quaternion baseRot)
+    {
+        int fps = _brio.TimelineFps;
+        var bakeKeys = comp.BakeForTimeline(fps, StepFrames);
+        var keys = ToFreeCamKeys(bakeKeys, basePos, baseRot, out float maxPitch);
+        int firstFrame = keys.Count > 0 ? keys[0].Frame : 0;
+        int lastFrame = keys.Count > 0 ? keys[^1].Frame : 0;
+        int cuts = keys.Count(k => k.Step);
 
         // undo snapshot
         var current = _brio.GetTrackKeyframes(cam);
@@ -63,7 +71,6 @@ public sealed class TimelineBake
         if(ClearExisting) _brio.ClearTrack(cam);
         _brio.AddCameraKeys(cam, keys);
 
-        int lastFrame = StartFrame + totalFrames;
         if(_brio.FrameMax < lastFrame) _brio.FrameMax = lastFrame;
 
         string pitchNote = "";
@@ -76,8 +83,8 @@ public sealed class TimelineBake
         _brio.EnsureInTimeline(cam);
         _brio.ApplyTimelineFrame();
 
-        Status = $"已烘焙 {keys.Count} 个关键帧到「{cam.Name}」（第 {StartFrame}–{lastFrame} 帧 @ {fps}fps）{pitchNote}";
-        _log.Info($"TimelineBake: {keys.Count} keys into {cam.Name}, frames {StartFrame}-{lastFrame} @ {fps}fps, baseFov {BaseFov}");
+        Status = $"已烘焙 {keys.Count} 个关键帧到「{cam.Name}」（第 {firstFrame}–{lastFrame} 帧 @ {fps}fps，{cuts} 处硬切）{pitchNote}";
+        _log.Info($"TimelineBake: {keys.Count} keys into {cam.Name}, frames {firstFrame}-{lastFrame} @ {fps}fps, cuts {cuts}, baseFov {BaseFov}");
     }
 
     public void Undo()

@@ -49,6 +49,13 @@ public sealed class Keyframe
     /// <summary>Hold length in timeline frames. HoldSec is derived from it.</summary>
     public int HoldFrames;
 
+    /// <summary>Hard cut: jump to this node from the previous node in the same track instead of moving there.</summary>
+    public bool CutIn;
+    /// <summary>CutIn was switched on automatically (node placed 1 frame after its predecessor).</summary>
+    public bool CutAuto;
+    /// <summary>Gap to the predecessor last seen by <see cref="CamTimeline.RefreshAutoCuts"/> (0 = not seen yet).</summary>
+    public int LastGap;
+
     public float TimeSec;
     public Vector3 Pos;
     public Quaternion Rot;
