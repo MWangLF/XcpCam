@@ -44,6 +44,11 @@ public sealed class PathSettings
 /// </summary>
 public sealed class Keyframe
 {
+    /// <summary>Timeline frame (source of truth in the UI). TimeSec is derived from it by <see cref="CamTimeline"/>.</summary>
+    public int Frame;
+    /// <summary>Hold length in timeline frames. HoldSec is derived from it.</summary>
+    public int HoldFrames;
+
     public float TimeSec;
     public Vector3 Pos;
     public Quaternion Rot;

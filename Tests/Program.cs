@@ -200,6 +200,96 @@ bool UnitAndHemi(List<XcpFrame> f)
     Check(Vector3.Distance(p.Sample(0.5f).Pos, new Vector3(1, 1.5f, 3)) < 1e-3f, "2 keys, no ease: straight line, uniform");
 }
 
+// ---------- 6b) Frame timeline model ----------
+{
+    var tl = new CamTimeline { Length = 300 };
+    tl.Keys.Add(new Keyframe { Frame = 0, Pos = new(0, 1, 3), Rot = Yaw(0), Fov = 0.78f });
+    tl.Keys.Add(new Keyframe { Frame = 60, Pos = new(3, 1, 0), Rot = Yaw(1.5f), Fov = 0.78f, HoldFrames = 15 });
+    tl.Keys.Add(new Keyframe { Frame = 150, Pos = new(0, 2, -3), Rot = Yaw(3f), Fov = 0.7f });
+
+    tl.SyncSeconds();
+    Check(MathF.Abs(tl.Keys[1].TimeSec - 2f) < 1e-6f && MathF.Abs(tl.Keys[1].HoldSec - 0.5f) < 1e-6f, "timeline: frame -> seconds @30fps");
+
+    // move with collision: moving key 3 onto key 2's frame is refused
+    int got = tl.MoveKey(tl.Keys[2], 60);
+    Check(got == 150, "timeline: move onto occupied frame is refused");
+    got = tl.MoveKey(tl.Keys[2], 121);
+    Check(got == 121, "timeline: move to free frame");
+
+    // fps change keeps seconds
+    tl.SetFps(60);
+    tl.SyncSeconds();
+    Check(tl.Fps == 60 && tl.Keys[1].Frame == 120 && tl.Keys[1].HoldFrames == 30 && MathF.Abs(tl.Keys[1].TimeSec - 2f) < 1e-6f && tl.Length == 600,
+        $"timeline: 30->60fps keeps seconds (key2 frame {tl.Keys[1].Frame}, len {tl.Length})");
+
+    // undo / redo
+    tl.Snapshot();
+    tl.Keys[0].Frame = 10;
+    tl.Keys.RemoveAt(2);
+    tl.Undo();
+    Check(tl.Keys.Count == 3 && tl.Keys[0].Frame == 0, "timeline: undo restores");
+    tl.Redo();
+    Check(tl.Keys.Count == 2 && tl.Keys[0].Frame == 10, "timeline: redo reapplies");
+
+    // path from frames hits nodes at their frames
+    tl.Undo();
+    tl.SyncSeconds();
+    var p = CameraPath.Create(tl.Sorted(), new PathSettings())!;
+    var s = p.Sample(tl.FrameToPathTime(120));
+    Check(Vector3.Distance(s.Pos, new Vector3(3, 1, 0)) < 2e-3f, "timeline: path reaches node 2 at its frame");
+    var sh = p.Sample(tl.FrameToPathTime(140));
+    Check(Vector3.Distance(sh.Pos, new Vector3(3, 1, 0)) < 2e-3f, "timeline: hold frames keep camera still");
+}
+
+// ---------- 6b2) Insert a key sampled from the path: path should barely change ----------
+{
+    var tl = new CamTimeline { Length = 600 };
+    foreach(var (f, p, y) in new[] { (0, new Vector3(0, 1.5f, 3), 0f), (60, new Vector3(3, 1.5f, 0), 1.5f), (150, new Vector3(1, 2, -3), 3f), (240, new Vector3(-4, 1, -1), 4.5f) })
+        tl.Keys.Add(new Keyframe { Frame = f, Pos = p, Rot = Yaw(y), Fov = 0.78f });
+    tl.SyncSeconds();
+    var before = CameraPath.Create(tl.Sorted(), new PathSettings())!;
+
+    int ins = 100;
+    var s = before.Sample(tl.FrameToPathTime(ins));
+    tl.Keys.Add(new Keyframe { Frame = ins, Pos = s.Pos, Rot = s.Rot, Fov = s.Fov });
+    tl.SyncSeconds();
+    var after = CameraPath.Create(tl.Sorted(), new PathSettings())!;
+
+    var atIns = after.Sample(tl.FrameToPathTime(ins));
+    Check(Vector3.Distance(atIns.Pos, s.Pos) < 2e-3f && MathF.Abs(MathF.Abs(Quaternion.Dot(atIns.Rot, s.Rot)) - 1) < 1e-4f,
+        "insert-from-path: new node reproduces the sampled pose");
+
+    float maxDev = 0, maxAng = 0;
+    for(int f = 0; f <= 240; f++)
+    {
+        var a = before.Sample(tl.FrameToPathTime(f)); var b = after.Sample(tl.FrameToPathTime(f));
+        maxDev = MathF.Max(maxDev, Vector3.Distance(a.Pos, b.Pos));
+        maxAng = MathF.Max(maxAng, 2f * MathF.Acos(Math.Clamp(MathF.Abs(Quaternion.Dot(a.Rot, b.Rot)), 0f, 1f)));
+    }
+    Console.WriteLine($"      insert-from-path deviation: pos {maxDev:0.000}y, rot {maxAng * 180 / MathF.PI:0.0}°");
+    Check(maxDev < 0.25f && maxAng < 0.15f, "insert-from-path: rest of the path stays close to the original");
+}
+
+// ---------- 6c) Gizmo math: world matrix -> decompose -> relative -> world ----------
+{
+    float worstG = 0;
+    for(int n = 0; n < 200; n++)
+    {
+        var basePos = new Vector3(R(-50, 50), R(-2, 5), R(-50, 50));
+        var baseRot = Quaternion.CreateFromAxisAngle(Vector3.UnitY, R(-3.1f, 3.1f));
+        var rel = new Vector3(R(-5, 5), R(-1, 3), R(-5, 5));
+        var relRot = Quaternion.Normalize(Quaternion.CreateFromYawPitchRoll(R(-3, 3), R(-1.3f, 1.3f), R(-0.5f, 0.5f)));
+        var wp = Vector3.Transform(rel, baseRot) + basePos;
+        var wr = Quaternion.Normalize(baseRot * relRot);
+        var model = Matrix4x4.CreateFromQuaternion(wr) * Matrix4x4.CreateTranslation(wp);
+        Matrix4x4.Decompose(model, out _, out var dr, out var dp);
+        var (rel2, relRot2) = XcpMath.WorldToRelative(dp, Quaternion.Normalize(dr), basePos, baseRot);
+        worstG = MathF.Max(worstG, Vector3.Distance(rel, rel2));
+        worstG = MathF.Max(worstG, 1 - MathF.Abs(Quaternion.Dot(relRot, relRot2)));
+    }
+    Check(worstG < 1e-4f, $"gizmo: model matrix round-trip (worst {worstG:0.0e0})");
+}
+
 // ---------- 7) Writer + simulate Brio reader (i < count-1) ----------
 {
     var frames = PathBuilder.Build(Keys());

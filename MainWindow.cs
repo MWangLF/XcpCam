@@ -3,7 +3,6 @@ using Dalamud.Interface.ImGuiFileDialog;
 using Dalamud.Interface.Windowing;
 using Dalamud.Plugin.Services;
 using System;
-using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Numerics;
@@ -19,36 +18,39 @@ public sealed class MainWindow : Window, IDisposable
     private readonly IPluginLog _log;
     private readonly BrioBridge _brio;
     private readonly Overlay _overlay;
+    private readonly GizmoEditor _gizmo = new();
+    private readonly TimelineWidget _tlw = new();
     private readonly TimelineSync _sync;
     private readonly TimelineBake _bake;
 
     public readonly FileDialogManager FileDialog = new();
 
-    private readonly List<Keyframe> _keys = [];
+    private readonly CamTimeline _tl = new();
     private readonly PathSettings _settings = new();
     private bool _useProjectionFov = true;
-    private float _defaultGap = 2f;
+    private bool _syncFpsWithBrio = true;
+    private bool _followBrioPlayhead;
+    private bool _drivePlayheadToBrio;
+    private bool _lookThrough;
+    private int _defaultGapFrames = 60;
     private string _status = "";
     private bool _statusIsError;
     private string _lastDir = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
 
-    // cached path; rebuilt when keys/settings change
     private CameraPath? _path;
     private int _pathHash;
+    private float _maxSpeed = 1;
 
-    // preview
-    private bool _previewPlaying;
-    private float _previewTime;
-    private bool _previewLoop = true;
+    private bool _playing;
+    private bool _loop = true;
 
-    // bake target
     private int _bakeCamIndex;
 
     private static readonly string[] TangentNames = ["自动(平滑)", "停顿", "匀速"];
     private static readonly string[] ModeNames = ["按时间平滑", "整体匀速"];
 
     public MainWindow(ITargetManager targets, IClientState clientState, IPluginLog log, BrioBridge brio, Overlay overlay)
-        : base("XcpCam - 镜头关键帧 → .xcp###xcpcam_main")
+        : base("XcpCam - 相机时间轴###xcpcam_main")
     {
         _targets = targets;
         _clientState = clientState;
@@ -57,7 +59,7 @@ public sealed class MainWindow : Window, IDisposable
         _overlay = overlay;
         _sync = new TimelineSync(brio, log);
         _bake = new TimelineBake(brio, log);
-        Size = new Vector2(720, 520);
+        Size = new Vector2(820, 560);
         SizeCondition = ImGuiCond.FirstUseEver;
     }
 
@@ -66,30 +68,88 @@ public sealed class MainWindow : Window, IDisposable
         try { _sync.Unbind(); } catch { /* Brio may already be gone */ }
     }
 
+    private Keyframe? Selected
+    {
+        get => _tlw.Selected != null && _tl.Keys.Contains(_tlw.Selected) ? _tlw.Selected : null;
+        set => _tlw.Selected = value;
+    }
+
     // ------------------------------------------------------------------ ticking
 
     public void FrameworkTick(float dt)
     {
-        RebuildPathIfNeeded();
-
-        if(_previewPlaying && _path != null)
+        if(_syncFpsWithBrio && _brio.IsConnected)
         {
-            _previewTime += dt;
-            if(_previewTime > _path.Duration)
+            int fps = _brio.TimelineFps;
+            if(fps != _tl.Fps)
             {
-                if(_previewLoop) _previewTime = 0;
-                else { _previewTime = _path.Duration; _previewPlaying = false; }
+                _tl.SetFps(fps);
+                SetStatus($"已同步 Brio 灵动时间轴帧率：{fps}fps（镜头节点按秒保持不变）", false);
             }
         }
+
+        RebuildPathIfNeeded();
+
+        if(_followBrioPlayhead && _brio.IsConnected)
+            _tl.Playhead = (float)Math.Clamp(_brio.TimelineTime, 0, _tl.Length);
+        else if(_playing)
+        {
+            _tl.Playhead += dt * _tl.Fps;
+            float end = _path != null ? _tl.LastFrame : _tl.Length;
+            if(_tl.Playhead > end)
+            {
+                if(_loop) _tl.Playhead = _tl.FirstFrame;
+                else { _tl.Playhead = end; _playing = false; }
+            }
+        }
+
+        if(_lookThrough && _path != null) LookThroughPlayhead();
 
         try { _sync.Tick(_path?.Duration ?? 0); }
         catch(Exception ex) { _log.Warning(ex, "TimelineSync tick failed"); }
     }
 
+    private void LookThroughPlayhead()
+    {
+        if(!_brio.IsConnected || _path == null) return;
+        if(!CameraCapture.TryGetBase(_targets, out var bp, out var br, out _, out _)) return;
+        var s = _path.Sample(_tl.FrameToPathTime(_tl.Playhead));
+        var wp = Vector3.Transform(s.Pos, br) + bp;
+        var wr = Quaternion.Normalize(br * s.Rot);
+        var (yaw, pitch, roll) = FreeCamMath.FromWorldRotation(wr);
+        if(!_brio.SetCurrentFreeCamPose(wp, yaw, pitch, roll, s.Fov - _bake.BaseFov))
+        {
+            _lookThrough = false;
+            SetStatus("镜头预览需要 Brio 当前相机是自由相机（Free）。", true);
+        }
+    }
+
+    // ------------------------------------------------------------------ overlay (drawn in OverlayWindow)
+
+    public bool OverlayWantsInput => _gizmo.Enabled && Selected != null && (_gizmo.IsOver || _gizmo.IsUsing);
+
     public void DrawOverlay()
     {
-        _overlay.PreviewTime = _previewPlaying || _previewTime > 0 ? _previewTime : null;
-        _overlay.Draw(_path, _keys, _sync.PlayheadSec);
+        float? playT = _path != null && (_playing || _followBrioPlayhead || _tl.Playhead != _tl.FirstFrame)
+            ? _tl.FrameToPathTime(_tl.Playhead) : null;
+        _overlay.PreviewTime = _lookThrough ? null : playT;
+        _overlay.Draw(_path, _tl.Keys, _sync.PlayheadSec, Selected);
+
+        var sel = Selected;
+        if(sel != null && _clientState.IsGPosing && CameraCapture.TryGetBase(_targets, out var bp, out var br, out _, out _))
+        {
+            var prePos = sel.Pos;
+            var preRot = sel.Rot;
+            _gizmo.Draw(sel, bp, br);
+            if(_gizmo.DragStarted)
+            {
+                // snapshot the pose from before this drag, then re-apply the first frame of the drag
+                var newPos = sel.Pos; var newRot = sel.Rot;
+                sel.Pos = prePos; sel.Rot = preRot;
+                _tl.Snapshot();
+                sel.Pos = newPos; sel.Rot = newRot;
+            }
+        }
     }
 
     private int ComputeHash()
@@ -97,19 +157,28 @@ public sealed class MainWindow : Window, IDisposable
         var h = new HashCode();
         h.Add(_settings.Mode); h.Add(_settings.EaseStart); h.Add(_settings.EaseEnd);
         h.Add(_settings.Duration); h.Add(_settings.EaseInFraction); h.Add(_settings.EaseOutFraction); h.Add(_settings.RotationWeight);
-        foreach(var k in _keys) { h.Add(k.TimeSec); h.Add(k.Pos); h.Add(k.Rot); h.Add(k.Fov); h.Add(k.Tangent); h.Add(k.HoldSec); }
-        h.Add(_keys.Count);
+        h.Add(_tl.Fps);
+        foreach(var k in _tl.Keys) { h.Add(k.Frame); h.Add(k.Pos); h.Add(k.Rot); h.Add(k.Fov); h.Add(k.Tangent); h.Add(k.HoldFrames); }
+        h.Add(_tl.Keys.Count);
         return h.ToHashCode();
     }
 
     private void RebuildPathIfNeeded()
     {
         int hash = ComputeHash();
-        if(hash == _pathHash && (_path != null || _keys.Count < 2)) return;
+        if(hash == _pathHash && (_path != null || _tl.Keys.Count < 2)) return;
         _pathHash = hash;
         try
         {
-            _path = CameraPath.Create(_keys, _settings);
+            _tl.SyncSeconds();
+            // constant-speed mode: span the keys' first..last frames
+            if(_settings.Mode == TimingMode.ConstantSpeed && _tl.Keys.Count >= 2)
+                _settings.Duration = MathF.Max(0.1f, (_tl.LastFrame - _tl.FirstFrame) / (float)_tl.Fps);
+            _path = CameraPath.Create(_tl.Sorted(), _settings);
+            _maxSpeed = 1e-3f;
+            if(_path != null)
+                for(float t = 0; t < _path.Duration; t += 1f / 30f)
+                    _maxSpeed = MathF.Max(_maxSpeed, SpeedAtTime(t));
             if(_sync.Bound && _path != null) _sync.Refresh(_path);
         }
         catch(Exception ex)
@@ -117,6 +186,13 @@ public sealed class MainWindow : Window, IDisposable
             _path = null;
             _log.Warning(ex, "path build failed");
         }
+    }
+
+    private float SpeedAtTime(float t)
+    {
+        if(_path == null) return 0;
+        const float e = 1f / 60f;
+        return Vector3.Distance(_path.Sample(t).Pos, _path.Sample(t + e).Pos) / e;
     }
 
     // ------------------------------------------------------------------ UI
@@ -129,17 +205,12 @@ public sealed class MainWindow : Window, IDisposable
 
         if(ImGui.BeginTabBar("##tabs"))
         {
-            if(ImGui.BeginTabItem("关键帧"))
+            if(ImGui.BeginTabItem("相机时间轴"))
             {
-                DrawKeysTab(gpose);
+                DrawTimelineTab(gpose);
                 ImGui.EndTabItem();
             }
-            if(ImGui.BeginTabItem("可视化"))
-            {
-                DrawVisualTab();
-                ImGui.EndTabItem();
-            }
-            if(ImGui.BeginTabItem("Brio 时间轴"))
+            if(ImGui.BeginTabItem("Brio 联动"))
             {
                 DrawBrioTab(gpose);
                 ImGui.EndTabItem();
@@ -151,51 +222,113 @@ public sealed class MainWindow : Window, IDisposable
             ImGui.TextColored(_statusIsError ? new Vector4(1, 0.4f, 0.4f, 1) : new Vector4(0.5f, 1, 0.5f, 1), _status);
     }
 
-    // ---------------- keys tab ----------------
+    // ---------------- timeline tab ----------------
 
-    private void DrawKeysTab(bool gpose)
+    private void DrawTimelineTab(bool gpose)
     {
-        ImGui.TextDisabled("在 Brio 里切到/摆好一个镜头 → 抓取 → 换下一个镜头 → 抓取 … → 导出 .xcp 或绑定 Brio 时间轴");
+        // --- transport ---
+        if(ImGui.Button(_playing ? "暂停" : "播放")) { _playing = !_playing; if(_playing && _tl.Playhead >= _tl.LastFrame) _tl.Playhead = _tl.FirstFrame; }
+        ImGui.SameLine();
+        if(ImGui.Button("停止")) { _playing = false; _tl.Playhead = _tl.FirstFrame; }
+        ImGui.SameLine();
+        if(ImGui.ArrowButton("##prev", ImGuiDir.Left)) StepPlayhead(-1);
+        ImGui.SameLine();
+        if(ImGui.ArrowButton("##next", ImGuiDir.Right)) StepPlayhead(1);
+        ImGui.SameLine();
+        ImGui.Checkbox("循环", ref _loop);
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(80);
+        int ph = (int)MathF.Round(_tl.Playhead);
+        if(ImGui.InputInt("帧", ref ph)) { _tl.Playhead = Math.Clamp(ph, 0, _tl.Length); _playing = false; }
+        ImGui.SameLine();
+        ImGui.TextDisabled($"{_tl.Playhead / _tl.Fps:0.00}s");
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(80);
+        int len = _tl.Length;
+        if(ImGui.InputInt("总长(帧)", ref len, 10)) _tl.Length = Math.Clamp(len, Math.Max(1, _tl.LastFrame), 100000);
+        ImGui.SameLine();
+        if(_syncFpsWithBrio && _brio.IsConnected)
+            ImGui.TextColored(new Vector4(0.6f, 0.9f, 1, 1), $"{_tl.Fps}fps (Brio)");
+        else
+        {
+            ImGui.SetNextItemWidth(60);
+            int fps = _tl.Fps;
+            if(ImGui.InputInt("fps", ref fps, 0)) _tl.SetFps(fps);
+        }
 
+        // --- capture row ---
         ImGui.BeginDisabled(!gpose);
-        if(ImGui.Button("抓取当前镜头"))
-            Capture();
+        if(ImGui.Button("在播放头抓取镜头")) CaptureAtPlayhead();
+        ImGui.EndDisabled();
+        if(ImGui.IsItemHovered()) ImGui.SetTooltip("在当前播放头所在帧添加镜头节点（该帧已有节点则替换它的镜头）");
+        ImGui.SameLine();
+        ImGui.BeginDisabled(!gpose);
+        if(ImGui.Button("追加到末尾")) CaptureAppend();
         ImGui.EndDisabled();
         ImGui.SameLine();
-        ImGui.SetNextItemWidth(70);
-        ImGui.DragFloat("默认间隔(秒)", ref _defaultGap, 0.1f, 0.1f, 60f, "%.1f");
+        bool inPath = _path != null && _tl.Playhead >= _tl.FirstFrame && _tl.Playhead <= _tl.LastFrame;
+        ImGui.BeginDisabled(!inPath);
+        if(ImGui.Button("从运镜生成关键帧")) InsertKeyFromPath();
+        ImGui.EndDisabled();
+        if(ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            ImGui.SetTooltip(inPath
+                ? "在播放头所在帧插入一个镜头节点，位置/旋转/FoV 取自当前运镜在这一帧的值。\n之后可以单独拖动、用手柄调整它来修改这一段运镜。"
+                : "需要至少 2 个镜头节点，且播放头位于第一个和最后一个节点之间。");
         ImGui.SameLine();
-        ImGui.Checkbox("FoV 取投影矩阵", ref _useProjectionFov);
-        if(ImGui.IsItemHovered())
-            ImGui.SetTooltip("勾选：从投影矩阵反算实际垂直 FoV（推荐）；不勾：读 RenderCamera.FoV 字段。");
+        ImGui.SetNextItemWidth(60);
+        ImGui.InputInt("间隔帧", ref _defaultGapFrames, 0);
+        _defaultGapFrames = Math.Clamp(_defaultGapFrames, 1, 10000);
+        ImGui.SameLine();
+        ImGui.BeginDisabled(!_tl.CanUndo);
+        if(ImGui.Button("撤销")) { _tl.Undo(); Selected = null; }
+        ImGui.EndDisabled();
+        ImGui.SameLine();
+        ImGui.BeginDisabled(!_tl.CanRedo);
+        if(ImGui.Button("重做")) { _tl.Redo(); Selected = null; }
+        ImGui.EndDisabled();
+        ImGui.SameLine();
+        if(ImGui.Button("适配")) _tlw.FitAll(_tl, ImGui.GetContentRegionAvail().X + 300);
+        ImGui.SameLine();
+        ImGui.BeginDisabled(_tl.Keys.Count < 2);
+        if(ImGui.Button("导出 .xcp")) OpenSaveDialog();
+        ImGui.EndDisabled();
+
+        // --- the timeline ---
+        ImGui.Spacing();
+        _tlw.Draw(_tl, _path == null ? null : f =>
+        {
+            float t = _tl.FrameToPathTime(f);
+            if(t < 0 || t > _path.Duration) return null;
+            return SpeedAtTime(t) / _maxSpeed;
+        });
+        if(_tlw.DragStarted) _tl.Snapshot();
+        if(_tlw.PlayheadChanged)
+        {
+            _playing = false;
+            if(_drivePlayheadToBrio && _brio.IsConnected) _brio.SetTimelineTime(_tl.Playhead);
+        }
+        ImGui.TextDisabled("拖动◆移动镜头节点（精确到帧）· 点击空白处移动播放头 · 滚轮平移，Ctrl+滚轮缩放，中键拖动 · 双击节点跳转");
+        DrawGizmoBar();
 
         ImGui.Separator();
         DrawPacing();
         ImGui.Separator();
-        DrawTable();
-        ImGui.Separator();
-
-        ImGui.BeginDisabled(_keys.Count < 2);
-        if(ImGui.Button("导出 .xcp"))
-            OpenSaveDialog();
-        ImGui.EndDisabled();
-        ImGui.SameLine();
-        if(ImGui.Button("按时间排序"))
-            _keys.Sort((a, b) => a.TimeSec.CompareTo(b.TimeSec));
-        ImGui.SameLine();
-        if(ImGui.Button("清空"))
-        {
-            _keys.Clear();
-            _overlay.SelectedKey = -1;
-        }
-
-        if(_path != null)
-        {
-            ImGui.SameLine();
-            ImGui.TextDisabled($"时长 {_path.Duration:0.00}s · 路径长 {_path.TotalLength:0.0}y · {Math.Max(2, (int)MathF.Round(_path.Duration * PathBuilder.Fps) + 1)} 帧 @30fps");
-        }
-
+        DrawInspector(gpose);
         DrawTargetWarnings(gpose);
+        ImGui.Spacing();
+        DrawDisplayOptions();
+    }
+
+    private void StepPlayhead(int dir)
+    {
+        _playing = false;
+        var frames = _tl.Keys.Select(k => k.Frame).OrderBy(f => f).ToList();
+        int cur = (int)MathF.Round(_tl.Playhead);
+        int? next = dir > 0 ? frames.Where(f => f > cur).Cast<int?>().FirstOrDefault() : frames.Where(f => f < cur).Cast<int?>().LastOrDefault();
+        _tl.Playhead = next ?? Math.Clamp(cur + dir, 0, _tl.Length);
+        var k = _tl.Keys.FirstOrDefault(x => x.Frame == (int)_tl.Playhead);
+        if(k != null) Selected = k;
+        if(_drivePlayheadToBrio && _brio.IsConnected) _brio.SetTimelineTime(_tl.Playhead);
     }
 
     private void DrawPacing()
@@ -205,8 +338,7 @@ public sealed class MainWindow : Window, IDisposable
         if(ImGui.Combo("运镜节奏", ref mode, ModeNames, ModeNames.Length))
             _settings.Mode = (TimingMode)mode;
         if(ImGui.IsItemHovered())
-            ImGui.SetTooltip("按时间平滑：每个镜头在设定的时间到达，经过镜头时速度连续、不顿挫。\n整体匀速：忽略各镜头时间，整条路径以恒定速度运动，只在首尾缓入缓出。");
-
+            ImGui.SetTooltip("按时间平滑：每个镜头在它所在的帧到达，经过镜头时速度连续、不顿挫。\n整体匀速：首尾节点之间以恒定速度运动（中间节点的帧位置被忽略），只在首尾缓入缓出。");
         ImGui.SameLine();
         if(_settings.Mode == TimingMode.Timed)
         {
@@ -216,9 +348,6 @@ public sealed class MainWindow : Window, IDisposable
         }
         else
         {
-            ImGui.SetNextItemWidth(70);
-            ImGui.DragFloat("总时长(秒)", ref _settings.Duration, 0.1f, 0.5f, 600f, "%.1f");
-            ImGui.SameLine();
             float a = _settings.EaseInFraction * 100, b = _settings.EaseOutFraction * 100;
             ImGui.SetNextItemWidth(60);
             if(ImGui.DragFloat("缓入%", ref a, 0.5f, 0f, 50f, "%.0f")) _settings.EaseInFraction = a / 100f;
@@ -228,160 +357,186 @@ public sealed class MainWindow : Window, IDisposable
             ImGui.SameLine();
             ImGui.SetNextItemWidth(60);
             ImGui.DragFloat("转向权重", ref _settings.RotationWeight, 0.05f, 0f, 10f, "%.2f");
-            if(ImGui.IsItemHovered())
-                ImGui.SetTooltip("原地转向/变焦时也分配时间：1 弧度转向按多少米移动来计。0 = 只按移动距离分配时间。");
+        }
+        if(_path != null)
+        {
+            ImGui.SameLine();
+            ImGui.TextDisabled($"| 时长 {_path.Duration:0.00}s · 路径 {_path.TotalLength:0.0}y");
         }
     }
 
-    private void DrawTable()
+    private void DrawInspector(bool gpose)
     {
-        var flags = ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingFixedFit;
-        var height = Math.Max(120f, ImGui.GetContentRegionAvail().Y - 80f);
-        bool timed = _settings.Mode == TimingMode.Timed;
-        if(!ImGui.BeginTable("##keys", 7, flags, new Vector2(0, height)))
+        var k = Selected;
+        if(k == null)
+        {
+            ImGui.TextDisabled(_tl.Keys.Count == 0
+                ? "还没有镜头节点。在 Brio 里摆好镜头后点「在播放头抓取镜头」。"
+                : _gizmo.Enabled
+                    ? "点击时间轴上的◆选中一个镜头节点进行编辑；选中后可在游戏画面中用变换手柄直接移动/旋转它。"
+                    : "点击时间轴上的◆选中一个镜头节点进行编辑。（勾选上方「变换手柄」可在游戏画面中直接调整）");
             return;
-
-        ImGui.TableSetupScrollFreeze(0, 1);
-        ImGui.TableSetupColumn("#");
-        ImGui.TableSetupColumn(timed ? "时间(秒)" : "到达(秒)");
-        ImGui.TableSetupColumn("经过方式");
-        ImGui.TableSetupColumn("停留(秒)");
-        ImGui.TableSetupColumn("相对位置 / FoV°");
-        ImGui.TableSetupColumn("自检");
-        ImGui.TableSetupColumn("操作", ImGuiTableColumnFlags.WidthStretch);
-        ImGui.TableHeadersRow();
-
-        int remove = -1, up = -1, down = -1;
-        for(int i = 0; i < _keys.Count; i++)
-        {
-            var k = _keys[i];
-            ImGui.PushID(i);
-            ImGui.TableNextRow();
-
-            ImGui.TableNextColumn();
-            bool sel = _overlay.SelectedKey == i;
-            if(ImGui.Selectable($"{i + 1}", sel))
-                _overlay.SelectedKey = sel ? -1 : i;
-
-            ImGui.TableNextColumn();
-            if(timed)
-            {
-                ImGui.SetNextItemWidth(65);
-                ImGui.DragFloat("##t", ref k.TimeSec, 0.05f, 0f, 3600f, "%.2f");
-            }
-            else
-            {
-                float t = _path != null && i < _path.KeyTimes.Count ? _path.KeyTimes[i] : 0;
-                ImGui.TextDisabled($"{t:0.00}");
-            }
-
-            ImGui.TableNextColumn();
-            ImGui.BeginDisabled(!timed);
-            ImGui.SetNextItemWidth(95);
-            int tan = (int)k.Tangent;
-            if(ImGui.Combo("##tan", ref tan, TangentNames, TangentNames.Length))
-                k.Tangent = (TangentMode)tan;
-            if(ImGui.IsItemHovered())
-                ImGui.SetTooltip("自动：平滑穿过，速度连续（推荐）\n停顿：在这个镜头处减速停下再出发\n匀速：从这个镜头到下一个镜头保持匀速");
-
-            ImGui.TableNextColumn();
-            ImGui.SetNextItemWidth(55);
-            ImGui.DragFloat("##hold", ref k.HoldSec, 0.05f, 0f, 60f, "%.2f");
-            ImGui.EndDisabled();
-
-            ImGui.TableNextColumn();
-            ImGui.Text($"({k.Pos.X:0.00}, {k.Pos.Y:0.00}, {k.Pos.Z:0.00})  {k.Fov * 180f / MathF.PI:0.0}°");
-
-            ImGui.TableNextColumn();
-            bool ok = k.SelfCheckError < 1e-3f;
-            ImGui.TextColored(ok ? new Vector4(0.5f, 1, 0.5f, 1) : new Vector4(1, 0.4f, 0.4f, 1), ok ? "OK" : $"{k.SelfCheckError:0.0e0}");
-            if(ImGui.IsItemHovered())
-                ImGui.SetTooltip($"按 Brio 播放公式重建视图矩阵与实际视图矩阵的最大误差：{k.SelfCheckError:0.000000}\n目标：{k.TargetName}");
-
-            ImGui.TableNextColumn();
-            if(ImGui.SmallButton("↑")) up = i;
-            ImGui.SameLine();
-            if(ImGui.SmallButton("↓")) down = i;
-            ImGui.SameLine();
-            if(ImGui.SmallButton("重抓")) Recapture(i);
-            ImGui.SameLine();
-            if(ImGui.SmallButton("删除")) remove = i;
-
-            ImGui.PopID();
         }
-        ImGui.EndTable();
 
-        if(remove >= 0)
+        int idx = _tl.Keys.IndexOf(k) + 1;
+        ImGui.Text($"镜头 {idx}");
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(90);
+        int frame = k.Frame;
+        if(ImGui.InputInt("所在帧", ref frame))
         {
-            _keys.RemoveAt(remove);
-            if(_overlay.SelectedKey >= _keys.Count) _overlay.SelectedKey = -1;
+            _tl.Snapshot();
+            int got = _tl.MoveKey(k, frame);
+            if(got != frame) SetStatus($"第 {frame} 帧已有节点", true);
         }
-        if(up > 0) (_keys[up - 1], _keys[up]) = (_keys[up], _keys[up - 1]);
-        if(down >= 0 && down < _keys.Count - 1) (_keys[down + 1], _keys[down]) = (_keys[down], _keys[down + 1]);
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(70);
+        int hold = k.HoldFrames;
+        if(ImGui.InputInt("停留帧", ref hold, 0)) { _tl.Snapshot(); k.HoldFrames = Math.Clamp(hold, 0, 100000); }
+        ImGui.SameLine();
+        ImGui.BeginDisabled(_settings.Mode != TimingMode.Timed);
+        ImGui.SetNextItemWidth(100);
+        int tan = (int)k.Tangent;
+        if(ImGui.Combo("经过方式", ref tan, TangentNames, TangentNames.Length)) { _tl.Snapshot(); k.Tangent = (TangentMode)tan; }
+        ImGui.EndDisabled();
+
+        // transform fields (relative to target)
+        var pos = k.Pos;
+        ImGui.SetNextItemWidth(260);
+        if(ImGui.DragFloat3("相对位置 (米)", ref pos, 0.01f))
+            k.Pos = pos;
+        if(ImGui.IsItemActivated()) _tl.Snapshot();
+
+        var euler = QuatToEulerDeg(k.Rot);
+        ImGui.SetNextItemWidth(260);
+        if(ImGui.DragFloat3("旋转 偏航/俯仰/滚转 (°)", ref euler, 0.25f))
+            k.Rot = EulerDegToQuat(euler);
+        if(ImGui.IsItemActivated()) _tl.Snapshot();
+
+        float fovDeg = k.Fov * 180f / MathF.PI;
+        ImGui.SetNextItemWidth(120);
+        if(ImGui.DragFloat("FoV (°)", ref fovDeg, 0.1f, 5f, 150f, "%.1f"))
+            k.Fov = fovDeg * MathF.PI / 180f;
+        if(ImGui.IsItemActivated()) _tl.Snapshot();
+
+        ImGui.SameLine();
+        ImGui.BeginDisabled(!gpose);
+        if(ImGui.Button("用当前镜头替换")) Recapture(k);
+        ImGui.EndDisabled();
+        ImGui.SameLine();
+        if(ImGui.Button("跳到此帧")) { _tl.Playhead = k.Frame; if(_drivePlayheadToBrio && _brio.IsConnected) _brio.SetTimelineTime(k.Frame); }
+        ImGui.SameLine();
+        if(ImGui.Button("复制节点")) Duplicate(k);
+        ImGui.SameLine();
+        if(ImGui.Button("删除节点")) { _tl.Snapshot(); _tl.Keys.Remove(k); Selected = null; }
+
+        bool ok = k.SelfCheckError < 1e-3f;
+        ImGui.TextColored(ok ? new Vector4(0.5f, 1, 0.5f, 1) : new Vector4(1, 0.4f, 0.4f, 1),
+            ok ? "自检 OK" : $"自检误差 {k.SelfCheckError:0.0e0}");
+        ImGui.SameLine();
+        ImGui.TextDisabled($"目标：{k.TargetName}");
+    }
+
+    private static Vector3 QuatToEulerDeg(Quaternion q)
+    {
+        // yaw (Y), pitch (X), roll (Z) matching Quaternion.CreateFromYawPitchRoll
+        q = Quaternion.Normalize(q);
+        float sinp = 2 * (q.W * q.X - q.Y * q.Z);
+        float pitch = MathF.Abs(sinp) >= 1 ? MathF.CopySign(MathF.PI / 2, sinp) : MathF.Asin(sinp);
+        float yaw = MathF.Atan2(2 * (q.W * q.Y + q.X * q.Z), 1 - 2 * (q.X * q.X + q.Y * q.Y));
+        float roll = MathF.Atan2(2 * (q.W * q.Z + q.X * q.Y), 1 - 2 * (q.X * q.X + q.Z * q.Z));
+        const float d = 180f / MathF.PI;
+        return new Vector3(yaw * d, pitch * d, roll * d);
+    }
+
+    private static Quaternion EulerDegToQuat(Vector3 e)
+    {
+        const float r = MathF.PI / 180f;
+        return Quaternion.Normalize(Quaternion.CreateFromYawPitchRoll(e.X * r, e.Y * r, e.Z * r));
     }
 
     private void DrawTargetWarnings(bool gpose)
     {
-        if(_keys.Count < 1) return;
-        var names = _keys.Select(k => k.TargetName).Distinct().Count();
+        if(_tl.Keys.Count < 1) return;
+        var names = _tl.Keys.Select(k => k.TargetName).Where(n => n.Length > 0).Distinct().Count();
         if(names > 1)
-            ImGui.TextColored(new Vector4(1, 0.4f, 0.4f, 1), "警告：关键帧抓取时的 GPose 目标不一致，播放时会错位。");
+            ImGui.TextColored(new Vector4(1, 0.4f, 0.4f, 1), "警告：镜头节点抓取时的 GPose 目标不一致，播放时会错位。");
         else if(gpose && CameraCapture.TryGetBase(_targets, out var bp, out var br, out var nm, out _))
         {
-            var k0 = _keys[0];
-            if(nm != k0.TargetName || Vector3.Distance(bp, k0.BasePos) > 0.01f || MathF.Abs(Quaternion.Dot(br, k0.BaseRot)) < 0.9999f)
-                ImGui.TextColored(new Vector4(1, 0.7f, 0.3f, 1), "提示：目标角色在抓取后移动/旋转或已更换。.xcp 是相对目标的，播放会跟随当前目标。");
+            var k0 = _tl.Keys[0];
+            if(k0.TargetName.Length > 0 && (nm != k0.TargetName || Vector3.Distance(bp, k0.BasePos) > 0.01f || MathF.Abs(Quaternion.Dot(br, k0.BaseRot)) < 0.9999f))
+                ImGui.TextColored(new Vector4(1, 0.7f, 0.3f, 1), "提示：目标角色在抓取后移动/旋转或已更换。运镜是相对目标的，会跟随当前目标。");
         }
     }
 
-    // ---------------- visual tab ----------------
+    // ---------------- in-game display & gizmo (merged into the timeline tab) ----------------
 
-    private void DrawVisualTab()
+    /// <summary>One row: overlay on/off + gizmo mode, shown right under the timeline.</summary>
+    private void DrawGizmoBar()
     {
-        ImGui.Checkbox("在游戏中显示", ref _overlay.Enabled);
-        ImGui.Indent();
+        ImGui.Checkbox("游戏内显示", ref _overlay.Enabled);
+        if(ImGui.IsItemHovered()) ImGui.SetTooltip("在游戏画面中显示运镜路径（蓝=慢，红=快）和各镜头视锥。详细选项见下方「显示选项」。");
+        ImGui.SameLine();
+        ImGui.Checkbox("变换手柄", ref _gizmo.Enabled);
+        if(ImGui.IsItemHovered()) ImGui.SetTooltip("选中一个镜头节点后，在游戏画面中该镜头处显示手柄，可直接拖动移动/旋转。");
+        ImGui.BeginDisabled(!_gizmo.Enabled);
+        ImGui.SameLine();
+        int op = (int)_gizmo.Operation;
+        if(ImGui.RadioButton("移动", ref op, 0)) _gizmo.Operation = GizmoEditor.Op.Translate;
+        ImGui.SameLine();
+        if(ImGui.RadioButton("旋转", ref op, 1)) _gizmo.Operation = GizmoEditor.Op.Rotate;
+        ImGui.SameLine();
+        ImGui.Checkbox("本地坐标", ref _gizmo.LocalSpace);
+        ImGui.SameLine();
+        ImGui.Checkbox("吸附", ref _gizmo.Snap);
+        if(_gizmo.Snap)
+        {
+            ImGui.SameLine();
+            ImGui.SetNextItemWidth(60);
+            if(_gizmo.Operation == GizmoEditor.Op.Translate)
+                ImGui.DragFloat("米##snapT", ref _gizmo.SnapTranslate, 0.01f, 0.01f, 5f, "%.2f");
+            else
+                ImGui.DragFloat("°##snapR", ref _gizmo.SnapRotateDeg, 0.5f, 0.5f, 90f, "%.1f");
+        }
+        ImGui.EndDisabled();
+        ImGui.SameLine();
+        ImGui.TextDisabled("|");
+        ImGui.SameLine();
+        DrawLookThroughToggle();
+    }
+
+    /// <summary>Collapsible detailed display options.</summary>
+    private void DrawDisplayOptions()
+    {
+        if(!ImGui.CollapsingHeader("显示选项")) return;
+        ImGui.BeginDisabled(!_overlay.Enabled);
         ImGui.Checkbox("运镜路径", ref _overlay.ShowPath);
         ImGui.SameLine();
         ImGui.Checkbox("按速度着色（蓝=慢，红=快）", ref _overlay.SpeedColors);
+        ImGui.SameLine();
         ImGui.Checkbox("镜头视锥", ref _overlay.ShowFrustums);
         ImGui.SameLine();
-        ImGui.Checkbox("编号/时间标签", ref _overlay.ShowLabels);
+        ImGui.Checkbox("编号/帧标签", ref _overlay.ShowLabels);
         ImGui.SetNextItemWidth(120);
         ImGui.DragFloat("视锥大小", ref _overlay.FrustumSize, 0.01f, 0.05f, 3f, "%.2f");
-        ImGui.Unindent();
+        ImGui.EndDisabled();
+    }
 
-        ImGui.Separator();
-        ImGui.Text("预览（只在画面中移动绿色视锥，不接管游戏镜头）");
-        if(_path == null)
+    private void DrawLookThroughToggle()
+    {
+        ImGui.BeginDisabled(!_brio.IsConnected || _path == null);
+        if(ImGui.Checkbox("预览镜头", ref _lookThrough) && _lookThrough && !_brio.CurrentCameraIsFree)
         {
-            ImGui.TextDisabled("至少需要 2 个关键帧。");
-            return;
+            _lookThrough = false;
+            SetStatus("请先在 Brio 中切换到一个自由相机（Free）。", true);
         }
-
-        if(ImGui.Button(_previewPlaying ? "暂停" : "播放预览"))
-        {
-            if(!_previewPlaying && _previewTime >= _path.Duration) _previewTime = 0;
-            _previewPlaying = !_previewPlaying;
-        }
-        ImGui.SameLine();
-        if(ImGui.Button("停止"))
-        {
-            _previewPlaying = false;
-            _previewTime = 0;
-        }
-        ImGui.SameLine();
-        ImGui.Checkbox("循环", ref _previewLoop);
-
-        ImGui.SetNextItemWidth(-1);
-        float t = _previewTime;
-        if(ImGui.SliderFloat("##scrub", ref t, 0f, _path.Duration, $"%.2f / {_path.Duration:0.00}s"))
-        {
-            _previewTime = t;
-            _previewPlaying = false;
-        }
-
-        var s = _path.Sample(_previewTime);
-        ImGui.TextDisabled($"位置 ({s.Pos.X:0.00}, {s.Pos.Y:0.00}, {s.Pos.Z:0.00})  FoV {s.Fov * 180f / MathF.PI:0.0}°");
+        ImGui.EndDisabled();
+        if(ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            ImGui.SetTooltip(!_brio.IsConnected ? "需要连接 Brio。"
+                : _path == null ? "需要至少 2 个镜头节点。"
+                : "把 Brio 当前的自由相机放到播放头位置，直接看到这一帧的画面。\n播放或拖动时间轴即可预览运镜。");
+        if(_lookThrough)
+            ImGui.TextColored(new Vector4(1, 0.7f, 0.3f, 1), "预览镜头：Brio 自由相机正被运镜接管，抓取镜头前请先关闭。");
     }
 
     // ---------------- Brio tab ----------------
@@ -397,16 +552,25 @@ public sealed class MainWindow : Window, IDisposable
         }
         if(!_brio.IsConnected) return;
 
-        ImGui.TextDisabled($"Brio 时间轴：{(_brio.TimelineIsPlaying ? "播放中" : "已停止")}  第 {_brio.TimelineTime:0} 帧 / {_brio.FrameMax}  @ {_brio.TimelineFps}fps");
+        ImGui.TextDisabled($"Brio 灵动时间轴：{(_brio.TimelineIsPlaying ? "播放中" : "已停止")}  第 {_brio.TimelineTime:0} 帧 / {_brio.FrameMax}  @ {_brio.TimelineFps}fps");
+
+        ImGui.Separator();
+        ImGui.Text("时间轴同步");
+        if(ImGui.Checkbox("帧率跟随 Brio 灵动时间轴", ref _syncFpsWithBrio) && !_syncFpsWithBrio)
+            SetStatus("已停止跟随 Brio 帧率，可在时间轴上手动设置 fps。", false);
+        ImGui.Checkbox("播放头跟随 Brio 时间轴", ref _followBrioPlayhead);
+        if(ImGui.IsItemHovered()) ImGui.SetTooltip("Brio 时间轴播放/拖动时，本插件的播放头同步移动（预览和可视化跟着走）。");
+        ImGui.Checkbox("拖动本插件播放头时同时移动 Brio 时间轴", ref _drivePlayheadToBrio);
+        ImGui.SameLine();
+        if(ImGui.Button("总长 = Brio 时间轴长度")) _tl.Length = Math.Max(_brio.FrameMax, _tl.LastFrame);
 
         // ---- mode 1 ----
         ImGui.Separator();
         ImGui.Text("方式 1：联动 Brio 的 XAT 播放器");
-        ImGui.TextDisabled("时间轴开始播放时自动从头播放本运镜；时间轴停止/暂停时 XAT 也停止。\n限制：XAT 不能跳转，拖动进度条或暂停后继续不会对齐；需要使用非自由相机。");
+        ImGui.TextDisabled("Brio 时间轴播放到起始帧时从头播放运镜；停止/暂停时 XAT 也停止。\n限制：XAT 不能跳转；需要使用非自由相机。");
         ImGui.BeginDisabled(!_brio.CanSync || _path == null);
-        ImGui.SetNextItemWidth(80);
-        ImGui.InputInt("开始于时间轴帧", ref _sync.StartFrame);
-        if(_sync.StartFrame < 0) _sync.StartFrame = 0;
+        _sync.StartFrame = _tl.Keys.Count > 0 ? _tl.FirstFrame : 0;
+        ImGui.TextDisabled($"起始帧 = 第一个镜头节点所在帧（{_sync.StartFrame}）");
         ImGui.SameLine();
         if(!_sync.Bound)
         {
@@ -421,51 +585,50 @@ public sealed class MainWindow : Window, IDisposable
         // ---- mode 2 ----
         ImGui.Separator();
         ImGui.Text("方式 2：烘焙进 Brio 自由相机的时间轴相机轨道");
-        ImGui.TextDisabled("由 Brio 时间轴直接驱动自由相机，拖动/暂停/循环都完全同步。会改写所选相机轨道（可撤销）。");
+        ImGui.TextDisabled("由 Brio 时间轴直接驱动自由相机，拖动/暂停/循环完全同步。节点帧位置原样对应 Brio 时间轴帧。");
 
         var cams = _brio.CanBake ? _brio.GetFreeCameras() : [];
         if(cams.Count == 0)
         {
             ImGui.TextColored(new Vector4(1, 0.7f, 0.3f, 1), "没有可用的 Brio 自由相机。请先在 Brio 相机窗口中新建一个 Free 相机。");
+            return;
         }
-        else
-        {
-            _bakeCamIndex = Math.Clamp(_bakeCamIndex, 0, cams.Count - 1);
-            var names = cams.Select(c => c.Name + (c.InTimeline ? "" : "（未加入时间轴）")).ToArray();
-            ImGui.SetNextItemWidth(200);
-            ImGui.Combo("目标自由相机", ref _bakeCamIndex, names, names.Length);
 
-            ImGui.SetNextItemWidth(80);
-            ImGui.InputInt("起始帧", ref _bake.StartFrame);
-            if(_bake.StartFrame < 0) _bake.StartFrame = 0;
-            ImGui.SameLine();
-            ImGui.SetNextItemWidth(80);
-            ImGui.InputInt("每隔几帧一个关键帧", ref _bake.StepFrames);
-            _bake.StepFrames = Math.Clamp(_bake.StepFrames, 1, 30);
-            ImGui.Checkbox("清除该相机轨道原有关键帧", ref _bake.ClearExisting);
-            ImGui.SameLine();
-            ImGui.SetNextItemWidth(70);
-            float baseDeg = _bake.BaseFov * 180f / MathF.PI;
-            if(ImGui.DragFloat("基础 FoV°", ref baseDeg, 0.1f, 20f, 120f, "%.1f")) _bake.BaseFov = baseDeg * MathF.PI / 180f;
-            if(ImGui.IsItemHovered()) ImGui.SetTooltip("Brio 自由相机的 FoV 是在游戏基础 FoV 上的偏移量（默认约 44.7°）。烘焙后如果视角大小不对，调整这里。");
+        _bakeCamIndex = Math.Clamp(_bakeCamIndex, 0, cams.Count - 1);
+        var names = cams.Select(c => c.Name + (c.InTimeline ? "" : "（未加入时间轴）")).ToArray();
+        ImGui.SetNextItemWidth(200);
+        ImGui.Combo("目标自由相机", ref _bakeCamIndex, names, names.Length);
+        ImGui.SetNextItemWidth(80);
+        ImGui.InputInt("每隔几帧一个关键帧", ref _bake.StepFrames);
+        _bake.StepFrames = Math.Clamp(_bake.StepFrames, 1, 30);
+        ImGui.SameLine();
+        ImGui.Checkbox("清除该相机轨道原有关键帧", ref _bake.ClearExisting);
+        ImGui.SetNextItemWidth(70);
+        float baseDeg = _bake.BaseFov * 180f / MathF.PI;
+        if(ImGui.DragFloat("基础 FoV°", ref baseDeg, 0.1f, 20f, 120f, "%.1f")) _bake.BaseFov = baseDeg * MathF.PI / 180f;
+        if(ImGui.IsItemHovered()) ImGui.SetTooltip("Brio 自由相机的 FoV 是在游戏基础 FoV 上的偏移量（默认约 44.7°）。");
 
-            ImGui.BeginDisabled(_path == null || !gpose);
-            if(ImGui.Button("烘焙到时间轴"))
-                Try(() =>
-                {
-                    if(!CameraCapture.TryGetBase(_targets, out var bp, out var br, out _, out var err))
-                        throw new InvalidOperationException(err);
-                    _bake.Bake(cams[_bakeCamIndex], _path!, bp, br);
-                    SetStatus(_bake.Status, false);
-                });
-            ImGui.EndDisabled();
-            ImGui.SameLine();
-            ImGui.BeginDisabled(!_bake.CanUndo);
-            if(ImGui.Button("撤销烘焙"))
-                Try(() => { _bake.Undo(); SetStatus(_bake.Status, false); });
-            ImGui.EndDisabled();
-            if(!string.IsNullOrEmpty(_bake.Status)) ImGui.TextColored(new Vector4(0.6f, 0.9f, 1, 1), _bake.Status);
-        }
+        bool fpsMismatch = _tl.Fps != _brio.TimelineFps;
+        if(fpsMismatch)
+            ImGui.TextColored(new Vector4(1, 0.7f, 0.3f, 1), $"本时间轴 {_tl.Fps}fps 与 Brio {_brio.TimelineFps}fps 不同，烘焙时按秒换算到 Brio 帧。");
+
+        ImGui.BeginDisabled(_path == null || !gpose);
+        if(ImGui.Button("烘焙到 Brio 时间轴"))
+            Try(() =>
+            {
+                if(!CameraCapture.TryGetBase(_targets, out var bp, out var br, out _, out var err))
+                    throw new InvalidOperationException(err);
+                _bake.StartFrame = (int)MathF.Round(_tl.FirstFrame * (_brio.TimelineFps / (float)_tl.Fps));
+                _bake.Bake(cams[_bakeCamIndex], _path!, bp, br);
+                SetStatus(_bake.Status, false);
+            });
+        ImGui.EndDisabled();
+        ImGui.SameLine();
+        ImGui.BeginDisabled(!_bake.CanUndo);
+        if(ImGui.Button("撤销烘焙"))
+            Try(() => { _bake.Undo(); SetStatus(_bake.Status, false); });
+        ImGui.EndDisabled();
+        if(!string.IsNullOrEmpty(_bake.Status)) ImGui.TextColored(new Vector4(0.6f, 0.9f, 1, 1), _bake.Status);
     }
 
     private void Try(Action a)
@@ -483,6 +646,11 @@ public sealed class MainWindow : Window, IDisposable
 
     private Keyframe? MakeKey()
     {
+        if(_lookThrough)
+        {
+            SetStatus("请先关闭「预览镜头」再抓取新镜头。", true);
+            return null;
+        }
         if(!CameraCapture.TryCapture(_targets, out var s, out var err) || s is null)
         {
             SetStatus(err, true);
@@ -494,13 +662,11 @@ public sealed class MainWindow : Window, IDisposable
         var err2 = XcpMath.MaxAffineDiff(rebuilt, s.View);
 
         float fov = _useProjectionFov && s.FovProjection > 0.01f ? s.FovProjection : s.FovRender;
-        _log.Info($"capture world={s.WorldPos} base={s.BasePos} baseRot={s.BaseRot} rel={pos} rot={rot} fovRender={s.FovRender} fovProj={s.FovProjection} selfCheck={err2}");
-        _log.Debug($"  sceneView={XcpMath.Dump(s.View)}");
-        _log.Debug($"  renderView={XcpMath.Dump(s.RenderView)}");
+        _log.Info($"capture world={s.WorldPos} base={s.BasePos} rel={pos} rot={rot} fov={fov} selfCheck={err2}");
 
         if(!XcpMath.IsFinite(pos) || !XcpMath.IsFinite(rot) || !float.IsFinite(fov))
         {
-            SetStatus("抓取结果无效（NaN），已丢弃。请查看 /xllog 中 XcpCam 的矩阵输出。", true);
+            SetStatus("抓取结果无效（NaN），已丢弃。", true);
             return null;
         }
 
@@ -511,24 +677,109 @@ public sealed class MainWindow : Window, IDisposable
         };
     }
 
-    private void Capture()
+    private void CaptureAtPlayhead()
     {
         var k = MakeKey();
         if(k is null) return;
-        k.TimeSec = _keys.Count == 0 ? 0f : _keys.Max(x => x.TimeSec + x.HoldSec) + _defaultGap;
-        _keys.Add(k);
-        SetStatus($"已抓取第 {_keys.Count} 帧（{k.TimeSec:0.00}s）", false);
+        _tl.Snapshot();
+        int frame = (int)MathF.Round(_tl.Playhead);
+        var existing = _tl.Keys.FirstOrDefault(x => x.Frame == frame);
+        if(existing != null)
+        {
+            CopyPose(k, existing);
+            Selected = existing;
+            SetStatus($"已替换第 {frame} 帧的镜头", false);
+            return;
+        }
+        k.Frame = frame;
+        if(k.Frame > _tl.Length) _tl.Length = k.Frame;
+        _tl.Keys.Add(k);
+        Selected = k;
+        SetStatus($"已在第 {frame} 帧添加镜头 {_tl.Keys.Count}", false);
     }
 
-    private void Recapture(int i)
+    private void CaptureAppend()
     {
         var k = MakeKey();
         if(k is null) return;
-        k.TimeSec = _keys[i].TimeSec;
-        k.Tangent = _keys[i].Tangent;
-        k.HoldSec = _keys[i].HoldSec;
-        _keys[i] = k;
-        SetStatus($"已重抓第 {i + 1} 帧", false);
+        _tl.Snapshot();
+        k.Frame = _tl.Keys.Count == 0 ? (int)MathF.Round(_tl.Playhead) : _tl.LastFrame + _defaultGapFrames;
+        if(k.Frame > _tl.Length) _tl.Length = k.Frame;
+        _tl.Keys.Add(k);
+        Selected = k;
+        _tl.Playhead = k.Frame;
+        _tlw.EnsureVisible(k.Frame, 700);
+        SetStatus($"已在第 {k.Frame} 帧添加镜头 {_tl.Keys.Count}", false);
+    }
+
+    /// <summary>Inserts a node at the playhead whose pose is the current path's pose at that frame.</summary>
+    private void InsertKeyFromPath()
+    {
+        if(_path == null) return;
+        int frame = (int)MathF.Round(_tl.Playhead);
+        var existing = _tl.Keys.FirstOrDefault(x => x.Frame == frame);
+        if(existing != null)
+        {
+            Selected = existing;
+            SetStatus($"第 {frame} 帧已经是镜头 {_tl.Keys.IndexOf(existing) + 1}，已选中它。", true);
+            return;
+        }
+
+        var s = _path.Sample(_tl.FrameToPathTime(frame));
+        if(!XcpMath.IsFinite(s.Pos) || !XcpMath.IsFinite(s.Rot) || !float.IsFinite(s.Fov))
+        {
+            SetStatus("这一帧的运镜数据无效，未生成。", true);
+            return;
+        }
+
+        // carry the target info of the node this frame belongs to
+        var src = _tl.Sorted().LastOrDefault(k => k.Frame <= frame) ?? _tl.Sorted()[0];
+        _tl.Snapshot();
+        var k = new Keyframe
+        {
+            Frame = frame,
+            Pos = s.Pos,
+            Rot = Quaternion.Normalize(s.Rot),
+            Fov = s.Fov,
+            Tangent = TangentMode.Auto,
+            TargetName = src.TargetName,
+            BasePos = src.BasePos,
+            BaseRot = src.BaseRot,
+        };
+        // a frame inside a hold: split the hold so the camera still stays put
+        if(src.HoldFrames > 0 && frame < src.Frame + src.HoldFrames)
+        {
+            k.HoldFrames = src.Frame + src.HoldFrames - frame;
+            src.HoldFrames = frame - src.Frame;
+        }
+        _tl.Keys.Add(k);
+        Selected = k;
+        SetStatus($"已从运镜在第 {frame} 帧生成镜头 {_tl.Keys.Count}。", false);
+    }
+
+    private void Recapture(Keyframe target)
+    {
+        var k = MakeKey();
+        if(k is null) return;
+        _tl.Snapshot();
+        CopyPose(k, target);
+        SetStatus($"已用当前镜头替换镜头 {_tl.Keys.IndexOf(target) + 1}", false);
+    }
+
+    private static void CopyPose(Keyframe from, Keyframe to)
+    {
+        to.Pos = from.Pos; to.Rot = from.Rot; to.Fov = from.Fov; to.SelfCheckError = from.SelfCheckError;
+        to.TargetName = from.TargetName; to.BasePos = from.BasePos; to.BaseRot = from.BaseRot;
+    }
+
+    private void Duplicate(Keyframe k)
+    {
+        _tl.Snapshot();
+        var c = k.Clone();
+        c.Frame = _tl.NearestFreeFrame(k.Frame + _defaultGapFrames);
+        if(c.Frame > _tl.Length) _tl.Length = c.Frame;
+        _tl.Keys.Add(c);
+        Selected = c;
     }
 
     private void OpenSaveDialog()
@@ -546,11 +797,11 @@ public sealed class MainWindow : Window, IDisposable
     {
         try
         {
-            if(_path == null) throw new InvalidOperationException("至少需要 2 个关键帧");
+            if(_path == null) throw new InvalidOperationException("至少需要 2 个镜头节点");
             var frames = _path.Bake(PathBuilder.Fps);
             XcpWriter.Write(path, frames);
             _lastDir = Path.GetDirectoryName(path) ?? _lastDir;
-            SetStatus($"已导出 {frames.Count} 帧 → {path}", false);
+            SetStatus($"已导出 {frames.Count} 帧 (30fps) → {path}", false);
             _log.Info($"exported {frames.Count} frames to {path}");
         }
         catch(Exception ex)

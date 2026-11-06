@@ -34,10 +34,12 @@ public sealed class Overlay
         _gui = gui; _clientState = clientState; _targets = targets;
     }
 
-    public void Draw(CameraPath? path, IReadOnlyList<Keyframe> keys, float? externalPlayhead)
+    /// <param name="selected">Node to highlight (reference compare).</param>
+    public void Draw(CameraPath? path, IReadOnlyList<Keyframe> keys, float? externalPlayhead, Keyframe? selected = null)
     {
         if(!Enabled || !_clientState.IsGPosing) return;
         if(!CameraCapture.TryGetBase(_targets, out var basePos, out var baseRot, out _, out _)) return;
+        if(selected != null) SelectedKey = -1;
 
         var dl = ImGui.GetBackgroundDrawList();
         Vector3 ToWorld(Vector3 rel) => Vector3.Transform(rel, baseRot) + basePos;
@@ -71,12 +73,12 @@ public sealed class Overlay
             for(int i = 0; i < keys.Count; i++)
             {
                 var k = keys[i];
-                bool sel = i == SelectedKey;
+                bool sel = i == SelectedKey || (selected != null && ReferenceEquals(k, selected));
                 uint col = sel ? 0xFF00FFFF : 0xFFFFAA33;
                 DrawFrustum(dl, ToWorld(k.Pos), Quaternion.Normalize(baseRot * k.Rot), k.Fov, col, sel ? 2.5f : 1.5f);
                 if(ShowLabels && _gui.WorldToScreen(ToWorld(k.Pos), out var sp))
                 {
-                    var label = $"#{i + 1}  {k.TimeSec:0.0}s";
+                    var label = $"#{i + 1}  F{k.Frame}";
                     dl.AddText(sp + new Vector2(8, -18), 0xFF000000, label);
                     dl.AddText(sp + new Vector2(7, -19), col, label);
                 }

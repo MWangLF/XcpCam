@@ -203,6 +203,29 @@ public sealed class BrioBridge
 
     public bool TimelineLoop => Get(Get(Get(_config, "Configuration"), "Timeline"), "Loop") is true;
 
+    /// <summary>Moves Brio's Vivacity playhead (fractional frames allowed) and applies it to all timeline hosts.</summary>
+    public void SetTimelineTime(double frame)
+    {
+        if(_timeline == null) return;
+        _timeline.GetType().GetField("_currentTime", Inst)?.SetValue(_timeline, frame);
+        Call(_timeline, "ApplyCurrentFrame", true);
+    }
+
+    /// <summary>
+    /// Points Brio's current camera at a world pose, if it is a free camera (used to look through a node).
+    /// Returns false if the current camera is not a free camera.
+    /// </summary>
+    public bool SetCurrentFreeCamPose(Vector3 position, float yaw, float pitch, float roll, float? fovOffset)
+    {
+        var vc = Get(_vcm, "CurrentCamera");
+        if(vc == null || Get(vc, "IsFreeCamera") is not true) return false;
+        Set(vc, "Position", position);
+        Set(vc, "Rotation", new Vector3(yaw, pitch, 0));
+        Set(vc, "PivotRotation", roll);
+        if(fovOffset is float f) Set(vc, "FoV", f);
+        return true;
+    }
+
     // ---------------- XAT cutscene player ----------------
 
     public bool CutsceneIsRunning => Get(_cutscene, "IsRunning") is true;
