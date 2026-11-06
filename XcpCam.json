@@ -1,0 +1,10 @@
+{
+  "Author": "local",
+  "Name": "XcpCam",
+  "InternalName": "XcpCam",
+  "Description": "Capture multiple GPose camera keyframes (e.g. Brio cameras) and export an XAT .xcp camera path for Brio's XAT player.",
+  "Punchline": "Keyframe the GPose camera and export .xcp",
+  "ApplicableVersion": "any",
+  "DalamudApiLevel": 15,
+  "Tags": [ "gpose", "camera", "xat", "brio" ]
+}
