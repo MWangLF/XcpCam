@@ -1,6 +1,7 @@
 using Dalamud.Bindings.ImGui;
 using System;
 using System.Linq;
+using System.Collections.Generic;
 using System.Numerics;
 using XcpCam.Core;
 
@@ -28,18 +29,28 @@ public sealed class TimelineWidget
     public Action? BeforeTrackEdit;
 
     private Keyframe? _dragKey;
-    private float _dragGrabOffset;
     private bool _scrubbing;
+    private Dictionary<Guid, int> _dragFrames = new();
+    private float _dragStartFrame;
+    private Vector2? _boxStart;
+    private bool _boxAdd;
 
-    private const float RulerH = 22f, OutputH = 14f, LaneH = 30f, NodeR = 7f, HeaderW = 190f;
+    private const float RulerH = 22f, OutputH = 14f, NodeR = 7f, HeaderW = 190f;
+    private float LaneH = 30f, trackScroll;
+    private bool _panning;
+    private const float ViewHeight = 260f;
 
     public void Draw(CamTimeline tl, ShotComposer? comp)
     {
         PlayheadChanged = false; KeysChanged = false; DragStarted = false; TracksEdited = false;
+        if(Selected != null && tl.SelectedNodes.Count > 0 && !tl.SelectedNodes.Contains(Selected.Id))
+            Selected = tl.AllKeys.FirstOrDefault(k => tl.SelectedNodes.Contains(k.Id));
 
         var start = ImGui.GetCursorScreenPos();
         float totalW = MathF.Max(300, ImGui.GetContentRegionAvail().X);
-        float height = RulerH + OutputH + 4 + tl.Tracks.Count * LaneH + 4;
+        float height = ViewHeight;
+        float trackHeight = height - RulerH - OutputH - 4;
+        trackScroll = Math.Clamp(trackScroll, 0, Math.Max(0, tl.Tracks.Count * LaneH - trackHeight));
 
         // ---- track headers (left column) ----
         // Header buttons can add / remove / reorder tracks, so everything below must use the track list as it is
@@ -64,7 +75,14 @@ public sealed class TimelineWidget
         float visibleFrames = width / PixelsPerFrame;
         if(hovered && io.MouseWheel != 0)
         {
-            if(io.KeyCtrl)
+            if(io.KeyCtrl && io.KeyAlt)
+            {
+                float at = (trackScroll + mouse.Y - origin.Y - RulerH - OutputH - 4) / LaneH;
+                LaneH = Math.Clamp(LaneH * MathF.Pow(1.2f, io.MouseWheel), 26, 90);
+                trackScroll = at * LaneH - (mouse.Y - origin.Y - RulerH - OutputH - 4);
+            }
+            else if(io.KeyAlt) trackScroll -= io.MouseWheel * LaneH * 2;
+            else if(io.KeyCtrl)
             {
                 float fAtMouse = ScrollFrame + (mouse.X - origin.X) / PixelsPerFrame;
                 PixelsPerFrame = Math.Clamp(PixelsPerFrame * (io.MouseWheel > 0 ? 1.2f : 1f / 1.2f), 0.5f, 60f);
@@ -73,14 +91,15 @@ public sealed class TimelineWidget
             else
                 ScrollFrame -= io.MouseWheel * visibleFrames * 0.1f;
         }
-        if(ImGui.IsItemActive() && ImGui.IsMouseDragging(ImGuiMouseButton.Middle))
-            ScrollFrame -= io.MouseDelta.X / PixelsPerFrame;
+        if(ImGui.IsItemActive() && (ImGui.IsMouseDragging(ImGuiMouseButton.Middle) || _panning && ImGui.IsMouseDragging(ImGuiMouseButton.Left)))
+        { ScrollFrame -= io.MouseDelta.X / PixelsPerFrame; trackScroll -= io.MouseDelta.Y; }
+        trackScroll = Math.Clamp(trackScroll, 0, Math.Max(0, tl.Tracks.Count * LaneH - trackHeight));
         visibleFrames = width / PixelsPerFrame;
         ScrollFrame = Math.Clamp(ScrollFrame, -5, MathF.Max(-5, tl.Length + 5 - visibleFrames));
 
         float X(float frame) => origin.X + (frame - ScrollFrame) * PixelsPerFrame;
         float FrameAt(float x) => ScrollFrame + (x - origin.X) / PixelsPerFrame;
-        float LaneTop(int i) => origin.Y + RulerH + OutputH + 4 + i * LaneH;
+        float LaneTop(int i) => origin.Y + RulerH + OutputH + 4 + i * LaneH - trackScroll;
 
         // background
         dl.PushClipRect(origin, origin + size, true);
@@ -88,8 +107,9 @@ public sealed class TimelineWidget
         dl.AddRectFilled(origin, origin + new Vector2(width, RulerH), 0xFF2A2A2A);
         for(int i = 0; i < lanes; i++)
         {
+            if(LaneTop(i) + LaneH <= origin.Y + RulerH + OutputH + 4 || LaneTop(i) >= origin.Y + height) continue;
             uint bg = i == tl.ActiveTrackIndex ? 0xFF2C2C34 : (i % 2 == 0 ? 0xFF222222 : 0xFF1B1B1B);
-            dl.AddRectFilled(new Vector2(origin.X, LaneTop(i)), new Vector2(origin.X + width, LaneTop(i) + LaneH), bg);
+            dl.AddRectFilled(new Vector2(origin.X, Math.Max(origin.Y + RulerH + OutputH + 4, LaneTop(i))), new Vector2(origin.X + width, Math.Min(origin.Y + height, LaneTop(i) + LaneH)), bg);
         }
         float xEnd = X(tl.Length);
         if(xEnd < origin.X + width) dl.AddRectFilled(new Vector2(xEnd, origin.Y), origin + size, 0x60000000);
@@ -134,8 +154,10 @@ public sealed class TimelineWidget
 
         // lanes: segments, speed tint, holds, nodes
         Keyframe? hoveredKey = null;
+        dl.PushClipRect(new Vector2(origin.X, origin.Y + RulerH + OutputH + 4), origin + size, true);
         for(int ti = 0; ti < lanes; ti++)
         {
+            if(LaneTop(ti) + LaneH <= origin.Y + RulerH + OutputH + 4 || LaneTop(ti) >= origin.Y + height) continue;
             var track = tl.Tracks[ti];
             float midY = LaneTop(ti) + LaneH / 2;
             var seq = comp?.SequenceOf(ti);
@@ -175,10 +197,11 @@ public sealed class TimelineWidget
                     dl.AddLine(new Vector2(x, LaneTop(ti) + 2), new Vector2(x, LaneTop(ti) + LaneH - 2), 0xFFFFFFFF, 1.5f);
                     dl.AddText(new Vector2(x - 14, LaneTop(ti) - 1), 0xFFFFFFFF, "✂");
                 }
-                bool over = hovered && Vector2.Distance(mouse, new Vector2(x, midY)) <= NodeR + 3;
+                bool over = hovered && mouse.Y >= origin.Y + RulerH + OutputH + 4 &&
+                    Vector2.Distance(mouse, new Vector2(x, midY)) <= NodeR + 3;
                 if(over) hoveredKey = k;
-                bool sel = k == Selected;
-                uint fill = k.Tangent switch { TangentMode.Stop => 0xFF3366FF, TangentMode.Linear => 0xFF33CCCC, _ => track.Color };
+                bool sel = tl.SelectedNodes.Contains(k.Id) || k == Selected;
+                uint fill = track.Color;
                 if(!active) fill = (fill & 0x00FFFFFF) | 0x70000000;
                 DrawDiamond(dl, new Vector2(x, midY), NodeR + (sel ? 2 : 0), sel ? 0xFF00FFFF : fill, over || sel ? 0xFFFFFFFF : 0xFF000000);
                 int idx = track.Keys.IndexOf(k) + 1;
@@ -186,6 +209,7 @@ public sealed class TimelineWidget
             }
         }
 
+        dl.PopClipRect();
         // playhead
         float px = X(tl.Playhead);
         dl.AddLine(new Vector2(px, origin.Y), new Vector2(px, origin.Y + height), 0xFF4444FF, 2);
@@ -197,22 +221,29 @@ public sealed class TimelineWidget
         {
             if(hoveredKey != null)
             {
-                _dragKey = hoveredKey;
-                Selected = _dragKey;
-                var owner = tl.TrackOf(_dragKey);
+                bool additive = ImGui.GetIO().KeyCtrl || ImGui.GetIO().KeyShift;
+                if(additive) tl.ToggleNode(hoveredKey.Id);
+                else if(!tl.SelectedNodes.Contains(hoveredKey.Id)) tl.SelectNodes([hoveredKey.Id]);
+                Selected = hoveredKey;
+                var owner = tl.TrackOf(hoveredKey);
                 if(owner != null) tl.ActiveTrackIndex = tl.Tracks.IndexOf(owner);
-                _dragGrabOffset = FrameAt(mouse.X) - _dragKey.Frame;
-                DragStarted = true;
+                _dragKey = additive ? null : hoveredKey;
+                _dragStartFrame = FrameAt(mouse.X);
+                _dragFrames = owner?.Keys.Where(k => tl.SelectedNodes.Contains(k.Id)).ToDictionary(k => k.Id, k => k.Frame) ?? new();
+                if(_dragKey != null) { tl.Snapshot(); DragStarted = true; }
             }
             else
             {
-                _scrubbing = true;
-                float laneY = mouse.Y - (origin.Y + RulerH + OutputH + 4);
+                bool box = ImGui.GetIO().KeyCtrl;
+                _boxStart = box ? mouse : null; _boxAdd = box;
+                _scrubbing = !box && mouse.Y < origin.Y + RulerH;
+                _panning = !box && !_scrubbing;
+                float laneY = mouse.Y - (origin.Y + RulerH + OutputH + 4) + trackScroll;
                 if(laneY >= 0)
                 {
                     int lane = (int)(laneY / LaneH);
                     if(lane >= 0 && lane < lanes) tl.ActiveTrackIndex = lane;
-                    Selected = null;
+                    if(!box) { Selected = null; tl.SelectNodes([]); }
                 }
             }
         }
@@ -221,10 +252,14 @@ public sealed class TimelineWidget
         {
             if(_dragKey != null)
             {
-                int target = (int)MathF.Round(FrameAt(mouse.X) - _dragGrabOffset);
-                int before = _dragKey.Frame;
-                if(tl.MoveKey(_dragKey, target) != before) KeysChanged = true;
+                int delta = (int)MathF.Round(FrameAt(mouse.X) - _dragStartFrame);
+                var targets = _dragFrames.ToDictionary(p => p.Key, p => p.Value + delta);
+                if(targets.Any(p => tl.AllKeys.Any(k => k.Id == p.Key && k.Frame != p.Value)) && tl.MoveNodes(targets)) KeysChanged = true;
                 ImGui.SetTooltip($"第 {_dragKey.Frame} 帧  ({_dragKey.Frame / (float)tl.Fps:0.00}s)");
+            }
+            else if(_boxStart is Vector2 boxStart)
+            {
+                dl.AddRect(Vector2.Min(boxStart, mouse), Vector2.Max(boxStart, mouse), 0xFFFFFF55);
             }
             else if(_scrubbing)
             {
@@ -234,6 +269,17 @@ public sealed class TimelineWidget
         }
         else
         {
+            if(_boxStart is Vector2 boxStart)
+            {
+                var a = Vector2.Min(boxStart, mouse); var b = Vector2.Max(boxStart, mouse);
+                var ids = tl.Tracks.SelectMany((track, lane) => track.Keys.Where(k =>
+                    X(k.Frame) >= a.X && X(k.Frame) <= b.X &&
+                    LaneTop(lane) + LaneH * 0.5f >= a.Y && LaneTop(lane) + LaneH * 0.5f <= b.Y).Select(k => k.Id));
+                tl.SelectNodes(ids, _boxAdd);
+                Selected ??= tl.AllKeys.FirstOrDefault(k => tl.SelectedNodes.Contains(k.Id));
+            }
+            _boxStart = null;
+            _panning = false;
             _dragKey = null;
             _scrubbing = false;
         }
@@ -269,7 +315,7 @@ public sealed class TimelineWidget
         if(ImGui.SmallButton("+ 新镜头轨道"))
         {
             BeforeTrackEdit?.Invoke();
-            tl.AddTrack();
+            tl.AddTrack(); trackScroll = 0;
             Selected = null;
             TracksEdited = true;
         }
@@ -281,7 +327,8 @@ public sealed class TimelineWidget
         for(int i = 0; i < tl.Tracks.Count; i++)
         {
             var t = tl.Tracks[i];
-            float y = start.Y + RulerH + OutputH + 4 + i * LaneH;
+            float y = start.Y + RulerH + OutputH + 4 + i * LaneH - trackScroll;
+            if(y < start.Y + RulerH + OutputH + 4 || y + LaneH > start.Y + height) continue;
             ImGui.PushID($"trk{i}");
             dl.AddRectFilled(new Vector2(start.X + 2, y + 4), new Vector2(start.X + 6, y + LaneH - 4), t.Color);
 

@@ -2,6 +2,7 @@ using Dalamud.Bindings.ImGui;
 using Dalamud.Plugin.Services;
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Numerics;
 using XcpCam.Core;
 
@@ -17,6 +18,16 @@ public sealed class Overlay
     private readonly IGameGui _gui;
     private readonly IClientState _clientState;
     private readonly ITargetManager _targets;
+    private readonly Dictionary<ShotCurves, PathDisplay> _pathCache = new();
+    private ShotComposer? _cachedComposer;
+    private long _cachedRevision = -1;
+    private PathDisplay Display(ShotCurves shot, CamTimeline timeline, ShotComposer composer)
+    {
+        if(!ReferenceEquals(composer, _cachedComposer) || timeline.Revision != _cachedRevision)
+        { _pathCache.Clear(); _cachedComposer = composer; _cachedRevision = timeline.Revision; }
+        if(!_pathCache.TryGetValue(shot, out var display)) _pathCache[shot] = display = PathDisplay.Build(shot, timeline.Fps);
+        return display;
+    }
 
     public bool Enabled = true;
     public bool ShowPath = true;
@@ -67,23 +78,15 @@ public sealed class Overlay
                 bool trackActive = comp.IsActive(t);
                 foreach(var seg in seq.Segments)
                 {
-                    if(seg.Path == null) continue;
-                    Vector3? prev = null;
-                    for(float f = seg.Start; ; f += step)
+                    foreach(var edge in Display(seg.Curves, tl, comp).Edges)
                     {
-                        bool last = f >= seg.End;
-                        if(last) f = seg.End;
-                        var p = ToWorld(seg.SampleAt(f).Pos);
-                        if(prev is Vector3 pv)
-                        {
-                            bool shown = trackActive && comp.TrackAt(f - step * 0.5f) == t;
-                            float speed = Vector3.Distance(pv, p) / (step / tl.Fps);
-                            uint col = SpeedColors ? SpeedColor(speed / maxSpeed) : tl.Tracks[t].Color;
-                            if(!shown) col = Dim(col);
-                            Line(dl, pv, p, col, shown ? 2.5f : 1.2f);
-                        }
-                        prev = p;
-                        if(last) break;
+                        bool shown = trackActive && comp.TrackAt(edge.EndFrame) == t;
+                        float duration = (edge.EndFrame - edge.StartFrame) / tl.Fps;
+                        float speed = duration > 1e-6f && !edge.Dashed ? Vector3.Distance(edge.Start.Pos, edge.End.Pos) / duration : 0;
+                        uint col = edge.Dashed ? tl.Tracks[t].Color : SpeedColors ? SpeedColor(speed / maxSpeed) : tl.Tracks[t].Color;
+                        if(!shown) col = Dim(col);
+                        if(edge.Dashed) DashedLine(dl, ToWorld(edge.Start.Pos), ToWorld(edge.End.Pos), col);
+                        else Line(dl, ToWorld(edge.Start.Pos), ToWorld(edge.End.Pos), col, shown ? 2.5f : 1.2f);
                     }
                 }
             }
@@ -93,7 +96,9 @@ public sealed class Overlay
             {
                 var a = ToWorld(comp.Sample(cf - 1).Pos);
                 var b = ToWorld(comp.Sample(cf).Pos);
-                DashedLine(dl, a, b, 0xC0FFFFFF);
+                int outputTrack = comp.TrackAt(cf);
+                bool alreadyDrawn = comp.SequenceOf(outputTrack)?.Segments.Any(s => Display(s.Curves, tl, comp).Jumps.Any(j => Math.Abs(j.Frame - cf) < .001f)) == true;
+                if(!alreadyDrawn) DashedLine(dl, a, b, 0xC0FFFFFF);
                 if(_gui.WorldToScreen(b, out var sp) && IsSane(sp))
                 {
                     dl.AddCircle(sp, 7, 0xFFFFFFFF, 12, 2f);
@@ -114,14 +119,35 @@ public sealed class Overlay
                     var k = track.Keys[i];
                     bool sel = selected != null && ReferenceEquals(k, selected);
                     uint col = sel ? 0xFF00FFFF : active ? track.Color : Dim(track.Color);
-                    DrawFrustum(dl, ToWorld(k.Pos), Quaternion.Normalize(baseRot * k.Rot), k.Fov, col, sel ? 2.5f : 1.5f);
-                    if(ShowLabels && _gui.WorldToScreen(ToWorld(k.Pos), out var sp) && IsSane(sp))
+                    var seq = comp?.SequenceOf(t);
+                    var pose = seq == null ? new XcpFrame(k.Pos, k.Rot, k.Fov)
+                        : seq.Segments[seq.SegmentAt(k.Frame)].Curves.NodePose(k);
+                    DrawFrustum(dl, ToWorld(pose.Pos), Quaternion.Normalize(baseRot * pose.Rot), pose.Fov, col, sel ? 2.5f : 1.5f);
+                    if(ShowLabels && _gui.WorldToScreen(ToWorld(pose.Pos), out var sp) && IsSane(sp))
                     {
                         var label = tl.Tracks.Count > 1 ? $"{track.Name} #{i + 1}  F{k.Frame}" : $"#{i + 1}  F{k.Frame}";
                         if(k.CutIn) label += " ✂";
                         dl.AddText(sp + new Vector2(8, -18), 0xFF000000, label);
                         dl.AddText(sp + new Vector2(7, -19), col, label);
                     }
+                }
+                if(comp?.SequenceOf(t) is { } sequence)
+                {
+                    var drawn = new List<XcpFrame>();
+                    foreach(var segment in sequence.Segments)
+                        foreach(var jump in Display(segment.Curves, tl, comp).Jumps)
+                            foreach(var item in new[] { (pose: jump.Before, text: "跳变前"), (pose: jump.After, text: "跳变后") })
+                            {
+                                var pose = item.pose;
+                                bool Same(XcpFrame a) => Vector3.DistanceSquared(a.Pos, pose.Pos) < 1e-7f &&
+                                    Math.Abs(Quaternion.Dot(a.Rot, pose.Rot)) > 1 - 1e-6f && Math.Abs(a.Fov - pose.Fov) < 1e-5f;
+                                if(drawn.Count >= 128 || drawn.Exists(Same) || track.Keys.Exists(k => segment.Curves.SeededNodes.Contains(k.Id) && Same(segment.Curves.NodePose(k)))) continue;
+                                drawn.Add(pose);
+                                uint color = active && comp.TrackAt(jump.Frame) == t ? track.Color : Dim(track.Color);
+                                DrawFrustum(dl, ToWorld(pose.Pos), Quaternion.Normalize(baseRot * pose.Rot), pose.Fov, color, 1.5f, true);
+                                if(ShowLabels && _gui.WorldToScreen(ToWorld(pose.Pos), out var point) && IsSane(point))
+                                    dl.AddText(point + new Vector2(7, 5), color, $"{item.text} F{jump.Frame:0.##}");
+                            }
                 }
             }
         }
@@ -146,23 +172,25 @@ public sealed class Overlay
 
     private void DashedLine(ImDrawListPtr dl, Vector3 a, Vector3 b, uint col)
     {
+        if(Vector3.DistanceSquared(a, b) < 1e-10f) return;
         const int n = 12;
         for(int i = 0; i < n; i += 2)
             Line(dl, Vector3.Lerp(a, b, i / (float)n), Vector3.Lerp(a, b, (i + 1) / (float)n), col, 1.5f);
     }
 
-    private void DrawFrustum(ImDrawListPtr dl, Vector3 eye, Quaternion worldRot, float fov, uint col, float thick)
+    private void DrawFrustum(ImDrawListPtr dl, Vector3 eye, Quaternion worldRot, float fov, uint col, float thick, bool dashed = false)
     {
-        // camera looks along local +Z (matches XcpMath / Brio view convention), up = +Y
+        // The view basis uses +Z as backward; draw the visible frustum along local -Z.
         float d = FrustumSize;
         float hy = MathF.Tan(MathF.Max(0.05f, fov) / 2f) * d;
         float hx = hy * Aspect;
-        Vector3 L(float x, float y, float z) => eye + Vector3.Transform(new Vector3(x, y, z), worldRot);
+        Vector3 L(float x, float y, float z) => FrustumGeometry.Point(eye, worldRot, x, y, z);
         var c0 = L(-hx, hy, d); var c1 = L(hx, hy, d); var c2 = L(hx, -hy, d); var c3 = L(-hx, -hy, d);
-        Line(dl, eye, c0, col, thick); Line(dl, eye, c1, col, thick); Line(dl, eye, c2, col, thick); Line(dl, eye, c3, col, thick);
-        Line(dl, c0, c1, col, thick); Line(dl, c1, c2, col, thick); Line(dl, c2, c3, col, thick); Line(dl, c3, c0, col, thick);
+        void Edge(Vector3 a, Vector3 b) { if(dashed) DashedLine(dl, a, b, col); else Line(dl, a, b, col, thick); }
+        Edge(eye, c0); Edge(eye, c1); Edge(eye, c2); Edge(eye, c3);
+        Edge(c0, c1); Edge(c1, c2); Edge(c2, c3); Edge(c3, c0);
         // "up" notch so roll/orientation is visible
-        Line(dl, c0, L(0, hy * 1.4f, d), col, thick); Line(dl, c1, L(0, hy * 1.4f, d), col, thick);
+        Edge(c0, L(0, hy * 1.4f, d)); Edge(c1, L(0, hy * 1.4f, d));
         Dot(dl, eye, col, 3.5f);
     }
 

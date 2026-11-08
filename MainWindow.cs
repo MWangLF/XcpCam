@@ -20,6 +20,9 @@ public sealed class MainWindow : Window, IDisposable
     private readonly Overlay _overlay;
     private readonly GizmoEditor _gizmo = new();
     private readonly TimelineWidget _tlw = new();
+    private readonly GraphEditor _graph = new();
+    private int _graphShot;
+    private Guid _graphNode;
     private readonly TimelineSync _sync;
     private readonly TimelineBake _bake;
 
@@ -42,7 +45,6 @@ public sealed class MainWindow : Window, IDisposable
     private int _pathHash;
 
     private bool _playing;
-    private bool _loop = true;
 
     private int _bakeCamIndex;
 
@@ -51,10 +53,13 @@ public sealed class MainWindow : Window, IDisposable
     private BindSource _source = BindSource.Vivacity;
     private readonly AnimationClock _anim;
     private bool _freezeAnimWhileScrubbing = true;
-    private bool _animFrozenByUs;
+    private readonly AnimationSpeedLease _animationSpeed;
+    private bool _animationLoop = true;
+    private bool _transportOwned;
+    private long _clockEpoch;
+    private bool _wasGpose;
+    private AnimationIdentity _lastAnimationIdentity;
 
-    private static readonly string[] TangentNames = ["自动(平滑)", "停顿", "匀速"];
-    private static readonly string[] ModeNames = ["按时间平滑", "整体匀速"];
     private static readonly string[] SourceNames = ["灵动时间轴", "动画进度条"];
 
     public MainWindow(ITargetManager targets, IClientState clientState, IPluginLog log, BrioBridge brio, Overlay overlay)
@@ -66,7 +71,13 @@ public sealed class MainWindow : Window, IDisposable
         _brio = brio;
         _overlay = overlay;
         _anim = new AnimationClock(targets);
-        _sync = new TimelineSync(brio, log) { Clock = ReadBoundClock };
+        _animationSpeed = new AnimationSpeedLease(brio);
+        _sync = new TimelineSync(brio, log)
+        {
+            Clock = ReadBoundClock,
+            ClockCycle = () => _source == BindSource.Animation && _anim.Wrapped,
+            ClockGeneration = () => _clockEpoch + (_source == BindSource.Animation ? _anim.Generation : 0),
+        };
         _bake = new TimelineBake(brio, log);
         _tlw.BeforeTrackEdit = _tl.Snapshot;
         Size = new Vector2(900, 600);
@@ -76,130 +87,121 @@ public sealed class MainWindow : Window, IDisposable
     // ---------------- bound clock abstraction ----------------
 
     private string SourceName => SourceNames[(int)_source];
+    private bool SourceAvailable => _clientState.IsGPosing && _brio.IsConnected
+        && (_source == BindSource.Vivacity || _anim.Available);
+    private bool FollowingSource => _followBrioPlayhead && SourceAvailable;
+    private bool SourcePlaying => SourceAvailable && (_source == BindSource.Vivacity ? _brio.TimelineIsPlaying : _anim.IsPlaying);
+    private bool TransportPlaying => SourcePlaying;
+    private double SourceFrame => _source == BindSource.Vivacity
+        ? TransportMath.ConvertFrame(_brio.TimelineTime, _brio.TimelineRate, _tl.Fps)
+        : _anim.Time * _tl.Fps;
+    private int? SourceLengthFrames => !SourceAvailable ? null : _source == BindSource.Vivacity
+        ? (int)Math.Ceiling(TransportMath.ConvertFrame(_brio.FrameMax, _brio.TimelineRate, _tl.Fps))
+        : (int)Math.Ceiling(_anim.Duration * _tl.Fps);
 
-    /// <summary>Whether the selected binding source is currently usable.</summary>
-    private bool SourceAvailable => _source == BindSource.Vivacity ? _brio.IsConnected : _anim.Available;
-
-    /// <summary>Frame rate of the bound clock. The animation bar is in seconds, so it uses the camera timeline's own fps.</summary>
-    private int SourceFps => _source == BindSource.Vivacity && _brio.IsConnected ? _brio.TimelineFps : _tl.Fps;
-
-    /// <summary>(playing, time in camera-timeline frames, fps) of the bound clock.</summary>
+    // XAT's start frame and clock use camera-editor frames, regardless of Brio's own rate.
     private (bool playing, double frame, int fps) ReadBoundClock()
+        => (SourcePlaying, SourceAvailable ? SourceFrame : 0, _tl.Fps);
+
+    private void ValidateAnimationCommand()
     {
-        if(_source == BindSource.Vivacity)
-            return (_brio.TimelineIsPlaying, _brio.TimelineTime, _brio.TimelineFps);
-        return (_anim.IsPlaying, _anim.Time * _tl.Fps, _tl.Fps);
+        if(_anim.MatchesCurrent()) return;
+        ReleaseAnimFreeze();
+        _anim.Reset();
+        _lastAnimationIdentity = default;
+        _transportOwned = false;
+        _clockEpoch++;
+        throw new InvalidOperationException("目标或动画刚刚更换，请等待一帧后重试。");
     }
 
-    private double SourceFrame => _source == BindSource.Vivacity ? _brio.TimelineTime : _anim.Time * _tl.Fps;
-
-    /// <summary>Length of the bound clock in camera-timeline frames, or null if unknown.</summary>
-    private int? SourceLengthFrames => _source == BindSource.Vivacity
-        ? (_brio.IsConnected ? _brio.FrameMax : null)
-        : (_anim.Available ? (int)MathF.Round(_anim.Duration * _tl.Fps) : null);
-
-    /// <summary>Moves the bound clock to a camera-timeline frame.</summary>
     private void DriveSourceTo(float frame)
     {
+        if(!SourceAvailable) throw new InvalidOperationException($"{SourceName}不可用，请确认已进入 GPose 并选择目标。");
         if(_source == BindSource.Vivacity)
         {
-            if(_brio.IsConnected) _brio.SetTimelineTime(frame);
+            double f = TransportMath.ConvertFrame(frame, _tl.Fps, _brio.TimelineRate);
+            _brio.SetTimelineTime(Math.Clamp(f, _brio.FrameMin, _brio.FrameMax));
+            _clockEpoch++;
             return;
         }
-        if(!_anim.Available) return;
-        if(_freezeAnimWhileScrubbing && !_animFrozenByUs && _brio.IsConnected && _targets.GPoseTarget != null)
-            _animFrozenByUs = _brio.SetTargetAnimationFrozen(_targets.GPoseTarget.Address, true);
-        _anim.Seek(frame / _tl.Fps);
+        ValidateAnimationCommand();
+        if(_freezeAnimWhileScrubbing)
+        {
+            if(!_animationSpeed.Pause(_anim.Sample.Identity.Actor)) throw new InvalidOperationException("无法通过 Brio 冻结目标动画");
+            _anim.Pause();
+        }
+        if(!_anim.Seek(frame / _tl.Fps)) throw new InvalidOperationException("动画已更换，无法跳转");
     }
 
-    private void ReleaseAnimFreeze()
-    {
-        if(!_animFrozenByUs) return;
-        if(_brio.IsConnected && _targets.GPoseTarget != null)
-            _brio.SetTargetAnimationFrozen(_targets.GPoseTarget.Address, false);
-        _animFrozenByUs = false;
-    }
+    private void ReleaseAnimFreeze() => _animationSpeed.Release();
 
-    /// <summary>The playhead is slaved to the bound source (Vivacity timeline or animation bar).</summary>
-    private bool FollowingSource => _followBrioPlayhead && SourceAvailable;
-
-    /// <summary>Is the bound source itself playing right now?</summary>
-    private bool SourcePlaying => _source == BindSource.Vivacity ? _brio.TimelineIsPlaying : _anim.IsPlaying;
-
-    /// <summary>What the play button shows: our own clock, or the source's when following it.</summary>
-    private bool TransportPlaying => FollowingSource ? SourcePlaying || _animPlayRequested : _playing;
-
-    /// <summary>Set while we asked Brio to play the animation and it has not visibly advanced yet (debounce for the button).</summary>
-    private bool _animPlayRequested;
-    private DateTime _animPlayRequestUtc;
-
-    /// <summary>
-    /// Plays / pauses the bound source from our transport buttons. For the animation bar this seeks the animation to
-    /// the playhead and lets it run (or freezes it) through Brio's speed override, so Brio's own speed hook does the
-    /// timing; the playhead then follows the animation.
-    /// </summary>
     private void SetSourcePlaying(bool play)
     {
+        if(!SourceAvailable) throw new InvalidOperationException($"{SourceName}不可用，请确认已进入 GPose 并选择目标。");
+        if(_source == BindSource.Animation) ValidateAnimationCommand();
+        _playing = false;
         if(_source == BindSource.Vivacity)
         {
-            if(play) _brio.SetTimelineTime(_tl.Playhead);
+            if(play)
+            {
+                double frame = TransportMath.ConvertFrame(_tl.Playhead, _tl.Fps, _brio.TimelineRate);
+                _brio.SetTimelineTime(TransportMath.PlayPosition(frame, _brio.FrameMin, _brio.FrameMax));
+                _clockEpoch++;
+            }
             _brio.SetTimelinePlaying(play);
-            return;
         }
-
-        var target = _targets.GPoseTarget;
-        if(!_anim.Available || target == null) return;
-        if(play)
+        else if(play)
         {
-            float f = _tl.Playhead;
-            if(f >= _anim.Duration * _tl.Fps - 0.5f) f = 0; // at the end: start over
-            _anim.Seek(f / _tl.Fps);
-            // remove any freeze (ours or Brio's own) so the animation runs at its normal speed
-            _brio.SetTargetAnimationSpeed(target.Address, null);
-            _animFrozenByUs = false;
-            _animPlayRequested = true;
-            _animPlayRequestUtc = DateTime.UtcNow;
+            float seconds = (float)TransportMath.PlayPosition(_tl.Playhead / _tl.Fps, 0, _anim.Duration);
+            if(!_anim.Seek(seconds) || !_animationSpeed.Play(_anim.Sample.Identity.Actor))
+                throw new InvalidOperationException("无法通过 Brio 播放目标动画");
+            _anim.Play();
         }
         else
         {
-            _animFrozenByUs = _brio.SetTargetAnimationFrozen(target.Address, true);
-            _animPlayRequested = false;
+            if(!_animationSpeed.Pause(_anim.Sample.Identity.Actor)) throw new InvalidOperationException("无法通过 Brio 暂停目标动画");
+            _anim.Pause();
         }
+        _transportOwned = true;
+        _tl.Playhead = (float)SourceFrame;
     }
 
-    /// <summary>
-    /// Moves the playhead from a user action (scrub, frame input, step, jump). When the playhead follows the source,
-    /// the source is moved too — otherwise the follow would snap the playhead straight back.
-    /// </summary>
     private void SeekPlayhead(float frame)
     {
         _playing = false;
         _tl.Playhead = Math.Clamp(frame, 0, _tl.Length);
-        if((FollowingSource || _drivePlayheadToBrio) && SourceAvailable) DriveSourceTo(_tl.Playhead);
+        if((FollowingSource || _drivePlayheadToBrio || _transportOwned) && SourceAvailable)
+            Try(() => DriveSourceTo(_tl.Playhead));
     }
 
-    private void TogglePlay()
+    private void TogglePlay() => Try(() => SetSourcePlaying(!TransportPlaying));
+
+    private void StopTransport() => Try(() =>
     {
-        if(FollowingSource)
+        if(!SourceAvailable) throw new InvalidOperationException($"{SourceName}不可用");
+        if(_source == BindSource.Animation) ValidateAnimationCommand();
+        if(_source == BindSource.Vivacity)
         {
-            SetSourcePlaying(!TransportPlaying);
-            return;
+            _brio.StopTimeline();
+            _clockEpoch++;
         }
-        _playing = !_playing;
-        if(_playing && _tl.Playhead >= _tl.LastFrame) _tl.Playhead = _tl.FirstFrame;
-    }
-
-    private void StopTransport()
-    {
-        if(FollowingSource)
+        else
         {
-            SetSourcePlaying(false);
-            _tl.Playhead = _tl.FirstFrame;
-            DriveSourceTo(_tl.Playhead);
-            return;
+            if(!_animationSpeed.Pause(_anim.Sample.Identity.Actor)) throw new InvalidOperationException("无法冻结目标动画");
+            if(!_anim.Seek(0)) throw new InvalidOperationException("动画已更换，无法停止");
+            _anim.Stop();
         }
         _playing = false;
-        _tl.Playhead = _tl.FirstFrame;
+        _transportOwned = true;
+        _tl.Playhead = (float)SourceFrame;
+    });
+
+    private bool CurrentLoop => _source == BindSource.Vivacity && _brio.IsConnected ? _brio.TimelineLoop : _animationLoop;
+
+    private void SetLoop(bool loop)
+    {
+        if(_source == BindSource.Vivacity) _brio.TimelineLoop = loop;
+        else _animationLoop = loop;
     }
 
     private void SetSource(BindSource s)
@@ -207,7 +209,11 @@ public sealed class MainWindow : Window, IDisposable
         if(s == _source) return;
         if(_sync.Bound) _sync.Unbind();
         ReleaseAnimFreeze();
-        _animPlayRequested = false;
+        _anim.Reset();
+        _lastAnimationIdentity = default;
+        _transportOwned = false;
+        _playing = false;
+        _clockEpoch++;
         _source = s;
         _sync.ClockName = SourceName;
         SetStatus($"相机时间轴已改为绑定「{SourceName}」", false);
@@ -221,7 +227,9 @@ public sealed class MainWindow : Window, IDisposable
 
     private Keyframe? Selected
     {
-        get => _tlw.Selected != null && _tl.AllKeys.Contains(_tlw.Selected) ? _tlw.Selected : null;
+        get => _tlw.Selected != null && _tl.AllKeys.Contains(_tlw.Selected) &&
+            (_tl.SelectedNodes.Count == 0 || _tl.SelectedNodes.Contains(_tlw.Selected.Id))
+            ? _tlw.Selected : _tl.AllKeys.FirstOrDefault(k => _tl.SelectedNodes.Contains(k.Id));
         set => _tlw.Selected = value;
     }
 
@@ -229,7 +237,48 @@ public sealed class MainWindow : Window, IDisposable
 
     public void FrameworkTick(float dt)
     {
-        _anim.Update();
+        bool gpose = _clientState.IsGPosing;
+        if(!gpose)
+        {
+            if(_wasGpose)
+            {
+                ReleaseAnimFreeze();
+                _anim.Reset();
+                _lastAnimationIdentity = default;
+                _transportOwned = false;
+                _clockEpoch++;
+                if(_sync.Bound) _sync.Unbind();
+            }
+            _wasGpose = false;
+            return;
+        }
+        _wasGpose = true;
+
+        if(_source == BindSource.Animation)
+        {
+            bool owned = _animationSpeed.Active;
+            bool stillOwned = owned && _animationSpeed.OwnsCurrentValue();
+            if(owned && !stillOwned) _transportOwned = false;
+            bool mayAdvance = true;
+            var actor = _targets.GPoseTarget == null ? null : _brio.GetAnimationActor(_targets.GPoseTarget.Address);
+            if(actor != null && _brio.TryAnimationSpeed(actor, out _, out float speed)) mayAdvance = speed > 0;
+            _anim.Update(dt, _animationLoop, mayAdvance);
+            if(_lastAnimationIdentity != default && (!_anim.Available || _lastAnimationIdentity != _anim.Sample.Identity))
+            {
+                ReleaseAnimFreeze();
+                _transportOwned = false;
+                _clockEpoch++;
+            }
+            _lastAnimationIdentity = _anim.Available ? _anim.Sample.Identity : default;
+            if(_anim.MustFreeze)
+            {
+                if(_animationSpeed.Pause(_anim.Sample.Identity.Actor) && _anim.FreezeAtEnd())
+                    SetStatus("动画播放完成，已冻结在末尾（未开启循环）。", false);
+                else SetStatus("动画已到末尾，但无法冻结目标，请检查 Brio 连接。", true);
+            }
+            else if(_anim.Ended && _animationSpeed.Frozen && _animationSpeed.OwnsCurrentValue())
+                _anim.FreezeAtEnd();
+        }
 
         // fps only follows the Vivacity timeline; the animation bar is in seconds and has no fps of its own
         if(_source == BindSource.Vivacity && _syncFpsWithBrio && _brio.IsConnected)
@@ -237,34 +286,28 @@ public sealed class MainWindow : Window, IDisposable
             int fps = _brio.TimelineFps;
             if(fps != _tl.Fps)
             {
-                _tl.SetFps(fps);
-                SetStatus($"已同步 Brio 灵动时间轴帧率：{fps}fps（镜头节点按秒保持不变）", false);
+                try
+                {
+                    _tl.SetFps(fps);
+                    SetStatus($"已同步 Brio 灵动时间轴帧率：{fps}fps（镜头节点按秒保持不变）", false);
+                }
+                catch(InvalidOperationException ex)
+                {
+                    _syncFpsWithBrio = false;
+                    SetStatus(ex.Message + " 已暂停自动帧率同步。", true);
+                }
             }
         }
-
-        // the user pressed play on the animation in Brio: give the animation back to Brio
-        if(_source == BindSource.Animation && _animFrozenByUs && _anim.IsAdvancing)
-            _animFrozenByUs = false;
-        // our play request has taken effect (or timed out)
-        if(_animPlayRequested && (_anim.IsAdvancing || (DateTime.UtcNow - _animPlayRequestUtc).TotalSeconds > 1))
-            _animPlayRequested = false;
 
         RebuildPathIfNeeded();
 
-        if(FollowingSource)
+        if(SourceAvailable && (FollowingSource || _transportOwned || _sync.Bound))
         {
-            _playing = false; // our own clock is idle while the source drives the playhead
+            _playing = false;
+            // A bound source may be longer than the camera shots. Never clamp away its real progress.
+            int sourceEnd = SourceLengthFrames ?? 0;
+            _tl.Length = Math.Max(_tl.Length, Math.Max(sourceEnd, _tl.LastFrame));
             _tl.Playhead = (float)Math.Clamp(SourceFrame, 0, _tl.Length);
-        }
-        else if(_playing)
-        {
-            _tl.Playhead += dt * _tl.Fps;
-            float end = _comp != null ? _tl.LastFrame : _tl.Length;
-            if(_tl.Playhead > end)
-            {
-                if(_loop) _tl.Playhead = _tl.FirstFrame;
-                else { _tl.Playhead = end; _playing = false; }
-            }
         }
 
         if(_lookThrough && _comp != null) LookThroughPlayhead();
@@ -302,9 +345,10 @@ public sealed class MainWindow : Window, IDisposable
         var sel = Selected;
         if(sel != null && _clientState.IsGPosing && CameraCapture.TryGetBase(_targets, out var bp, out var br, out _, out _))
         {
+            RefreshNodePose(sel);
             var prePos = sel.Pos;
             var preRot = sel.Rot;
-            _gizmo.Draw(sel, bp, br);
+            bool changed = _gizmo.Draw(sel, bp, br);
             if(_gizmo.DragStarted)
             {
                 // snapshot the pose from before this drag, then re-apply the first frame of the drag
@@ -313,20 +357,22 @@ public sealed class MainWindow : Window, IDisposable
                 _tl.Snapshot();
                 sel.Pos = newPos; sel.Rot = newRot;
             }
+            if(changed) WriteNodePose(sel, _gizmo.Operation == GizmoEditor.Op.Translate,
+                _gizmo.Operation == GizmoEditor.Op.Rotate, false);
         }
     }
 
     private int ComputeHash()
     {
         var h = new HashCode();
-        h.Add(_settings.Mode); h.Add(_settings.EaseStart); h.Add(_settings.EaseEnd);
-        h.Add(_settings.Duration); h.Add(_settings.EaseInFraction); h.Add(_settings.EaseOutFraction); h.Add(_settings.RotationWeight);
+        h.Add(_tl.Revision);
         h.Add(_tl.Fps);
         h.Add(_tl.Tracks.Count);
         foreach(var t in _tl.Tracks)
         {
             h.Add(t.GetHashCode()); h.Add(t.Muted); h.Add(t.Solo); h.Add(t.Keys.Count);
-            foreach(var k in t.Keys) { h.Add(k.Frame); h.Add(k.Pos); h.Add(k.Rot); h.Add(k.Fov); h.Add(k.Tangent); h.Add(k.HoldFrames); h.Add(k.CutIn); }
+            foreach(var k in t.Keys)
+            { h.Add(k.Id); h.Add(k.Frame); h.Add(k.HoldFrames); h.Add(k.CutIn); }
         }
         return h.ToHashCode();
     }
@@ -367,6 +413,11 @@ public sealed class MainWindow : Window, IDisposable
                 DrawTimelineTab(gpose);
                 ImGui.EndTabItem();
             }
+            if(ImGui.BeginTabItem("曲线编辑器"))
+            {
+                DrawGraphTab();
+                ImGui.EndTabItem();
+            }
             if(ImGui.BeginTabItem("Brio 联动"))
             {
                 DrawBrioTab(gpose);
@@ -379,16 +430,80 @@ public sealed class MainWindow : Window, IDisposable
             ImGui.TextColored(_statusIsError ? new Vector4(1, 0.4f, 0.4f, 1) : new Vector4(0.5f, 1, 0.5f, 1), _status);
     }
 
+    private ShotCurves? ShotFor(Keyframe node)
+    {
+        var track = _tl.TrackOf(node);
+        if(track == null) return null;
+        CurveModel.Ensure(track, _tl.Fps);
+        var groups = CurveModel.Groups(track);
+        int index = groups.FindIndex(g => g.Contains(node));
+        return index < 0 ? null : track.Shots[index];
+    }
+
+    private void RefreshNodePose(Keyframe node)
+    {
+        if(ShotFor(node) is not { } shot) return;
+        var pose = shot.NodePose(node);
+        node.Pos = pose.Pos; node.Rot = pose.Rot; node.Fov = pose.Fov;
+    }
+
+    private void WriteNodePose(Keyframe node, bool position = true, bool rotation = true, bool fov = true)
+    {
+        if(ShotFor(node) is not { } shot) return;
+        try
+        {
+            shot.WritePose(node, new XcpFrame(node.Pos, node.Rot, node.Fov), position, rotation, fov);
+            _tl.Touch();
+        }
+        catch(InvalidOperationException ex) { RefreshNodePose(node); SetStatus(ex.Message, true); }
+    }
+
+    private void DrawGraphTab()
+    {
+        if(ImGui.SmallButton("撤销##graph")) { _tl.Undo(); Selected = null; }
+        ImGui.SameLine();
+        if(ImGui.SmallButton("重做##graph")) { _tl.Redo(); Selected = null; }
+        var selected = Selected;
+        if(selected != null && selected.Id != _graphNode)
+        {
+            _graphNode = selected.Id;
+            var owner = _tl.TrackOf(selected);
+            if(owner != null)
+            {
+                _tl.ActiveTrackIndex = _tl.Tracks.IndexOf(owner);
+                _graphShot = CurveModel.Groups(owner).FindIndex(g => g.Contains(selected));
+            }
+        }
+        ImGui.SetNextItemWidth(180);
+        int trackIndex = _tl.ActiveTrackIndex;
+        var trackNames = _tl.Tracks.Select(t => t.Name).ToArray();
+        if(ImGui.Combo("轨道", ref trackIndex, trackNames, trackNames.Length))
+        { _tl.ActiveTrackIndex = trackIndex; _graphShot = 0; Selected = null; }
+        var track = _tl.ActiveTrack;
+        CurveModel.Ensure(track, _tl.Fps);
+        if(track.Shots.Count == 0) { ImGui.TextDisabled("请先在相机时间轴抓取镜头。"); return; }
+        _graphShot = Math.Clamp(_graphShot, 0, track.Shots.Count - 1);
+        ImGui.SameLine(); ImGui.SetNextItemWidth(250);
+        var names = track.Shots.Select(s => s.Name).ToArray();
+        ImGui.Combo("镜头段", ref _graphShot, names, names.Length);
+        var shot = track.Shots[_graphShot];
+        ImGui.TextDisabled($"{track.Name} → {shot.Name} · 高级/简单曲线互斥编辑");
+        _graph.Draw(shot, _tl);
+        if(_graph.PlayheadChanged) SeekPlayhead(_tl.Playhead);
+        if(!string.IsNullOrEmpty(_graph.Status)) ImGui.TextWrapped(_graph.Status);
+        ImGui.TextDisabled("高级曲线直接控制相对位置、姿态、速度与节点帧；简单曲线调整节奏。另一层锁定且保留，切换不重建高级数据。");
+    }
+
     // ---------------- timeline tab ----------------
 
     private void DrawTimelineTab(bool gpose)
     {
         // --- transport ---
         if(ImGui.Button(TransportPlaying ? "暂停###play" : "播放###play")) TogglePlay();
-        if(ImGui.IsItemHovered() && FollowingSource)
+        if(ImGui.IsItemHovered())
             ImGui.SetTooltip(_source == BindSource.Animation
-                ? "播放头正跟随动画进度条：从播放头位置播放 / 暂停 Brio 中目标的动画（暂停 = 通过 Brio 冻结动画）。"
-                : "播放头正跟随灵动时间轴：从播放头位置播放 / 暂停 Brio 的灵动时间轴。");
+                ? "从播放头位置播放 / 暂停 Brio 目标动画。关闭循环后，动画播完冻结在末尾。"
+                : "从播放头位置播放 / 暂停 Brio 灵动时间轴；停止和循环同步控制 Brio，不要求开启播放头跟随。");
         ImGui.SameLine();
         if(ImGui.Button("停止")) StopTransport();
         ImGui.SameLine();
@@ -396,7 +511,8 @@ public sealed class MainWindow : Window, IDisposable
         ImGui.SameLine();
         if(ImGui.ArrowButton("##next", ImGuiDir.Right)) StepPlayhead(1);
         ImGui.SameLine();
-        ImGui.Checkbox("循环", ref _loop);
+        bool loop = CurrentLoop;
+        if(ImGui.Checkbox("循环", ref loop)) Try(() => SetLoop(loop));
         ImGui.SameLine();
         ImGui.SetNextItemWidth(80);
         int ph = (int)MathF.Round(_tl.Playhead);
@@ -414,7 +530,7 @@ public sealed class MainWindow : Window, IDisposable
         {
             ImGui.SetNextItemWidth(60);
             int fps = _tl.Fps;
-            if(ImGui.InputInt("fps", ref fps, 0)) _tl.SetFps(fps);
+            if(ImGui.InputInt("fps", ref fps, 0)) Try(() => { _tl.Snapshot(); _tl.SetFps(fps); });
         }
 
         // --- capture row ---
@@ -474,13 +590,13 @@ public sealed class MainWindow : Window, IDisposable
             if(Selected == null) _tlw.Selected = null;
             RebuildPathIfNeeded();
         }
-        if(_tlw.DragStarted) _tl.Snapshot();
+        // TimelineWidget snapshots before applying the first drag delta.
         if(_tlw.PlayheadChanged) SeekPlayhead(_tl.Playhead);
-        ImGui.TextDisabled("拖动◆移动镜头节点（精确到帧）· 点击空白处移动播放头 · 滚轮平移，Ctrl+滚轮缩放，中键拖动 · 双击节点跳转 · ✂ = 硬切 · 越靠上的轨道越优先显示");
+        ImGui.TextWrapped("拖节点改帧 · 标尺拖播放头 · 空白左键/中键拖视图 · Ctrl+滚轮缩放帧轴 · Ctrl+Alt+滚轮缩放轨道行 · Alt+滚轮滚轨道 · Ctrl+左键空白框选 · 双击节点跳转 · ✂=恒定切镜");
         DrawGizmoBar();
 
         ImGui.Separator();
-        DrawPacing();
+        ImGui.TextDisabled("「曲线编辑器」可选择高级/简单曲线；高级直接调数值、速度和帧，简单调节奏，另一层锁定并保留。");
         ImGui.Separator();
         DrawInspector(gpose);
         DrawTargetWarnings(gpose);
@@ -498,40 +614,6 @@ public sealed class MainWindow : Window, IDisposable
         SeekPlayhead(next ?? Math.Clamp(cur + dir, 0, _tl.Length));
         var k = _tl.Keys.FirstOrDefault(x => x.Frame == (int)_tl.Playhead);
         if(k != null) Selected = k;
-    }
-
-    private void DrawPacing()
-    {
-        int mode = (int)_settings.Mode;
-        ImGui.SetNextItemWidth(130);
-        if(ImGui.Combo("运镜节奏", ref mode, ModeNames, ModeNames.Length))
-            _settings.Mode = (TimingMode)mode;
-        if(ImGui.IsItemHovered())
-            ImGui.SetTooltip("按时间平滑：每个镜头在它所在的帧到达，经过镜头时速度连续、不顿挫。\n整体匀速：首尾节点之间以恒定速度运动（中间节点的帧位置被忽略），只在首尾缓入缓出。");
-        ImGui.SameLine();
-        if(_settings.Mode == TimingMode.Timed)
-        {
-            ImGui.Checkbox("开头缓入", ref _settings.EaseStart);
-            ImGui.SameLine();
-            ImGui.Checkbox("结尾缓出", ref _settings.EaseEnd);
-        }
-        else
-        {
-            float a = _settings.EaseInFraction * 100, b = _settings.EaseOutFraction * 100;
-            ImGui.SetNextItemWidth(60);
-            if(ImGui.DragFloat("缓入%", ref a, 0.5f, 0f, 50f, "%.0f")) _settings.EaseInFraction = a / 100f;
-            ImGui.SameLine();
-            ImGui.SetNextItemWidth(60);
-            if(ImGui.DragFloat("缓出%", ref b, 0.5f, 0f, 50f, "%.0f")) _settings.EaseOutFraction = b / 100f;
-            ImGui.SameLine();
-            ImGui.SetNextItemWidth(60);
-            ImGui.DragFloat("转向权重", ref _settings.RotationWeight, 0.05f, 0f, 10f, "%.2f");
-        }
-        if(_comp != null)
-        {
-            ImGui.SameLine();
-            ImGui.TextDisabled($"| 时长 {_comp.DurationSec:0.00}s · 路径 {_comp.TotalLength:0.0}y · {_comp.CutFrames.Count} 处切镜");
-        }
     }
 
     private void DrawInspector(bool gpose)
@@ -557,18 +639,16 @@ public sealed class MainWindow : Window, IDisposable
         {
             _tl.Snapshot();
             int got = _tl.MoveKey(k, frame);
-            if(got != frame) SetStatus($"第 {frame} 帧已有节点", true);
+            if(got != frame) SetStatus("无法移动：节点不能越过相邻节点，且区间进度关键帧取整后不能重叠。", true);
         }
         ImGui.SameLine();
         ImGui.SetNextItemWidth(70);
         int hold = k.HoldFrames;
-        if(ImGui.InputInt("停留帧", ref hold, 0)) { _tl.Snapshot(); k.HoldFrames = Math.Clamp(hold, 0, 100000); }
-        ImGui.SameLine();
-        ImGui.BeginDisabled(_settings.Mode != TimingMode.Timed);
-        ImGui.SetNextItemWidth(100);
-        int tan = (int)k.Tangent;
-        if(ImGui.Combo("经过方式", ref tan, TangentNames, TangentNames.Length)) { _tl.Snapshot(); k.Tangent = (TangentMode)tan; }
-        ImGui.EndDisabled();
+        if(ImGui.InputInt("停留帧", ref hold, 0))
+        {
+            hold = Math.Clamp(hold, 0, 100000);
+            _tl.Snapshot(); k.HoldFrames = hold; _tl.Touch();
+        }
         ImGui.SameLine();
         bool isFirst = owner.Keys.All(o => o == k || o.Frame > k.Frame);
         ImGui.BeginDisabled(isFirst);
@@ -576,32 +656,42 @@ public sealed class MainWindow : Window, IDisposable
         if(ImGui.Checkbox("从上一个节点硬切", ref cut))
         {
             _tl.Snapshot();
+            if(ShotFor(k) is { } shot) ConstantCuts.Set(shot, k.Id, cut);
             k.CutIn = cut;
             k.CutAuto = false; // a manual choice is never overridden by the auto rule
+            _tl.Touch();
         }
         ImGui.EndDisabled();
         if(ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
             ImGui.SetTooltip(isFirst ? "这是这条轨道的第一个节点。"
-                : "勾选后，镜头在这一帧从上一个节点瞬间切换到这里，不再移动过去。\n节点放在上一个节点后 1 帧时会自动勾选；手动取消后不会再被自动勾上。");
+                : "勾选后把前一区间的全部通道设为恒定，保持前一姿态到此帧再瞬跳；不拆分轨道。\n全部通道手动设为恒定也会自动勾选，部分恒定只作局部跳变。");
+
+        RefreshNodePose(k);
+        ImGui.TextDisabled("节点姿态修改写回高级曲线；简单曲线的节奏数据独立保留。");
 
         // transform fields (relative to target)
         var pos = k.Pos;
         ImGui.SetNextItemWidth(260);
-        if(ImGui.DragFloat3("相对位置 (米)", ref pos, 0.01f))
-            k.Pos = pos;
+        bool positionChanged = ImGui.DragFloat3("相对位置 (米)", ref pos, 0.01f);
         if(ImGui.IsItemActivated()) _tl.Snapshot();
+        if(positionChanged) { k.Pos = pos; WriteNodePose(k, true, false, false); }
 
-        var euler = QuatToEulerDeg(k.Rot);
+        var nodeShot = ShotFor(k);
+        var euler = nodeShot?.NodeEuler(k) ?? QuatToEulerDeg(k.Rot);
         ImGui.SetNextItemWidth(260);
-        if(ImGui.DragFloat3("旋转 偏航/俯仰/滚转 (°)", ref euler, 0.25f))
-            k.Rot = EulerDegToQuat(euler);
+        bool rotationChanged = ImGui.DragFloat3("旋转 偏航/俯仰/滚转 (°)", ref euler, 0.25f);
         if(ImGui.IsItemActivated()) _tl.Snapshot();
+        if(rotationChanged)
+        {
+            if(nodeShot != null) Try(() => { nodeShot.WriteNodeEuler(k, euler); _tl.Touch(); });
+            else { k.Rot = EulerDegToQuat(euler); WriteNodePose(k, false, true, false); }
+        }
 
         float fovDeg = k.Fov * 180f / MathF.PI;
         ImGui.SetNextItemWidth(120);
-        if(ImGui.DragFloat("FoV (°)", ref fovDeg, 0.1f, 5f, 150f, "%.1f"))
-            k.Fov = fovDeg * MathF.PI / 180f;
+        bool fovChanged = ImGui.DragFloat("FoV (°)", ref fovDeg, 0.1f, 1f, 175f, "%.1f");
         if(ImGui.IsItemActivated()) _tl.Snapshot();
+        if(fovChanged) { k.Fov = fovDeg * MathF.PI / 180f; WriteNodePose(k, false, false, true); }
 
         ImGui.SameLine();
         ImGui.BeginDisabled(!gpose);
@@ -612,7 +702,11 @@ public sealed class MainWindow : Window, IDisposable
         ImGui.SameLine();
         if(ImGui.Button("复制节点")) Duplicate(k);
         ImGui.SameLine();
-        if(ImGui.Button("删除节点")) { _tl.Snapshot(); owner.Keys.Remove(k); Selected = null; }
+        if(ImGui.Button(_tl.SelectedNodes.Count > 1 ? $"删除所选 {_tl.SelectedNodes.Count} 节点" : "删除节点"))
+        {
+            var ids = _tl.SelectedNodes.Count > 0 ? _tl.SelectedNodes.ToHashSet() : new System.Collections.Generic.HashSet<Guid> { k.Id };
+            _tl.DeleteNodes(ids); Selected = null;
+        }
 
         bool ok = k.SelfCheckError < 1e-3f;
         ImGui.TextColored(ok ? new Vector4(0.5f, 1, 0.5f, 1) : new Vector4(1, 0.4f, 0.4f, 1),
@@ -794,7 +888,14 @@ public sealed class MainWindow : Window, IDisposable
                 Try(() => { _sync.Bind(_comp!); SetStatus($"已绑定到{SourceName}（XAT）", false); });
         }
         else if(ImGui.Button("解绑"))
-            Try(() => { _sync.Unbind(); SetStatus("已解绑", false); });
+            Try(() =>
+            {
+                _sync.Unbind();
+                ReleaseAnimFreeze();
+                _transportOwned = false;
+                _anim.Reset();
+                SetStatus("已解绑，已恢复插件接管前的动画速度。", false);
+            });
         ImGui.EndDisabled();
         if(_sync.Bound) ImGui.TextColored(new Vector4(0.6f, 0.9f, 1, 1), _sync.Status);
 
@@ -907,6 +1008,7 @@ public sealed class MainWindow : Window, IDisposable
         if(existing != null)
         {
             CopyPose(k, existing);
+            WriteNodePose(existing);
             Selected = existing;
             SetStatus($"已替换第 {frame} 帧的镜头", false);
             return;
@@ -944,6 +1046,7 @@ public sealed class MainWindow : Window, IDisposable
         }
         k.CutIn = true;
         k.CutAuto = false;
+        WriteNodePose(k);
         Selected = k;
         SetStatus($"已在第 {frame} 帧切镜：之前的运镜到这里结束，镜头瞬间切到新镜头。", false);
     }
@@ -976,6 +1079,9 @@ public sealed class MainWindow : Window, IDisposable
             return;
         }
 
+        var segment = seq.Segments[seq.SegmentAt(frame)];
+        if(!segment.Curves.Intervals.Any(i => frame > i.Start && frame < i.End))
+        { SetStatus("请将播放头放在两个镜头节点之间，停留尾部或镜头段空白区不能分割运动区间。", true); return; }
         var (s, _) = seq.Sample(frame);
         if(!XcpMath.IsFinite(s.Pos) || !XcpMath.IsFinite(s.Rot) || !float.IsFinite(s.Fov))
         {
@@ -983,29 +1089,12 @@ public sealed class MainWindow : Window, IDisposable
             return;
         }
 
-        // carry the target info of the node this frame belongs to
-        var src = _tl.Sorted().LastOrDefault(k => k.Frame <= frame) ?? _tl.Sorted()[0];
-        _tl.Snapshot();
-        var k = new Keyframe
+        try
         {
-            Frame = frame,
-            Pos = s.Pos,
-            Rot = Quaternion.Normalize(s.Rot),
-            Fov = s.Fov,
-            Tangent = TangentMode.Auto,
-            TargetName = src.TargetName,
-            BasePos = src.BasePos,
-            BaseRot = src.BaseRot,
-        };
-        // a frame inside a hold: split the hold so the camera still stays put
-        if(src.HoldFrames > 0 && frame < src.Frame + src.HoldFrames)
-        {
-            k.HoldFrames = src.Frame + src.HoldFrames - frame;
-            src.HoldFrames = frame - src.Frame;
+            Selected = _tl.AddSampledNode(segment.Curves, frame);
+            SetStatus($"已在第 {frame} 帧添加节点，七通道关键帧已同步。", false);
         }
-        _tl.Keys.Add(k);
-        Selected = k;
-        SetStatus($"已从运镜在第 {frame} 帧生成镜头 {_tl.Keys.Count}。", false);
+        catch(InvalidOperationException ex) { SetStatus(ex.Message, true); }
     }
 
     private void Recapture(Keyframe target)
@@ -1014,6 +1103,7 @@ public sealed class MainWindow : Window, IDisposable
         if(k is null) return;
         _tl.Snapshot();
         CopyPose(k, target);
+        WriteNodePose(target);
         var owner = _tl.TrackOf(target);
         SetStatus($"已用当前镜头替换节点 {(owner?.Keys.IndexOf(target) ?? 0) + 1}", false);
     }
@@ -1027,8 +1117,10 @@ public sealed class MainWindow : Window, IDisposable
     private void Duplicate(Keyframe k)
     {
         var owner = _tl.TrackOf(k) ?? _tl.ActiveTrack;
+        RefreshNodePose(k);
         _tl.Snapshot();
         var c = k.Clone();
+        c.Id = Guid.NewGuid();
         c.CutIn = false; c.CutAuto = false; c.LastGap = 0;
         c.Frame = _tl.NearestFreeFrame(k.Frame + _defaultGapFrames, null, owner);
         if(c.Frame > _tl.Length) _tl.Length = c.Frame;

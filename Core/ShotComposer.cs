@@ -71,7 +71,7 @@ public sealed class ShotComposer
     {
         int n = tl.Tracks.Count;
         var seq = new ShotSequence?[n];
-        for(int i = 0; i < n; i++) seq[i] = ShotSequence.Create(tl.Tracks[i].Keys, settings, tl.Fps);
+        for(int i = 0; i < n; i++) seq[i] = ShotSequence.Create(tl.Tracks[i], tl.Fps);
 
         bool anySolo = Enumerable.Range(0, n).Any(i => tl.Tracks[i].Solo && seq[i] != null);
         var active = new bool[n];
@@ -96,7 +96,7 @@ public sealed class ShotComposer
     private (int track, int segment) ShotAt(float frame)
     {
         var (_, t, s) = SampleEx(frame);
-        return (t, s);
+        return (t, s * 100000 + (_seq[t]?.CutFrames.Count(f => f <= frame) ?? 0));
     }
 
     public XcpFrame Sample(float frame) => SampleEx(frame).pose;
@@ -130,7 +130,7 @@ public sealed class ShotComposer
         float d = Fps / 60f;
         var a = SampleEx(frame);
         var b = SampleEx(frame + d);
-        if(a.track != b.track || a.segment != b.segment) return null;
+        if(a.track != b.track || a.segment != b.segment || CutFrames.Any(f => f > frame && f <= frame + d)) return null;
         return Vector3.Distance(a.pose.Pos, b.pose.Pos) / (d / Fps);
     }
 
@@ -174,7 +174,7 @@ public sealed class ShotComposer
         {
             var (p, t, s) = SampleEx((float)(b / r));
             poses[b - b0] = p;
-            ids[b - b0] = (t, s);
+            ids[b - b0] = ShotAt((float)(b / r));
         }
 
         var keys = new SortedDictionary<int, bool>(); // frame -> step

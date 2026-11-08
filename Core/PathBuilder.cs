@@ -160,6 +160,11 @@ public sealed class CameraPath
         }
     }
 
+    internal float DistanceAtTime(float time) => _timeToArc?.Evaluate(Math.Clamp(time, 0, Duration)) ?? 0;
+    internal XcpFrame SampleAtDistance(float distance, float time) => new(
+        _curve.PositionAt(distance), _rot.Evaluate(Math.Clamp(time, 0, Duration)),
+        Math.Clamp(_fov.Evaluate(Math.Clamp(time, 0, Duration)), _fovMin, _fovMax));
+
     /// <summary>Uniformly sampled frames covering the whole path (inclusive of both ends).</summary>
     public List<XcpFrame> Bake(float fps = DefaultFps)
     {

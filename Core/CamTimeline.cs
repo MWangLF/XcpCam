@@ -12,11 +12,13 @@ public sealed class CamTrack
     public bool Muted;
     public bool Solo;
     public List<Keyframe> Keys = [];
+    public List<ShotCurves> Shots = [];
 
     public CamTrack Clone() => new()
     {
         Name = Name, Color = Color, Muted = Muted, Solo = Solo,
         Keys = Keys.Select(k => k.Clone()).ToList(),
+        Shots = Shots.Select(s => s.Clone()).ToList(),
     };
 }
 
@@ -47,8 +49,25 @@ public sealed class CamTimeline
     public List<Keyframe> Keys => ActiveTrack.Keys;
     public IEnumerable<Keyframe> AllKeys => Tracks.SelectMany(t => t.Keys);
 
-    private readonly List<(List<CamTrack> tracks, int active)> _undo = [];
-    private readonly List<(List<CamTrack> tracks, int active)> _redo = [];
+    public HashSet<Guid> SelectedNodes { get; } = [];
+    public long SelectionRevision { get; private set; }
+    public void SelectNodes(IEnumerable<Guid> ids, bool additive = false)
+    {
+        if(!additive) SelectedNodes.Clear();
+        SelectedNodes.UnionWith(ids);
+        SelectedNodes.IntersectWith(AllKeys.Select(k => k.Id));
+        SelectionRevision++;
+    }
+    public void ToggleNode(Guid id)
+    {
+        if(!SelectedNodes.Remove(id)) SelectedNodes.Add(id);
+        SelectionRevision++;
+    }
+
+    public long Revision { get; private set; }
+    public void Touch() => Revision++;
+    private readonly List<(List<CamTrack> tracks, int active, int fps, int length)> _undo = [];
+    private readonly List<(List<CamTrack> tracks, int active, int fps, int length)> _redo = [];
     private const int MaxUndo = 64;
 
     public bool CanUndo => _undo.Count > 0;
@@ -87,17 +106,28 @@ public sealed class CamTimeline
         if(keepSeconds)
         {
             double r = fps / (double)Fps;
+            // Validate every rescale on clones before modifying anything; never silently merge keys.
+            foreach(var track in Tracks)
+            {
+                if(track.Keys.GroupBy(k => (int)Math.Round(k.Frame * r, MidpointRounding.AwayFromZero)).Any(g => g.Count() > 1))
+                    throw new InvalidOperationException("更改帧率会使镜头节点占用同一帧，请先移动冲突节点。");
+                foreach(var shot in track.Shots) shot.Clone().Rescale(r);
+            }
+            foreach(var track in Tracks)
+                foreach(var shot in track.Shots)
+                    shot.Rescale(r);
             foreach(var k in AllKeys)
             {
-                k.Frame = (int)Math.Round(k.Frame * r);
-                k.HoldFrames = (int)Math.Round(k.HoldFrames * r);
+                k.Frame = (int)Math.Round(k.Frame * r, MidpointRounding.AwayFromZero);
+                k.HoldFrames = (int)Math.Round(k.HoldFrames * r, MidpointRounding.AwayFromZero);
             }
-            Length = Math.Max(1, (int)Math.Round(Length * r));
+            Length = Math.Max(1, (int)Math.Round(Length * r, MidpointRounding.AwayFromZero));
             Playhead = (float)(Playhead * r);
             foreach(var t in Tracks) ResolveCollisions(t);
         }
         Fps = fps;
         ResyncGaps();
+        Touch();
     }
 
     // ---------------- per-track frame helpers ----------------
@@ -124,8 +154,91 @@ public sealed class CamTimeline
     public int MoveKey(Keyframe k, int frame)
     {
         frame = Math.Clamp(frame, 0, Math.Max(0, Length));
-        if(IsFrameFree(frame, k)) k.Frame = frame;
+        if(!IsFrameFree(frame, k)) return k.Frame;
+        var owner = TrackOf(k);
+        if(owner != null)
+        {
+            // A time edit must not reorder geometry controls or reshape the route.
+            int previous = owner.Keys.Where(n => n.Frame < k.Frame).Select(n => n.Frame).DefaultIfEmpty(-1).Max();
+            int next = owner.Keys.Where(n => n.Frame > k.Frame).Select(n => n.Frame).DefaultIfEmpty(int.MaxValue).Min();
+            if(frame <= previous || frame >= next) return k.Frame;
+            var affected = owner.Shots.SelectMany(s => s.Intervals)
+                .Where(i => i.StartNodeId == k.Id || i.EndNodeId == k.Id).ToList();
+            try
+            {
+                foreach(var interval in affected)
+                    interval.Clone().Retime(interval.StartNodeId == k.Id ? frame : interval.Start,
+                        interval.EndNodeId == k.Id ? frame : interval.End);
+            }
+            catch(InvalidOperationException) { return k.Frame; }
+            foreach(var interval in affected)
+                interval.Retime(interval.StartNodeId == k.Id ? frame : interval.Start,
+                    interval.EndNodeId == k.Id ? frame : interval.End);
+        }
+        k.Frame = frame;
+        Touch();
         return k.Frame;
+    }
+
+    public bool MoveNodes(IReadOnlyDictionary<Guid, int> targets)
+    {
+        var nodes = AllKeys.Where(k => targets.ContainsKey(k.Id)).ToList();
+        if(nodes.Count != targets.Count || nodes.Count == 0) return false;
+        foreach(var track in Tracks)
+        {
+            int previous = -1;
+            foreach(var node in track.Keys.OrderBy(k => k.Frame))
+            {
+                int frame = targets.TryGetValue(node.Id, out int value) ? value : node.Frame;
+                if(frame < 0 || frame > Length || frame <= previous) return false;
+                previous = frame;
+            }
+        }
+        var affected = Tracks.SelectMany(t => t.Shots).SelectMany(s => s.Intervals)
+            .Where(i => targets.ContainsKey(i.StartNodeId) || targets.ContainsKey(i.EndNodeId)).ToList();
+        try
+        {
+            foreach(var interval in affected)
+                interval.Clone().Retime(targets.TryGetValue(interval.StartNodeId, out int a) ? a : interval.Start,
+                    targets.TryGetValue(interval.EndNodeId, out int b) ? b : interval.End);
+        }
+        catch(ArgumentException) { return false; }
+        catch(InvalidOperationException) { return false; }
+        foreach(var interval in affected)
+            interval.Retime(targets.TryGetValue(interval.StartNodeId, out int a) ? a : interval.Start,
+                targets.TryGetValue(interval.EndNodeId, out int b) ? b : interval.End);
+        foreach(var node in nodes) node.Frame = targets[node.Id];
+        Touch();
+        return true;
+    }
+
+    public Keyframe AddSampledNode(ShotCurves shot, int frame)
+    {
+        var owner = Tracks.FirstOrDefault(t => t.Shots.Contains(shot)) ?? throw new InvalidOperationException("找不到镜头轨道。");
+        var existing = owner.Keys.FirstOrDefault(k => k.Frame == frame);
+        if(existing != null) { SelectNodes([existing.Id]); return existing; }
+        if(!shot.Intervals.Any(i => frame > i.Start && frame < i.End)) throw new InvalidOperationException("请在两个镜头节点之间添加关键帧。");
+        var source = owner.Keys.Where(k => shot.SeededNodes.Contains(k.Id)).OrderBy(k => k.Frame).LastOrDefault(k => k.Frame <= frame);
+        var pose = shot.Sample(frame);
+        var node = new Keyframe { Frame = frame, Pos = pose.Pos, Rot = pose.Rot, Fov = pose.Fov,
+            TargetName = source?.TargetName ?? "", BasePos = source?.BasePos ?? default, BaseRot = source?.BaseRot ?? System.Numerics.Quaternion.Identity };
+        Snapshot();
+        shot.InsertNode(node); owner.Keys.Add(node);
+        CurveModel.Ensure(owner, Fps); SelectNodes([node.Id]); Touch();
+        return node;
+    }
+
+    public void DeleteNodes(IEnumerable<Guid> ids)
+    {
+        var selected = ids.ToHashSet();
+        if(!AllKeys.Any(k => selected.Contains(k.Id))) return;
+        Snapshot();
+        foreach(var track in Tracks)
+        {
+            track.Keys.RemoveAll(k => selected.Contains(k.Id));
+            CurveModel.Ensure(track, Fps);
+        }
+        SelectNodes([]); Touch();
     }
 
     private void ResolveCollisions(CamTrack t)
@@ -210,7 +323,7 @@ public sealed class CamTimeline
 
     // ---------------- undo ----------------
 
-    private (List<CamTrack>, int) Capture() => (Tracks.Select(t => t.Clone()).ToList(), ActiveTrackIndex);
+    private (List<CamTrack>, int, int, int) Capture() => (Tracks.Select(t => t.Clone()).ToList(), ActiveTrackIndex, Fps, Length);
 
     public void Snapshot()
     {
@@ -222,13 +335,17 @@ public sealed class CamTimeline
     public void Undo() => Swap(_undo, _redo);
     public void Redo() => Swap(_redo, _undo);
 
-    private void Swap(List<(List<CamTrack> tracks, int active)> from, List<(List<CamTrack> tracks, int active)> to)
+    private void Swap(List<(List<CamTrack> tracks, int active, int fps, int length)> from,
+        List<(List<CamTrack> tracks, int active, int fps, int length)> to)
     {
         if(from.Count == 0) return;
         to.Add(Capture());
-        var (tracks, active) = from[^1];
+        var (tracks, active, fps, length) = from[^1];
         from.RemoveAt(from.Count - 1);
         Tracks = tracks.Select(t => t.Clone()).ToList();
         ActiveTrackIndex = active;
+        Fps = fps; Length = length;
+        SelectNodes(SelectedNodes.ToArray());
+        Touch();
     }
 }

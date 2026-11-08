@@ -1,109 +1,126 @@
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Graphics.Scene;
 using System;
-
+using XcpCam.Core;
 using GameObjectStruct = FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject;
+using AnimationControl = FFXIVClientStructs.Havok.Animation.Playback.Control.Default.hkaDefaultAnimationControl;
 
 namespace XcpCam;
 
 /// <summary>
-/// The GPose target's current animation playhead — the same value Brio's "Animation Scruber" shows and edits
-/// (Brio/UI/Controls/Editors/ActionTimelineEditor.cs DrawFirstScrub):
-///   CharacterBase.Skeleton -> PartialSkeletons[0] -> GetHavokAnimatedSkeleton(0) -> AnimationControls[0]
-///   -> hkaAnimationControl.LocalTime (seconds) / Binding.Animation.Duration (seconds).
-/// Read and written directly from game memory; does not depend on Brio internals.
+/// Reads the same first skeleton/control as Brio's Animation Scruber. Native loop counters distinguish an
+/// actual completed cycle from a backward scrub, including short clips or multiple cycles between updates.
+/// Pointers are re-resolved for every observation/seek, never retained as dereferenceable pointers.
 /// </summary>
 public sealed unsafe class AnimationClock
 {
     private readonly ITargetManager _targets;
-
+    private readonly TransportState _transport = new();
     public bool Available { get; private set; }
-    /// <summary>Animation local time in seconds.</summary>
-    public float Time { get; private set; }
-    /// <summary>Animation length in seconds.</summary>
-    public float Duration { get; private set; }
-    /// <summary>True when the local time advanced since the previous <see cref="Update"/>.</summary>
-    public bool IsAdvancing { get; private set; }
-    /// <summary>Debounced "animation is playing": advanced within the last 0.3 s (avoids flapping between ticks).</summary>
-    public bool IsPlaying => Available && (DateTime.UtcNow - _lastAdvanceUtc).TotalSeconds < 0.3;
-    private DateTime _lastAdvanceUtc = DateTime.MinValue;
-    /// <summary>True when the local time jumped backwards (loop wrap or user scrub back).</summary>
-    public bool Wrapped { get; private set; }
+    public float Time => (float)Sample.Time;
+    public float Duration => (float)Sample.Duration;
+    public AnimationSample Sample { get; private set; }
+    public bool IsPlaying => Available && _transport.IsPlaying;
+    public bool Ended => _transport.State == PlaybackState.Ended;
+    public bool Wrapped => _transport.Cycle;
+    public bool Discontinuity => _transport.Discontinuity;
+    public long Generation => _transport.Generation;
+    public bool MustFreeze { get; private set; }
+    public bool IdentityChanged { get; private set; }
     public string Status { get; private set; } = "";
-
-    private float _lastTime = float.NaN;
 
     public AnimationClock(ITargetManager targets) { _targets = targets; }
 
-    private FFXIVClientStructs.Havok.Animation.Playback.Control.hkaAnimationControl* GetControl(out float duration, out string error)
+    private AnimationControl* GetControl(out AnimationSample sample, out string error)
     {
-        duration = 0; error = "";
+        sample = default; error = "";
         var go = _targets.GPoseTarget;
         if(go == null) { error = "没有 GPose 目标"; return null; }
         var native = (GameObjectStruct*)go.Address;
         if(native == null || native->DrawObject == null) { error = "目标没有模型"; return null; }
         if(native->DrawObject->Object.GetObjectType() != ObjectType.CharacterBase) { error = "目标不是角色"; return null; }
-
-        var chara = (CharacterBase*)native->DrawObject;
-        var skel = chara->Skeleton;
+        var skel = ((CharacterBase*)native->DrawObject)->Skeleton;
         if(skel == null || skel->PartialSkeletonCount <= 0) { error = "目标没有骨骼"; return null; }
-
-        var partial = &skel->PartialSkeletons[0];
-        var animated = partial->GetHavokAnimatedSkeleton(0);
-        if(animated == null || animated->AnimationControls.Length <= 0) { error = "目标当前没有播放动画"; return null; }
-
+        var animated = skel->PartialSkeletons[0].GetHavokAnimatedSkeleton(0);
+        if(animated == null || animated->AnimationControls.Length <= 0) { error = "目标没有动画控制器"; return null; }
         var control = animated->AnimationControls[0].Value;
         if(control == null) { error = "目标当前没有播放动画"; return null; }
-
-        var binding = control->hkaAnimationControl.Binding;
-        if(binding.ptr == null || binding.ptr->Animation.ptr == null) { error = "目标当前没有播放动画"; return null; }
-
-        duration = binding.ptr->Animation.ptr->Duration;
-        return &control->hkaAnimationControl;
+        var binding = control->Binding.ptr;
+        if(binding == null || binding->Animation.ptr == null) { error = "目标当前没有播放动画"; return null; }
+        var anim = binding->Animation.ptr;
+        if(!float.IsFinite(anim->Duration) || anim->Duration <= 0 || !float.IsFinite(control->LocalTime))
+        { error = "动画时长或进度无效"; return null; }
+        sample = new AnimationSample(new AnimationIdentity(go.Address, go.GameObjectId, (nint)control, (nint)binding, (nint)anim),
+            control->LocalTime, anim->Duration, control->OverflowCount, control->UnderflowCount);
+        return control;
     }
 
-    /// <summary>Call once per framework tick.</summary>
-    public void Update()
+    public void Reset()
     {
-        Wrapped = false;
-        IsAdvancing = false;
+        Available = false;
+        Sample = default;
+        MustFreeze = IdentityChanged = false;
+        _transport.Reset();
+    }
+
+    public void Update(float dt, bool loop, bool speedAllowsAdvance)
+    {
+        MustFreeze = IdentityChanged = false;
         try
         {
-            var c = GetControl(out var dur, out var err);
-            if(c == null)
+            var control = GetControl(out var sample, out var error);
+            if(control == null)
             {
-                Available = false;
-                Status = err;
-                _lastTime = float.NaN;
+                if(Available) Reset();
+                Status = error;
                 return;
             }
+            IdentityChanged = !Available || sample.Identity != Sample.Identity;
+            bool externalSeekAfterEnd = _transport.State == PlaybackState.Ended && !IdentityChanged
+                && sample.OverflowCount == Sample.OverflowCount && sample.Time < Sample.Time - 1e-6;
             Available = true;
-            Duration = dur;
-            Time = c->LocalTime;
-            if(!float.IsNaN(_lastTime))
-            {
-                if(Time > _lastTime + 1e-5f) { IsAdvancing = true; _lastAdvanceUtc = DateTime.UtcNow; }
-                else if(Time + 0.05f < _lastTime) Wrapped = true;
-            }
-            _lastTime = Time;
+            Sample = sample;
+            if(externalSeekAfterEnd) _transport.Seek(sample); // respect a scrub in Brio after completion
+            MustFreeze = _transport.Observe(sample, dt, loop, speedAllowsAdvance);
             Status = $"{Time:0.00}s / {Duration:0.00}s";
         }
         catch(Exception ex)
         {
-            Available = false;
+            Reset();
             Status = $"读取动画失败：{ex.Message}";
         }
     }
 
-    /// <summary>Scrubs the animation to <paramref name="seconds"/> (like dragging Brio's scrubber).</summary>
+    /// <summary>Reject a command issued after the target/control changed but before the next framework observation.</summary>
+    public bool MatchesCurrent()
+    {
+        var control = GetControl(out var sample, out _);
+        return Available && control != null && sample.Identity == Sample.Identity;
+    }
+
     public bool Seek(float seconds)
     {
-        var c = GetControl(out var dur, out _);
-        if(c == null) return false;
-        c->LocalTime = Math.Clamp(seconds, 0f, MathF.Max(0f, dur));
-        _lastTime = c->LocalTime;
-        Time = c->LocalTime;
-        _lastAdvanceUtc = DateTime.MinValue; // our own seek is not "playing"
+        var control = GetControl(out var sample, out _);
+        if(!Available || control == null || sample.Identity != Sample.Identity) return false;
+        control->LocalTime = Math.Clamp(seconds, 0, (float)sample.Duration);
+        Sample = sample with { Time = control->LocalTime };
+        _transport.Seek(Sample);
+        MustFreeze = false;
+        return true;
+    }
+
+    public void Play() => _transport.Play(Sample);
+    public void Pause() => _transport.Pause();
+    public void Stop() => _transport.Stop();
+
+    /// <summary>Correct a native wrap back to the exact endpoint, without clearing the latched Ended state.</summary>
+    public bool FreezeAtEnd()
+    {
+        var control = GetControl(out var sample, out _);
+        if(control == null || sample.Identity != Sample.Identity) return false;
+        control->LocalTime = (float)sample.Duration;
+        Sample = sample with { Time = sample.Duration };
+        MustFreeze = false;
         return true;
     }
 }

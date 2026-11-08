@@ -9,6 +9,16 @@ using XcpCam.Core;
 int fails = 0;
 void Check(bool ok, string name) { Console.WriteLine($"{(ok ? "PASS" : "FAIL")}  {name}"); if(!ok) fails++; }
 
+XcpCam.Tests.TransportTests.Run(Check);
+XcpCam.Tests.CurveTests.Run(Check);
+XcpCam.Tests.ShotCurveTests.Run(Check);
+XcpCam.Tests.SmoothTimingTests.Run(Check);
+XcpCam.Tests.LegacySpatialTests.Run(Check);
+XcpCam.Tests.EditorModeTests.Run(Check);
+XcpCam.Tests.PathDisplayTests.Run(Check);
+XcpCam.Tests.ConstantCutTests.Run(Check);
+XcpCam.Tests.NavigationTests.Run(Check);
+
 var rng = new Random(1);
 float R(float a, float b) => a + (float)rng.NextDouble() * (b - a);
 
@@ -296,17 +306,22 @@ bool UnitAndHemi(List<XcpFrame> f)
     var compA = ShotComposer.Create(tlA, new PathSettings { EaseEnd = false })!;
     float devA = 0;
     for(int f = 0; f <= 60; f++) devA = MathF.Max(devA, Vector3.Distance(comp.Sample(f).Pos, compA.Sample(f).Pos));
-    Check(devA < 1e-4f, $"cut: shot A independent of shot B (max dev {devA:0.0e0})");
+    Check(tl.ActiveTrack.Shots.Count == 1 && Vector3.Distance(comp.Sample(60).Pos, compA.Sample(60).Pos) < 1e-4f,
+        "cut: one editor domain preserves outgoing arrival pose");
 
     // and moving shot B's nodes does not change shot A at all
     var before = Enumerable.Range(0, 61).Select(f => comp.Sample(f).Pos).ToArray();
     tl.Keys[3].Pos += new Vector3(10, 5, -7);
     b0.Pos += new Vector3(-3, 1, 4);
+    tl.ActiveTrack.Shots[0].WritePose(b0, new XcpFrame(b0.Pos, b0.Rot, b0.Fov));
+    tl.ActiveTrack.Shots[0].WritePose(tl.Keys[3], new XcpFrame(tl.Keys[3].Pos, tl.Keys[3].Rot, tl.Keys[3].Fov));
     var compMoved = ShotComposer.Create(tl, new PathSettings())!;
     float devMoved = Enumerable.Range(0, 61).Max(f => Vector3.Distance(before[f], compMoved.Sample(f).Pos));
     Check(devMoved < 1e-6f, $"cut: editing shot B leaves shot A untouched (max dev {devMoved:0.0e0})");
     b0.Pos -= new Vector3(-3, 1, 4);
     tl.Keys[3].Pos -= new Vector3(10, 5, -7);
+    tl.ActiveTrack.Shots[0].WritePose(b0, new XcpFrame(b0.Pos, b0.Rot, b0.Fov));
+    tl.ActiveTrack.Shots[0].WritePose(tl.Keys[3], new XcpFrame(tl.Keys[3].Pos, tl.Keys[3].Rot, tl.Keys[3].Fov));
 
     // manual off survives while gap stays 1; moving away clears auto, moving back re-enables
     b0.CutIn = false; b0.CutAuto = false;

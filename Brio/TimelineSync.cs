@@ -26,6 +26,9 @@ public sealed class TimelineSync
     /// <summary>Supplies (isPlaying, timeInFrames, fps) of whatever the camera timeline is bound to.</summary>
     public Func<(bool playing, double frame, int fps)>? Clock;
     public string ClockName = "时间轴";
+    public Func<bool>? ClockCycle;
+    public Func<long>? ClockGeneration;
+    private long _lastGeneration;
 
     private bool _wasPlaying;
     private double _lastTime;
@@ -51,6 +54,7 @@ public sealed class TimelineSync
         var c = Read();
         _wasPlaying = c.playing;
         _lastTime = c.frame;
+        _lastGeneration = ClockGeneration?.Invoke() ?? 0;
         _startedThisRun = false;
         Status = $"已绑定：{frames.Count} 帧（{comp.DurationSec:0.00}s，{comp.CutFrames.Count} 处切镜），在{ClockName}第 {StartFrame} 帧开始";
         _log.Info($"TimelineSync bound to {ClockName}, {frames.Count} frames, start frame {StartFrame}");
@@ -90,14 +94,23 @@ public sealed class TimelineSync
         }
 
         var (playing, time, fps) = Read();
+        long generation = ClockGeneration?.Invoke() ?? 0;
+        bool seeked = generation != _lastGeneration;
+        if(seeked)
+        {
+            if(_brio.CutsceneIsRunning) _brio.StopCutscene();
+            _startedThisRun = false;
+            _lastTime = time;
+        }
+        _lastGeneration = generation;
 
         if(playing)
         {
-            bool wrapped = _wasPlaying && time + 0.5 < _lastTime;
+            bool wrapped = !seeked && ((ClockCycle?.Invoke() ?? false) || (_wasPlaying && time + 0.5 < _lastTime));
             if(wrapped) _startedThisRun = false;
 
-            bool crossed = (_wasPlaying && !wrapped && _lastTime < StartFrame && time >= StartFrame)
-                || (!_startedThisRun && time >= StartFrame && time - StartFrame < Math.Max(2, fps * 0.1));
+            bool crossed = TransportMath.CrossedXatStart(wrapped, _wasPlaying, _startedThisRun,
+                _lastTime, time, StartFrame, fps);
 
             if(wrapped && _brio.CutsceneIsRunning)
                 _brio.StopCutscene();

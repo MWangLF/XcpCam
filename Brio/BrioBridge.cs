@@ -192,16 +192,34 @@ public sealed class BrioBridge
         set { if(_timeline != null) Set(_timeline, "FrameMax", value); }
     }
 
-    public int TimelineFps
+    public double TimelineRate
     {
         get
         {
             var cfg = Get(Get(_config, "Configuration"), "Timeline");
-            return Get(cfg, "PlaybackFramesPerSecond") is int fps && fps > 0 ? fps : 60;
+            return Core.TransportMath.ValidFps(Get(cfg, "PlaybackFramesPerSecond"));
         }
     }
 
-    public bool TimelineLoop => Get(Get(Get(_config, "Configuration"), "Timeline"), "Loop") is true;
+    // The editor uses integer frames/rates; timing conversions use TimelineRate, without rounding.
+    public int TimelineFps => (int)Math.Round(TimelineRate);
+
+    public bool TimelineLoop
+    {
+        get => Get(Get(Get(_config, "Configuration"), "Timeline"), "Loop") is true;
+        set
+        {
+            var cfg = Get(Get(_config, "Configuration"), "Timeline")
+                ?? throw new InvalidOperationException("Brio 时间轴循环设置不可用");
+            Set(cfg, "Loop", value);
+        }
+    }
+
+    public void StopTimeline()
+    {
+        if(_timeline == null) throw new InvalidOperationException("Brio 时间轴未连接");
+        Call(_timeline, "Stop");
+    }
 
     /// <summary>
     /// Freezes / unfreezes the GPose target's animation through Brio's ActionTimelineCapability so Brio's own
@@ -234,6 +252,47 @@ public sealed class BrioBridge
             return true;
         }
         return false;
+    }
+
+    /// <summary>Actor-specific handle; validated against Brio's live actor/capability list before every access.</summary>
+    public sealed record AnimationActor(object Entity, object Capability, nint Address, ulong GameObjectId);
+
+    public AnimationActor? GetAnimationActor(nint address)
+    {
+        if(_asm == null) return null;
+        var em = GetService(_asm, _asm.GetType("Brio.Entities.EntityManager"));
+        var type = _asm.GetType("Brio.Capabilities.Actor.ActionTimelineCapability");
+        if(type == null || Call(em, "TryGetAllActors") is not IEnumerable actors) return null;
+        foreach(var entity in actors)
+        {
+            if(Get(entity, "GameObject") is not Dalamud.Game.ClientState.Objects.Types.IGameObject go || go.Address != address) continue;
+            if(Get(entity, "Capabilities") is not IEnumerable caps) continue;
+            var cap = caps.Cast<object>().FirstOrDefault(type.IsInstanceOfType);
+            if(cap != null) return new AnimationActor(entity, cap, go.Address, go.GameObjectId);
+        }
+        return null;
+    }
+
+    public bool TryAnimationSpeed(AnimationActor actor, out float? speedOverride, out float effective)
+    {
+        speedOverride = null; effective = 0;
+        var live = GetAnimationActor(actor.Address);
+        if(live == null || !ReferenceEquals(live.Entity, actor.Entity) || !ReferenceEquals(live.Capability, actor.Capability)
+            || live.GameObjectId != actor.GameObjectId) return false;
+        var raw = Get(live.Capability, "SpeedMultiplierOverride");
+        speedOverride = raw is float f ? f : null;
+        effective = Convert.ToSingle(Get(live.Capability, "SpeedMultiplier"));
+        return float.IsFinite(effective);
+    }
+
+    public bool WriteAnimationSpeed(AnimationActor actor, float? speedOverride, float nativeSpeed)
+    {
+        if(!TryAnimationSpeed(actor, out _, out _)) return false;
+        // ResetOverallSpeedOverride only removes the hook override. First write the native speed too,
+        // otherwise a zero written by our Pause may remain in OverallSpeed until the game recalculates it.
+        Call(actor.Capability, "SetOverallSpeedOverride", speedOverride ?? nativeSpeed);
+        if(speedOverride == null) Call(actor.Capability, "ResetOverallSpeedOverride");
+        return true;
     }
 
     /// <summary>Plays / pauses Brio's Vivacity timeline (TimelineService.TogglePlay only flips the state).</summary>
