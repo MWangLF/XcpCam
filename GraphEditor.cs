@@ -21,7 +21,7 @@ public sealed class GraphEditor
     private int interpolation, handleMode = 3, scope, linkSource;
     private double left, span = 100, bottom = -.1, height = 1.2;
     private Ref? drag;
-    private bool dragHandle, dragRight, scrubbing, panning;
+    private bool dragHandle, dragRight, scrubbing, panning, blankClick;
     private Vector2 press, lastMouse;
     private Dictionary<Guid, int> nodeFrames = new();
     private int originalFrame;
@@ -204,7 +204,7 @@ public sealed class GraphEditor
             }
             else if(io.KeyCtrl) box = mouse;
             else if(mouse.Y < plot.Y) { scrubbing = true; timeline.Playhead = (float)Math.Clamp(Math.Round(F(mouse.X)), 0, timeline.Length); PlayheadChanged = true; }
-            else { panning = true; lastMouse = mouse; }
+            else { panning = true; blankClick = true; lastMouse = mouse; }
         }
         if(ImGui.IsMouseDown(ImGuiMouseButton.Left))
         {
@@ -236,6 +236,10 @@ public sealed class GraphEditor
                 { var p = new Vector2(X(r.Key.Frame), Y(Global(shot, r, r.Key.Value))); if(p.X >= lo.X && p.X <= hi.X && p.Y >= lo.Y && p.Y <= hi.Y) { selected.Add(r.Key.Id); if(r.Key.NodeId is Guid id) ids.Add(id); } }
                 timeline.SelectNodes(ids, true); selectionRevision = timeline.SelectionRevision;
             }
+            // short left click on empty plot space (no drag) clears the selection, like the camera timeline
+            if(blankClick && Vector2.DistanceSquared(mouse, press) <= 9)
+            { selected.Clear(); timeline.SelectNodes([]); selectionRevision = timeline.SelectionRevision; }
+            blankClick = false;
             End();
         }
         if(hovered && hit is Hit hover) ImGui.SetTooltip($"{Label(hover.Item.Channel)} · F{hover.Item.Key.Frame} · 整段进度 {Global(shot, hover.Item, hover.Item.Key.Value) * 100:0.###}%");

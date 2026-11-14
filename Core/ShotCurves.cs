@@ -319,10 +319,10 @@ public sealed class ShotCurves
             (float)Space.Channels[SpatialChannel.Pitch].Evaluate(p), (float)Space.Channels[SpatialChannel.Roll].Evaluate(p));
     }
 
-    public void WriteNodeEuler(Keyframe node, Vector3 degrees)
+    public void WriteNodeEuler(Keyframe node, Vector3 degrees, int influence = 0)
     {
         var pose = NodePose(node);
-        Space.WritePose(node, pose, false, true, false, degrees);
+        Space.WritePose(node, pose, false, true, false, degrees, influence);
         const float rad = MathF.PI / 180;
         node.Rot = Quaternion.Normalize(Quaternion.CreateFromYawPitchRoll(degrees.X * rad, degrees.Y * rad, degrees.Z * rad));
     }
@@ -333,9 +333,9 @@ public sealed class ShotCurves
         return spatialPath!.HasJump(interval.Parameter(CameraChannel.Position, from), interval.Parameter(CameraChannel.Position, to));
     }
 
-    public void WritePose(Keyframe node, XcpFrame pose, bool position = true, bool rotation = true, bool fov = true)
+    public void WritePose(Keyframe node, XcpFrame pose, bool position = true, bool rotation = true, bool fov = true, int influence = 0)
     {
-        Space.WritePose(node, pose, position, rotation, fov);
+        Space.WritePose(node, pose, position, rotation, fov, null, influence);
         if(position) node.Pos = pose.Pos;
         if(rotation) node.Rot = pose.Rot;
         if(fov) node.Fov = pose.Fov;
@@ -346,6 +346,7 @@ public sealed class ShotCurves
         nodes = current;
         bool regenerate = Space.IsDefaultPath;
         bool added = false;
+        var seeded = new List<Guid>();
         foreach(var node in current)
         {
             if(Space.Anchors.ContainsKey(node.Id)) continue;
@@ -361,8 +362,11 @@ public sealed class ShotCurves
             }
             else if(after != null) parameter = checked(Space.Start - 1000);
             else parameter = Space.Anchors.Count == 0 ? 0 : checked(Space.End + 1000);
-            Space.Seed(node, parameter); added = true;
+            Space.Seed(node, parameter); added = true; seeded.Add(node.Id);
         }
+        // A new node changes its neighbours' Auto tangents too (an end node becomes interior, a lone
+        // node gains a neighbour), so the default path is a true Bezier Auto fit without editing first.
+        foreach(var id in seeded) Space.MarkTangentsDirty(id, 1);
         if(added && regenerate) Space.LegacyInitialized = false;
         if(Space.SynchronizeNodes(current))
         {

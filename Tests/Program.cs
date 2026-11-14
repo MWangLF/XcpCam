@@ -18,6 +18,8 @@ XcpCam.Tests.EditorModeTests.Run(Check);
 XcpCam.Tests.PathDisplayTests.Run(Check);
 XcpCam.Tests.ConstantCutTests.Run(Check);
 XcpCam.Tests.NavigationTests.Run(Check);
+XcpCam.Tests.PathInfluenceTests.Run(Check);
+XcpCam.Tests.NodeRangeTests.Run(Check);
 
 var rng = new Random(1);
 float R(float a, float b) => a + (float)rng.NextDouble() * (b - a);

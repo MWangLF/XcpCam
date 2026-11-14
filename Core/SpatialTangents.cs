@@ -12,6 +12,10 @@ public static class SpatialTangents
         ISet<Guid>? selected = null, bool explicitEdit = false)
     {
         bool changed = false;
+        // Routine synchronization only refits dirty nodes, so an edit reshapes just the legs
+        // touching the edited node (plus the configured influence range), never the whole run.
+        bool routine = selected == null && !explicitEdit;
+        if(routine && space.DirtyTangents.Count == 0) return;
         foreach(var c in Enum.GetValues<SpatialChannel>().Where(c => channel == null || c == channel))
         {
             var curve = space.Channels[c];
@@ -27,6 +31,7 @@ public static class SpatialTangents
                 for(int i = 0; i < run.Count; i++)
                 {
                     var (node,key) = run[i];
+                    if(routine && !space.DirtyTangents.Contains(node.Id)) continue;
                     if(!explicitEdit && !key.AutomaticTangent || key.Mode is HandleMode.Free or HandleMode.Aligned) continue;
                     if(run.Count == 1) continue;
                     var previous = run[Math.Max(0,i-1)]; var next = run[Math.Min(run.Count-1,i+1)];
@@ -50,6 +55,7 @@ public static class SpatialTangents
                     if(explicitEdit) key.AutomaticTangent=true;
                 }
         }
+        if(routine) space.DirtyTangents.Clear();
         if(changed) space.Touch();
     }
 }

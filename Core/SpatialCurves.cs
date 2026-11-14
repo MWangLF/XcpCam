@@ -19,8 +19,19 @@ public sealed class SpatialCurves
     public bool IsDefaultPath => LegacyInitialized && GeneratedRevision == Revision;
     public void Touch() => Revision++;
     public void MarkDirty() => Touch();
+    /// <summary>Nodes whose automatic tangents must be recomputed on the next synchronization.</summary>
+    internal HashSet<Guid> DirtyTangents = [];
+    /// <summary>Marks a node and <paramref name="radius"/> neighbours on each side (by path order) for tangent refit.</summary>
+    public void MarkTangentsDirty(Guid node, int radius)
+    {
+        if(!Anchors.ContainsKey(node)) return;
+        var order = Anchors.OrderBy(p => p.Value[CameraChannel.Position]).Select(p => p.Key).ToList();
+        int i = order.IndexOf(node); radius = Math.Max(0, radius);
+        for(int n = Math.Max(0, i - radius); n <= Math.Min(order.Count - 1, i + radius); n++) DirtyTangents.Add(order[n]);
+    }
     public SpatialCurves Clone() => new()
     {
+        DirtyTangents = [.. DirtyTangents],
         Channels = Channels.ToDictionary(p => p.Key, p => p.Value.Clone()), Start = Start, End = End, Revision = Revision,
         LegacyInitialized = LegacyInitialized, GeneratedRevision = GeneratedRevision,
         Anchors = Anchors.ToDictionary(p => p.Key, p => new Dictionary<CameraChannel, double>(p.Value)),
@@ -51,8 +62,10 @@ public sealed class SpatialCurves
             var curve = Channels[c];
             var key = curve.Keys.FirstOrDefault(k => k.Frame == parameter);
             if(key == null) { key = new CurveKey { Frame = parameter, NodeId = node.Id, Mode = HandleMode.Auto }; curve.Keys.Add(key); }
-            key.Value = values[(int)c]; curve.Sort(); curve.RecalculateHandles();
+            // Whole-curve refits would reshape neighbouring legs; tangents are fitted per dirty node instead.
+            key.Value = values[(int)c]; curve.Sort();
         }
+        DirtyTangents.Add(node.Id);
         var frames = Channels.Values.SelectMany(c => c.Keys).Select(k => k.Frame).ToArray();
         Start = frames.Min(); End = frames.Max(); Touch();
     }
@@ -66,18 +79,25 @@ public sealed class SpatialCurves
         foreach(var channel in Enum.GetValues<SpatialChannel>())
         {
             var group = SpatialFrameMap.Group(channel); var source = old.Channels[channel].Clone();
+            // InsertPreserving bakes every automatic key to Free to keep the shape exact. The baked
+            // handles already reproduce the curve, so restore the authored modes (default Auto).
+            var modes = source.Keys.ToDictionary(k => k.Id, k => k.Mode);
             foreach(var node in nodes)
             {
                 int p = (int)Math.Round(old.Anchors[node.Id][group]);
                 if(!source.Keys.Any(k => k.NodeId == node.Id) && !source.Keys.Any(k => k.Frame == p))
-                    source.InsertPreserving(p, node.Id);
+                {
+                    var inserted = source.InsertPreserving(p, node.Id);
+                    inserted.Mode = HandleMode.Auto; inserted.AutomaticTangent = true;
+                }
             }
+            foreach(var key in source.Keys) if(modes.TryGetValue(key.Id, out var mode)) key.Mode = mode;
             var curve = new FCurve();
             for(int i = 0; i < nodes.Count; i++)
             {
                 var node = nodes[i]; double parameter = old.Anchors[node.Id][group];
                 var existing = source.Keys.FirstOrDefault(k => k.NodeId == node.Id);
-                var key = existing?.Clone() ?? new CurveKey { Mode = HandleMode.Free };
+                var key = existing?.Clone() ?? new CurveKey { Mode = HandleMode.Auto };
                 key.NodeId = node.Id; key.Frame = i * 1000; key.Value = source.Evaluate(parameter);
                 if(existing != null)
                 {
@@ -102,7 +122,7 @@ public sealed class SpatialCurves
 
     /// <summary>Write selected pose groups at their independent anchors. Fractional anchors are
     /// represented by visible integer keys; a linear influence solve avoids rounding the pose anchor.</summary>
-    public void WritePose(Keyframe node, XcpFrame pose, bool position = true, bool rotation = true, bool fov = true, Vector3? rawEuler = null)
+    public void WritePose(Keyframe node, XcpFrame pose, bool position = true, bool rotation = true, bool fov = true, Vector3? rawEuler = null, int influence = 0)
     {
         if(!Anchors.TryGetValue(node.Id, out var anchors)) throw new ArgumentException("Node has no spatial anchor.", nameof(node));
         var copies = Channels.ToDictionary(p => p.Key, p => p.Value.Clone());
@@ -133,6 +153,7 @@ public sealed class SpatialCurves
             if(group == CameraChannel.Position && position || group == CameraChannel.Rotation && rotation || group == CameraChannel.Fov && fov)
                 Channels[c].Keys = copies[c].Keys;
         }
+        MarkTangentsDirty(node.Id, influence);
         Touch();
     }
 

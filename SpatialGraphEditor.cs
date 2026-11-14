@@ -27,6 +27,15 @@ public sealed class SpatialGraphEditor
     private KeyId? _primary;
     private Guid _shotId;
     private long _selectionRevision = -1;
+    private bool _blankClick;
+
+    /// <summary>Mirrors the key selection to the shared node selection (camera timeline / inspector / gizmo).</summary>
+    private void PushSelection(ShotCurves shot, CamTimeline timeline)
+    {
+        var nodes = _selected.Select(id => Resolve(shot, id)?.NodeId).OfType<Guid>().Distinct().ToList();
+        timeline.SelectNodes(nodes);
+        _selectionRevision = timeline.SelectionRevision;
+    }
     private ShotCurves? _lastShot;
     private bool _fit = true;
     private int _scope, _preset, _handleMode = 1;
@@ -241,7 +250,7 @@ public sealed class SpatialGraphEditor
         if (hovered && _gesture == Gesture.None)
         {
             if (ImGui.IsMouseClicked(ImGuiMouseButton.Middle))
-            { _gesture = Gesture.Pan; _press = mouse; }
+            { _gesture = Gesture.Pan; _press = mouse; _blankClick = false; }
             else if (ImGui.IsMouseClicked(ImGuiMouseButton.Left))
             {
                 _press = mouse; _snapshot = false;
@@ -255,10 +264,11 @@ public sealed class SpatialGraphEditor
                     {
                         if (!_selected.Add(h.Id)) _selected.Remove(h.Id);
                         _primary = _selected.Contains(h.Id) ? h.Id : null;
+                        PushSelection(shot, timeline);
                     }
                     else
                     {
-                        if (!_selected.Contains(h.Id)) { _selected.Clear(); _selected.Add(h.Id); }
+                        if (!_selected.Contains(h.Id)) { _selected.Clear(); _selected.Add(h.Id); PushSelection(shot, timeline); }
                         _primary = h.Id;
                         if (!_locked.Contains(h.Id.Channel))
                         {
@@ -281,14 +291,21 @@ public sealed class SpatialGraphEditor
                     }
                 }
                 else if (io.KeyCtrl) { _gesture = Gesture.Box; _boxEnd = mouse; }
-                else { _gesture = Gesture.Pan; }
+                else { _gesture = Gesture.Pan; _blankClick = true; }
             }
         }
         if (_gesture == Gesture.Pan)
         {
             if (ImGui.IsMouseDown(ImGuiMouseButton.Middle) || ImGui.IsMouseDown(ImGuiMouseButton.Left))
             { if(Vector2.DistanceSquared(mouse, _press) >= 9) { _left -= io.MouseDelta.X / width * _span; _bottom += io.MouseDelta.Y / plotHeight * _height; } }
-            else EndGesture();
+            else
+            {
+                // short left click on empty plot space (no drag) clears the selection, like the camera timeline
+                if (_blankClick && Vector2.DistanceSquared(mouse, _press) < 9)
+                { _selected.Clear(); _primary = null; PushSelection(shot, timeline); }
+                _blankClick = false;
+                EndGesture();
+            }
         }
         else if (_gesture != Gesture.None)
         {
@@ -321,7 +338,7 @@ public sealed class SpatialGraphEditor
                                 BeforeGesture(timeline);
                                 if (key.Mode.ToString() is "Auto" or "AutoClamped" or "Vector") key.Mode = Named(key.Mode, "Free");
                                 curve.SetHandle(key, _rightHandle, target);
-                                RecalculateEditableHandles(shot, curve); shot.Space.Touch(); timeline.Touch(); Status = "已编辑手柄（支持小数路径参数）。";
+                                shot.Space.Touch(); timeline.Touch(); Status = "已编辑手柄（支持小数路径参数）。";
                             }
                         }
                         else Status = "无法编辑手柄：通道锁定或数值无效。";
@@ -487,7 +504,10 @@ public sealed class SpatialGraphEditor
                 var ids = targets.Where(x => x.id.Channel == ch && x.key.NodeId.HasValue).Select(x => x.key.NodeId!.Value).ToHashSet();
                 SpatialTangents.Apply(shot.Space, owner.Keys.OrderBy(n => n.Frame).ToList(), ch, ids, true);
             }
-        foreach(var target in targets) target.key.AutomaticTangent = false;
+        // Applied automatic modes stay automatic, so later node edits keep refitting them within the
+        // influence range; only Free/Aligned handles are frozen as hand-authored.
+        if(_applyHandles)
+            foreach(var target in targets) target.key.AutomaticTangent = target.key.Mode is not (HandleMode.Free or HandleMode.Aligned);
         shot.Space.Touch(); timeline.Touch(); Status = $"已对 {targets.Count} 个关键帧应用预设；自动手柄只考虑所选连续节点组，选区外不修改。";
     }
 
@@ -532,7 +552,9 @@ public sealed class SpatialGraphEditor
             bool forward = group.First().frame > Resolve(shot, group.First().id)!.Frame;
             var ordered = forward ? group.OrderByDescending(m => Resolve(shot, m.id)!.Frame) : group.OrderBy(m => Resolve(shot, m.id)!.Frame);
             foreach (var m in ordered) Curves[m.id.Channel].MoveKey(Resolve(shot, m.id)!, (int)m.frame, m.value);
-            Curves[group.Key].Sort(); RecalculateEditableHandles(shot, Curves[group.Key]);
+            Curves[group.Key].Sort();
+            // Only the moved nodes (plus the influence range) are refitted on the next sync.
+            foreach (var m in group) if (Resolve(shot, m.id)?.NodeId is Guid node) shot.Space.MarkTangentsDirty(node, timeline.PathInfluence);
         }
         shot.Space.Touch(); timeline.Touch(); Status = "已编辑空间关键帧；横轴吸附到整数路径参数。"; return true;
     }
@@ -555,7 +577,6 @@ public sealed class SpatialGraphEditor
         SpatialChannel.Yaw => "偏航", SpatialChannel.Pitch => "俯仰", SpatialChannel.Roll => "滚转", SpatialChannel.Fov => "FoV",
         _ => "未知通道"
     };
-    private static void RecalculateEditableHandles(ShotCurves shot, FCurve curve) => curve.RecalculateHandles();
     private static T Named<T>(T _, string name) where T : struct, Enum => Enum.Parse<T>(name);
     private double Scale(SpatialChannel ch) => _normalize && _normalization.TryGetValue(ch, out var n) ? n.scale : 1;
     private double Display(SpatialChannel ch, double value) => _normalize && _normalization.TryGetValue(ch, out var n) ? (value - n.center) / n.scale : value;

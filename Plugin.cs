@@ -20,7 +20,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly BrioBridge _brio;
 
     public Plugin(IDalamudPluginInterface pi, ICommandManager commands, ITargetManager targets, IClientState clientState,
-        IGameGui gameGui, IFramework framework, IPluginLog log)
+        IGameGui gameGui, IFramework framework, IPluginLog log, IKeyState keyState)
     {
         _pi = pi;
         _commands = commands;
@@ -28,8 +28,9 @@ public sealed class Plugin : IDalamudPlugin
         _clientState = clientState;
 
         _brio = new BrioBridge(log);
+        var config = pi.GetPluginConfig() as Configuration ?? new Configuration();
         var overlay = new Overlay(gameGui, clientState, targets);
-        _main = new MainWindow(targets, clientState, log, _brio, overlay);
+        _main = new MainWindow(targets, clientState, log, _brio, overlay, config, () => pi.SavePluginConfig(config), keyState);
         _overlayWindow = new OverlayWindow(_main.DrawOverlay, () => _main.OverlayWantsInput);
 
         // overlay first so the main window is drawn on top of it
@@ -44,6 +45,7 @@ public sealed class Plugin : IDalamudPlugin
         _pi.UiBuilder.DisableGposeUiHide = true;
         _pi.UiBuilder.Draw += Draw;
         _pi.UiBuilder.OpenMainUi += _main.Toggle;
+        _pi.UiBuilder.OpenConfigUi += _main.OpenSettings;
         _framework.Update += OnUpdate;
     }
 
@@ -65,6 +67,7 @@ public sealed class Plugin : IDalamudPlugin
         _framework.Update -= OnUpdate;
         _pi.UiBuilder.Draw -= Draw;
         _pi.UiBuilder.OpenMainUi -= _main.Toggle;
+        _pi.UiBuilder.OpenConfigUi -= _main.OpenSettings;
         _commands.RemoveHandler(Command);
         _main.Dispose();
         _windows.RemoveAllWindows();

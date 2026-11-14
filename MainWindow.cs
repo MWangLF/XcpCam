@@ -62,7 +62,18 @@ public sealed class MainWindow : Window, IDisposable
 
     private static readonly string[] SourceNames = ["灵动时间轴", "动画进度条"];
 
-    public MainWindow(ITargetManager targets, IClientState clientState, IPluginLog log, BrioBridge brio, Overlay overlay)
+    private readonly Configuration _config;
+    private readonly Action _saveConfig;
+    private readonly IKeyState? _keys;
+    private bool _deleteWasDown;
+    private long _seenSelection = -1;
+    private bool _selectSettings;
+
+    /// <summary>Opens the window on the settings tab (Dalamud OpenConfigUi).</summary>
+    public void OpenSettings() { IsOpen = true; _selectSettings = true; }
+
+    public MainWindow(ITargetManager targets, IClientState clientState, IPluginLog log, BrioBridge brio, Overlay overlay,
+        Configuration config, Action saveConfig, IKeyState? keys = null)
         : base("XcpCam - 相机时间轴###xcpcam_main")
     {
         _targets = targets;
@@ -79,6 +90,10 @@ public sealed class MainWindow : Window, IDisposable
             ClockGeneration = () => _clockEpoch + (_source == BindSource.Animation ? _anim.Generation : 0),
         };
         _bake = new TimelineBake(brio, log);
+        _config = config; _saveConfig = saveConfig; _keys = keys;
+        NodeRange.MaxRange = config.MovementLimit;
+        overlay.Enabled = config.OverlayEnabled; overlay.ShowPath = config.ShowPath; overlay.ShowFrustums = config.ShowFrustums;
+        overlay.ShowLabels = config.ShowLabels; overlay.SpeedColors = config.SpeedColors; overlay.FrustumSize = config.FrustumSize;
         _tlw.BeforeTrackEdit = _tl.Snapshot;
         Size = new Vector2(900, 600);
         SizeCondition = ImGuiCond.FirstUseEver;
@@ -98,6 +113,34 @@ public sealed class MainWindow : Window, IDisposable
     private int? SourceLengthFrames => !SourceAvailable ? null : _source == BindSource.Vivacity
         ? (int)Math.Ceiling(TransportMath.ConvertFrame(_brio.FrameMax, _brio.TimelineRate, _tl.Fps))
         : (int)Math.Ceiling(_anim.Duration * _tl.Fps);
+
+    /// <summary>Length follows the bound source: Vivacity two-way, the animation scrubber read-only.</summary>
+    private bool LengthFromAnimation => SourceAvailable && _source == BindSource.Animation;
+    private bool LengthFromVivacity => SourceAvailable && _source == BindSource.Vivacity;
+
+    private void SyncLengthFromSource()
+    {
+        if(SourceLengthFrames is int length && length > 0) _tl.Length = Math.Min(length, 100000);
+    }
+
+    /// <summary>Sets the timeline length; when bound to Vivacity also writes Brio's FrameMax.</summary>
+    private void SetTimelineLength(int frames)
+    {
+        if(LengthFromAnimation) return; // the animation's own duration is authoritative
+        frames = Math.Clamp(frames, 1, 100000);
+        _tl.Length = frames;
+        if(LengthFromVivacity)
+        {
+            int brioFrames = (int)Math.Round(TransportMath.ConvertFrame(frames, _tl.Fps, _brio.TimelineRate));
+            _brio.FrameMax = Math.Max(_brio.FrameMin + 1, brioFrames);
+        }
+    }
+
+    /// <summary>Grows the timeline to include <paramref name="frame"/> (captures/duplicates past the end).</summary>
+    private void EnsureLength(int frame)
+    {
+        if(frame > _tl.Length) SetTimelineLength(frame);
+    }
 
     // XAT's start frame and clock use camera-editor frames, regardless of Brio's own rate.
     private (bool playing, double frame, int fps) ReadBoundClock()
@@ -299,14 +342,14 @@ public sealed class MainWindow : Window, IDisposable
             }
         }
 
+        // Length always follows the bound source immediately (after fps sync, so frames match).
+        if(SourceAvailable) SyncLengthFromSource();
+
         RebuildPathIfNeeded();
 
         if(SourceAvailable && (FollowingSource || _transportOwned || _sync.Bound))
         {
             _playing = false;
-            // A bound source may be longer than the camera shots. Never clamp away its real progress.
-            int sourceEnd = SourceLengthFrames ?? 0;
-            _tl.Length = Math.Max(_tl.Length, Math.Max(sourceEnd, _tl.LastFrame));
             _tl.Playhead = (float)Math.Clamp(SourceFrame, 0, _tl.Length);
         }
 
@@ -321,6 +364,9 @@ public sealed class MainWindow : Window, IDisposable
         if(!_brio.IsConnected || _comp == null) return;
         if(!CameraCapture.TryGetBase(_targets, out var bp, out var br, out _, out _)) return;
         var s = _comp.Sample(_tl.Playhead);
+        // Never push a non-finite or out-of-range pose into the live game camera.
+        if(!XcpMath.IsFinite(s.Pos) || !XcpMath.IsFinite(s.Rot) || !float.IsFinite(s.Fov)) return;
+        s = s with { Pos = GizmoEditor.ClampRange(s.Pos) };
         var wp = Vector3.Transform(s.Pos, br) + bp;
         var wr = Quaternion.Normalize(br * s.Rot);
         var (yaw, pitch, roll) = FreeCamMath.FromWorldRotation(wr);
@@ -333,7 +379,7 @@ public sealed class MainWindow : Window, IDisposable
 
     // ------------------------------------------------------------------ overlay (drawn in OverlayWindow)
 
-    public bool OverlayWantsInput => _gizmo.Enabled && Selected != null && (_gizmo.IsOver || _gizmo.IsUsing);
+    public bool OverlayWantsInput => _gizmo.Enabled && (Selected != null || _tl.SelectedNodes.Count > 1) && (_gizmo.IsOver || _gizmo.IsUsing);
 
     public void DrawOverlay()
     {
@@ -343,6 +389,21 @@ public sealed class MainWindow : Window, IDisposable
         _overlay.Draw(_comp, _tl, previewFrame, syncFrame, Selected);
 
         var sel = Selected;
+        var group = SelectedGroup();
+        if(group.Count > 1 && _clientState.IsGPosing && CameraCapture.TryGetBase(_targets, out var gbp, out var gbr, out _, out _))
+        {
+            // Group: translate-only gizmo at the centre; every selected node moves by the same delta.
+            var center = GroupCenter(group);
+            var proxy = new Keyframe { Pos = center, Rot = Quaternion.Identity, Fov = sel?.Fov ?? 0.78f };
+            var op = _gizmo.Operation; _gizmo.Operation = GizmoEditor.Op.Translate;
+            bool moved = _gizmo.Draw(proxy, gbp, gbr);
+            _gizmo.Operation = op;
+            if(_gizmo.DragStarted) _tl.Snapshot();
+            if(moved) MoveGroup(group, proxy.Pos - center);
+            if(_gizmo.IsUsing && _gizmo.Limited)
+                SetStatus($"变换手柄已限制：节点需保持在目标周围 {GizmoEditor.MaxRange:0} 米内，单帧跳动过大的拖动会被忽略。", true);
+            return;
+        }
         if(sel != null && _clientState.IsGPosing && CameraCapture.TryGetBase(_targets, out var bp, out var br, out _, out _))
         {
             RefreshNodePose(sel);
@@ -359,7 +420,45 @@ public sealed class MainWindow : Window, IDisposable
             }
             if(changed) WriteNodePose(sel, _gizmo.Operation == GizmoEditor.Op.Translate,
                 _gizmo.Operation == GizmoEditor.Op.Rotate, false);
+            if(_gizmo.IsUsing && _gizmo.Limited)
+                SetStatus($"变换手柄已限制：节点需保持在目标周围 {GizmoEditor.MaxRange:0} 米内，单帧跳动过大的拖动会被忽略。", true);
         }
+    }
+
+    /// <summary>All currently multi-selected nodes, with cached poses refreshed from the curves.</summary>
+    private System.Collections.Generic.List<Keyframe> SelectedGroup()
+    {
+        var group = _tl.AllKeys.Where(k => _tl.SelectedNodes.Contains(k.Id)).ToList();
+        if(group.Count > 1) foreach(var k in group) RefreshNodePose(k);
+        return group;
+    }
+
+    private static Vector3 GroupCenter(System.Collections.Generic.IReadOnlyList<Keyframe> group)
+        => group.Aggregate(Vector3.Zero, (sum, k) => sum + k.Pos) / Math.Max(1, group.Count);
+
+    /// <summary>Translates every node of the group by the same target-relative delta (position only).</summary>
+    private void MoveGroup(System.Collections.Generic.IReadOnlyList<Keyframe> group, Vector3 delta)
+    {
+        if(!XcpMath.IsFinite(delta) || delta == Vector3.Zero) return;
+        bool limited = false;
+        foreach(var k in group)
+        {
+            var target = k.Pos + delta;
+            var clamped = GizmoEditor.ClampRange(target);
+            limited |= clamped != target;
+            k.Pos = clamped;
+            WriteNodePose(k, true, false, false);
+        }
+        if(limited) SetStatus($"部分节点已限制在目标周围 {GizmoEditor.MaxRange:0} 米内。", true);
+    }
+
+    /// <summary>Deletes the multi-selection, or the primary node when nothing is multi-selected.</summary>
+    private void DeleteSelectedNodes()
+    {
+        var ids = _tl.SelectedNodes.Count > 0 ? _tl.SelectedNodes.ToArray() : Selected != null ? new[] { Selected.Id } : [];
+        if(ids.Length == 0) return;
+        _tl.DeleteNodes(ids); Selected = null;
+        SetStatus($"已删除 {ids.Length} 个镜头节点（可撤销）。", false);
     }
 
     private int ComputeHash()
@@ -403,6 +502,18 @@ public sealed class MainWindow : Window, IDisposable
     public override void Draw()
     {
         bool gpose = _clientState.IsGPosing;
+        // Delete removes the selected nodes. Read from the game key state (ImGui key events are not
+        // reliably delivered here), edge-triggered, only while this window is focused and no text field is active.
+        bool deleteDown = _keys != null && _keys[Dalamud.Game.ClientState.Keys.VirtualKey.DELETE];
+        if(deleteDown && !_deleteWasDown && ImGui.IsWindowFocused(ImGuiFocusedFlags.RootAndChildWindows) && !ImGui.GetIO().WantTextInput)
+            DeleteSelectedNodes();
+        _deleteWasDown = deleteDown;
+        // a selection cleared elsewhere (curve editors' blank click) also drops the primary node
+        if(_seenSelection != _tl.SelectionRevision)
+        {
+            _seenSelection = _tl.SelectionRevision;
+            if(_tl.SelectedNodes.Count == 0) Selected = null;
+        }
         if(!gpose)
             ImGui.TextColored(new Vector4(1, 0.7f, 0.3f, 1), "需要在 GPose 中使用。");
 
@@ -418,9 +529,11 @@ public sealed class MainWindow : Window, IDisposable
                 DrawGraphTab();
                 ImGui.EndTabItem();
             }
-            if(ImGui.BeginTabItem("Brio 联动"))
+            var settingsFlags = _selectSettings ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None;
+            _selectSettings = false;
+            if(ImGui.BeginTabItem("设置", settingsFlags))
             {
-                DrawBrioTab(gpose);
+                DrawSettingsTab(gpose);
                 ImGui.EndTabItem();
             }
             ImGui.EndTabBar();
@@ -447,12 +560,21 @@ public sealed class MainWindow : Window, IDisposable
         node.Pos = pose.Pos; node.Rot = pose.Rot; node.Fov = pose.Fov;
     }
 
+    private void DrawInfluenceOption()
+    {
+        ImGui.SetNextItemWidth(90);
+        int influence = _tl.PathInfluence;
+        if(ImGui.InputInt("影响范围（节点）", ref influence)) _tl.PathInfluence = Math.Clamp(influence, 0, 50);
+        if(ImGui.IsItemHovered())
+            ImGui.SetTooltip("修改节点位置/旋转/FoV/时间时，重新平滑自动切线的范围。\n0：只改变与当前节点相连的两段路径；N：同时重新平滑两侧各 N 个节点。\n手工拉过的手柄不受影响。");
+    }
+
     private void WriteNodePose(Keyframe node, bool position = true, bool rotation = true, bool fov = true)
     {
         if(ShotFor(node) is not { } shot) return;
         try
         {
-            shot.WritePose(node, new XcpFrame(node.Pos, node.Rot, node.Fov), position, rotation, fov);
+            shot.WritePose(node, new XcpFrame(node.Pos, node.Rot, node.Fov), position, rotation, fov, _tl.PathInfluence);
             _tl.Touch();
         }
         catch(InvalidOperationException ex) { RefreshNodePose(node); SetStatus(ex.Message, true); }
@@ -522,7 +644,13 @@ public sealed class MainWindow : Window, IDisposable
         ImGui.SameLine();
         ImGui.SetNextItemWidth(80);
         int len = _tl.Length;
-        if(ImGui.InputInt("总长(帧)", ref len, 10)) _tl.Length = Math.Clamp(len, Math.Max(1, _tl.LastFrame), 100000);
+        ImGui.BeginDisabled(LengthFromAnimation);
+        if(ImGui.InputInt("总长(帧)", ref len, 10)) SetTimelineLength(Math.Max(len, Math.Max(1, _tl.LastFrame)));
+        ImGui.EndDisabled();
+        if(ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            ImGui.SetTooltip(LengthFromAnimation ? "已绑定动画进度条：总长等于动画长度，不能修改。"
+                : LengthFromVivacity ? "已绑定灵动时间轴：总长与 Brio 灵动时间轴的帧长度双向同步。\n不能短于最后一个镜头节点。"
+                : "相机时间轴总长（帧）。不能短于最后一个镜头节点。");
         ImGui.SameLine();
         if(_source == BindSource.Vivacity && _syncFpsWithBrio && _brio.IsConnected)
             ImGui.TextColored(new Vector4(0.6f, 0.9f, 1, 1), $"{_tl.Fps}fps (Brio)");
@@ -532,6 +660,8 @@ public sealed class MainWindow : Window, IDisposable
             int fps = _tl.Fps;
             if(ImGui.InputInt("fps", ref fps, 0)) Try(() => { _tl.Snapshot(); _tl.SetFps(fps); });
         }
+        ImGui.SameLine();
+        DrawInfluenceOption();
 
         // --- capture row ---
         ImGui.BeginDisabled(!gpose);
@@ -600,8 +730,6 @@ public sealed class MainWindow : Window, IDisposable
         ImGui.Separator();
         DrawInspector(gpose);
         DrawTargetWarnings(gpose);
-        ImGui.Spacing();
-        DrawDisplayOptions();
     }
 
     private void StepPlayhead(int dir)
@@ -616,6 +744,24 @@ public sealed class MainWindow : Window, IDisposable
         if(k != null) Selected = k;
     }
 
+    /// <summary>Multi-selection: only the shared centre position is editable; rotation/FoV stay per node.</summary>
+    private void DrawGroupInspector(System.Collections.Generic.IReadOnlyList<Keyframe> group)
+    {
+        ImGui.Text($"镜头组合 · {group.Count} 个节点");
+        ImGui.SameLine();
+        ImGui.TextDisabled($"F{group.Min(k => k.Frame)}–F{group.Max(k => k.Frame)}");
+        var center = GroupCenter(group);
+        var pos = center;
+        ImGui.SetNextItemWidth(260);
+        bool changed = ImGui.DragFloat3("组合中心位置 (米)", ref pos, 0.01f);
+        if(ImGui.IsItemActivated()) _tl.Snapshot();
+        if(changed) MoveGroup(group, pos - center);
+        ImGui.TextDisabled("拖动中心位置或游戏内手柄会整体平移所有选中镜头；旋转和 FoV 需单独选中一个节点调整。");
+        if(ImGui.Button($"删除所选 {group.Count} 节点")) DeleteSelectedNodes();
+        ImGui.SameLine();
+        if(ImGui.Button("取消选择")) { _tl.SelectNodes([]); Selected = null; }
+    }
+
     private void DrawInspector(bool gpose)
     {
         var k = Selected;
@@ -628,6 +774,8 @@ public sealed class MainWindow : Window, IDisposable
                     : "点击时间轴上的◆选中一个镜头节点进行编辑。（勾选上方「变换手柄」可在游戏画面中直接调整）");
             return;
         }
+        var group = SelectedGroup();
+        if(group.Count > 1) { DrawGroupInspector(group); return; }
 
         var owner = _tl.TrackOf(k) ?? _tl.ActiveTrack;
         int idx = owner.Keys.IndexOf(k) + 1;
@@ -674,7 +822,12 @@ public sealed class MainWindow : Window, IDisposable
         ImGui.SetNextItemWidth(260);
         bool positionChanged = ImGui.DragFloat3("相对位置 (米)", ref pos, 0.01f);
         if(ImGui.IsItemActivated()) _tl.Snapshot();
-        if(positionChanged) { k.Pos = pos; WriteNodePose(k, true, false, false); }
+        if(positionChanged)
+        {
+            var limited = GizmoEditor.ClampRange(pos);
+            if(limited != pos) SetStatus($"相对位置已限制在目标周围 {GizmoEditor.MaxRange:0} 米内，超出后游戏无法正常渲染。", true);
+            k.Pos = limited; WriteNodePose(k, true, false, false);
+        }
 
         var nodeShot = ShotFor(k);
         var euler = nodeShot?.NodeEuler(k) ?? QuatToEulerDeg(k.Rot);
@@ -683,7 +836,7 @@ public sealed class MainWindow : Window, IDisposable
         if(ImGui.IsItemActivated()) _tl.Snapshot();
         if(rotationChanged)
         {
-            if(nodeShot != null) Try(() => { nodeShot.WriteNodeEuler(k, euler); _tl.Touch(); });
+            if(nodeShot != null) Try(() => { nodeShot.WriteNodeEuler(k, euler, _tl.PathInfluence); _tl.Touch(); });
             else { k.Rot = EulerDegToQuat(euler); WriteNodePose(k, false, true, false); }
         }
 
@@ -752,8 +905,8 @@ public sealed class MainWindow : Window, IDisposable
     /// <summary>One row: overlay on/off + gizmo mode, shown right under the timeline.</summary>
     private void DrawGizmoBar()
     {
-        ImGui.Checkbox("游戏内显示", ref _overlay.Enabled);
-        if(ImGui.IsItemHovered()) ImGui.SetTooltip("在游戏画面中显示运镜路径（蓝=慢，红=快）和各镜头视锥。详细选项见下方「显示选项」。");
+        if(ImGui.Checkbox("游戏内显示", ref _overlay.Enabled)) SaveConfig();
+        if(ImGui.IsItemHovered()) ImGui.SetTooltip("在游戏画面中显示运镜路径（蓝=慢，红=快）和各镜头视锥。详细选项见「设置」页。");
         ImGui.SameLine();
         ImGui.Checkbox("变换手柄", ref _gizmo.Enabled);
         if(ImGui.IsItemHovered()) ImGui.SetTooltip("选中一个镜头节点后，在游戏画面中该镜头处显示手柄，可直接拖动移动/旋转。");
@@ -783,21 +936,47 @@ public sealed class MainWindow : Window, IDisposable
         DrawLookThroughToggle();
     }
 
-    /// <summary>Collapsible detailed display options.</summary>
-    private void DrawDisplayOptions()
+    /// <summary>Settings tab: display options, movement limit, then Brio integration. Also the plugin's config UI.</summary>
+    private void DrawSettingsTab(bool gpose)
     {
-        if(!ImGui.CollapsingHeader("显示选项")) return;
-        ImGui.BeginDisabled(!_overlay.Enabled);
-        ImGui.Checkbox("运镜路径", ref _overlay.ShowPath);
-        ImGui.SameLine();
-        ImGui.Checkbox("按速度着色（蓝=慢，红=快）", ref _overlay.SpeedColors);
-        ImGui.SameLine();
-        ImGui.Checkbox("镜头视锥", ref _overlay.ShowFrustums);
-        ImGui.SameLine();
-        ImGui.Checkbox("编号/帧标签", ref _overlay.ShowLabels);
-        ImGui.SetNextItemWidth(120);
-        ImGui.DragFloat("视锥大小", ref _overlay.FrustumSize, 0.01f, 0.05f, 3f, "%.2f");
-        ImGui.EndDisabled();
+        bool changed = false;
+        if(ImGui.CollapsingHeader("显示选项", ImGuiTreeNodeFlags.DefaultOpen))
+        {
+            changed |= ImGui.Checkbox("游戏内显示", ref _overlay.Enabled);
+            ImGui.BeginDisabled(!_overlay.Enabled);
+            changed |= ImGui.Checkbox("运镜路径", ref _overlay.ShowPath);
+            ImGui.SameLine();
+            changed |= ImGui.Checkbox("按速度着色（蓝=慢，红=快）", ref _overlay.SpeedColors);
+            ImGui.SameLine();
+            changed |= ImGui.Checkbox("镜头视锥", ref _overlay.ShowFrustums);
+            ImGui.SameLine();
+            changed |= ImGui.Checkbox("编号/帧标签", ref _overlay.ShowLabels);
+            ImGui.SetNextItemWidth(120);
+            ImGui.DragFloat("视锥大小", ref _overlay.FrustumSize, 0.01f, 0.05f, 3f, "%.2f");
+            changed |= ImGui.IsItemDeactivatedAfterEdit();
+            ImGui.EndDisabled();
+        }
+        if(ImGui.CollapsingHeader("移动限制", ImGuiTreeNodeFlags.DefaultOpen))
+        {
+            float limit = NodeRange.MaxRange;
+            ImGui.SetNextItemWidth(140);
+            if(ImGui.InputFloat("节点移动范围（米）", ref limit, 100f, 1000f, "%.0f")) NodeRange.MaxRange = limit;
+            changed |= ImGui.IsItemDeactivatedAfterEdit();
+            ImGui.SameLine();
+            if(ImGui.SmallButton("恢复默认")) { NodeRange.MaxRange = NodeRange.DefaultRange; changed = true; }
+            ImGui.TextDisabled($"镜头节点距 GPose 目标不超过此距离（{NodeRange.MinimumRange:0}–{NodeRange.MaximumRange:0} 米，默认 {NodeRange.DefaultRange:0}）。\n作用于变换手柄、相对位置输入与预览镜头；已有节点不会被自动挪动，下次编辑时才被限制。\n超出游戏渲染范围时可能无法正常显示，可酌情调小。");
+        }
+        if(changed) SaveConfig();
+        if(ImGui.CollapsingHeader("Brio 联动", ImGuiTreeNodeFlags.DefaultOpen))
+            DrawBrioTab(gpose);
+    }
+
+    private void SaveConfig()
+    {
+        _config.MovementLimit = NodeRange.MaxRange;
+        _config.OverlayEnabled = _overlay.Enabled; _config.ShowPath = _overlay.ShowPath; _config.ShowFrustums = _overlay.ShowFrustums;
+        _config.ShowLabels = _overlay.ShowLabels; _config.SpeedColors = _overlay.SpeedColors; _config.FrustumSize = _overlay.FrustumSize;
+        _saveConfig();
     }
 
     private void DrawLookThroughToggle()
@@ -867,9 +1046,7 @@ public sealed class MainWindow : Window, IDisposable
             if(ImGui.IsItemHovered()) ImGui.SetTooltip("拖动播放头带动动画时，通过 Brio 把目标动画速度设为 0，避免动画自己继续往前走。\n在 Brio 里重新播放动画即可恢复。");
         }
         ImGui.SameLine();
-        ImGui.BeginDisabled(SourceLengthFrames == null);
-        if(ImGui.Button($"总长 = {SourceName}长度") && SourceLengthFrames is int srcLen) _tl.Length = Math.Max(srcLen, _tl.LastFrame);
-        ImGui.EndDisabled();
+        ImGui.TextDisabled(_source == BindSource.Animation ? "总长自动等于动画长度。" : "总长与灵动时间轴双向同步。");
 
         // ---- mode 1 ----
         ImGui.Separator();
@@ -1014,7 +1191,7 @@ public sealed class MainWindow : Window, IDisposable
             return;
         }
         k.Frame = frame;
-        if(k.Frame > _tl.Length) _tl.Length = k.Frame;
+        EnsureLength(k.Frame);
         _tl.Keys.Add(k);
         Selected = k;
         SetStatus($"已在「{_tl.ActiveTrack.Name}」第 {frame} 帧添加节点 {_tl.Keys.Count}", false);
@@ -1041,7 +1218,7 @@ public sealed class MainWindow : Window, IDisposable
         else
         {
             k.Frame = frame;
-            if(k.Frame > _tl.Length) _tl.Length = k.Frame;
+            EnsureLength(k.Frame);
             _tl.Keys.Add(k);
         }
         k.CutIn = true;
@@ -1057,7 +1234,7 @@ public sealed class MainWindow : Window, IDisposable
         if(k is null) return;
         _tl.Snapshot();
         k.Frame = _tl.Keys.Count == 0 ? (int)MathF.Round(_tl.Playhead) : CamTimeline.TrackLastFrame(_tl.ActiveTrack) + _defaultGapFrames;
-        if(k.Frame > _tl.Length) _tl.Length = k.Frame;
+        EnsureLength(k.Frame);
         _tl.Keys.Add(k);
         Selected = k;
         _tl.Playhead = k.Frame;
@@ -1123,7 +1300,7 @@ public sealed class MainWindow : Window, IDisposable
         c.Id = Guid.NewGuid();
         c.CutIn = false; c.CutAuto = false; c.LastGap = 0;
         c.Frame = _tl.NearestFreeFrame(k.Frame + _defaultGapFrames, null, owner);
-        if(c.Frame > _tl.Length) _tl.Length = c.Frame;
+        EnsureLength(c.Frame);
         owner.Keys.Add(c);
         Selected = c;
     }

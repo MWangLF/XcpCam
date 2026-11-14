@@ -30,6 +30,11 @@ public sealed unsafe class GizmoEditor
     /// <summary>Set on the frame a drag begins, so callers can take an undo snapshot.</summary>
     public bool DragStarted { get; private set; }
 
+    public static float MaxRange => NodeRange.MaxRange;
+    private const float MaxStep = NodeRange.MaxStep;
+    /// <summary>Set when the last change was clamped to <see cref="MaxRange"/> or rejected.</summary>
+    public bool Limited { get; private set; }
+
     private bool _wasUsing;
     private const int GizmoId = 0x58435043; // "XCPC"
 
@@ -68,6 +73,9 @@ public sealed unsafe class GizmoEditor
         var model = Matrix4x4.CreateFromQuaternion(worldRot) * Matrix4x4.CreateTranslation(worldPos);
 
         var io = ImGui.GetIO();
+        // A gizmo behind the camera or far off screen projects to garbage that can cover the whole
+        // screen, keeping IsOver true so the overlay swallows all game input. Skip it entirely.
+        if(!XcpMath.IsFinite(worldPos) || !GizmoVisible(worldPos, view, proj)) { _wasUsing = false; return false; }
         ImGuizmo.SetID(GizmoId);
         ImGuizmo.BeginFrame();
         ImGuizmo.SetDrawlist(); // current (overlay) window, same as Brio's posing overlay
@@ -101,8 +109,17 @@ public sealed unsafe class GizmoEditor
         if(!XcpMath.IsFinite(newPos) || !XcpMath.IsFinite(newRot)) return false;
 
         var (rel, relRot) = XcpMath.WorldToRelative(newPos, Quaternion.Normalize(newRot), basePos, baseRot);
-        key.Pos = rel;
+        if(!XcpMath.IsFinite(rel) || !XcpMath.IsFinite(relRot)) return false;
+        Limited = false;
+        if(Vector3.Distance(rel, key.Pos) > MaxStep) { Limited = true; return false; }
+        var clamped = ClampRange(rel);
+        Limited = clamped != rel;
+        if(Limited && Vector3.DistanceSquared(clamped, key.Pos) < 1e-10f && relRot == key.Rot) return false;
+        key.Pos = clamped;
         key.Rot = relRot;
         return true;
     }
+
+    public static Vector3 ClampRange(Vector3 rel) => NodeRange.Clamp(rel);
+    private static bool GizmoVisible(Vector3 world, Matrix4x4 view, Matrix4x4 proj) => NodeRange.Visible(world, view, proj);
 }

@@ -49,6 +49,8 @@ public sealed class CamTimeline
     public List<Keyframe> Keys => ActiveTrack.Keys;
     public IEnumerable<Keyframe> AllKeys => Tracks.SelectMany(t => t.Keys);
 
+    /// <summary>Automatic-tangent influence: 0 refits only the edited node, N also refits N neighbours each side.</summary>
+    public int PathInfluence;
     public HashSet<Guid> SelectedNodes { get; } = [];
     public long SelectionRevision { get; private set; }
     public void SelectNodes(IEnumerable<Guid> ids, bool additive = false)
@@ -208,6 +210,8 @@ public sealed class CamTimeline
             interval.Retime(targets.TryGetValue(interval.StartNodeId, out int a) ? a : interval.Start,
                 targets.TryGetValue(interval.EndNodeId, out int b) ? b : interval.End);
         foreach(var node in nodes) node.Frame = targets[node.Id];
+        foreach(var shot in Tracks.SelectMany(t => t.Shots))
+            foreach(var node in nodes) shot.Space.MarkTangentsDirty(node.Id, PathInfluence);
         Touch();
         return true;
     }
