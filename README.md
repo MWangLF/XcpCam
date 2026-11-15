@@ -72,6 +72,12 @@
 - **Brio 联动**：Brio 没有提供时间轴或相机的 IPC，所以通过反射访问 Brio 内部。所有用到的成员名都集中在 `Brio/BrioBridge.cs`，找不到成员时只禁用对应功能，不会崩溃。已在 Brio 0.8.0.12 上核对过。
 - **文件格式**：`"XCP1"` + uint32 帧数 + 每帧（pos xyz、rot xyzw、fov），小端序，30fps。Brio 的读取代码会少读最后一帧，所以文件头写入 N+1，并在末尾重复写一次最后一帧。
 
+## 第三方库索引
+
+`repo.json` 是卫月第三方库索引，下载地址指向本仓库对应版本的 GitHub Release 安装包。上传到 `main` 后，索引地址为 `https://raw.githubusercontent.com/MWangLF/XcpCam/main/repo.json`。
+
+每次构建会从 `XcpCam.csproj` 的 `Version` 和 `repo.template.json` 自动生成索引，更新 `AssemblyVersion` 和三个下载链接。也可运行 `dotnet msbuild -t:UpdatePluginRepository` 单独生成。发布时应一并提交生成的 `repo.json`，并上传对应版本安装包。内部标识使用 `XcpCam`，与安装包一致。
+
 ## 构建
 
 需要 .NET 10 SDK 和 XIVLauncher / Dalamud（API 15）。

@@ -16,4 +16,11 @@
 		<None Remove="Tests\**" />
 	</ItemGroup>
 
+	<Target Name="UpdatePluginRepository" BeforeTargets="BeforeBuild" Condition="'$(DesignTimeBuild)' != 'true'">
+		<PropertyGroup>
+			<RepositoryJson>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/repo.template.json').Replace('__VERSION__', '$(Version)'))</RepositoryJson>
+		</PropertyGroup>
+		<WriteLinesToFile File="$(MSBuildProjectDirectory)/repo.json" Lines="$(RepositoryJson)" Overwrite="true" Encoding="UTF-8" WriteOnlyWhenDifferent="true" />
+	</Target>
+
 </Project>
