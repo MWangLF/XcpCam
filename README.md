@@ -74,9 +74,13 @@
 
 ## 第三方库索引
 
-`repo.json` 是卫月第三方库索引，下载地址指向本仓库对应版本的 GitHub Release 安装包。上传到 `main` 后，索引地址为 `https://raw.githubusercontent.com/MWangLF/XcpCam/main/repo.json`。
+在卫月设置 → 实验性功能 → 自定义插件库中添加并保存：
 
-每次构建会从 `XcpCam.csproj` 的 `Version` 和 `repo.template.json` 自动生成索引，更新 `AssemblyVersion` 和三个下载链接。也可运行 `dotnet msbuild -t:UpdatePluginRepository` 单独生成。发布时应一并提交生成的 `repo.json`，并上传对应版本安装包。内部标识使用 `XcpCam`，与安装包一致。
+```text
+https://raw.githubusercontent.com/MWangLF/XcpCam/main/repo.json
+```
+
+打开 `/xlplugins`，搜索并安装 **XcpCam**，进入 GPose 后输入 `/xcpcam` 使用。
 
 ## 构建
 
