@@ -13,12 +13,17 @@ public sealed class CamTrack
     public bool Solo;
     public List<Keyframe> Keys = [];
     public List<ShotCurves> Shots = [];
+    /// <summary>Follow Path constraint (null = the track follows its own node path).</summary>
+    public FollowPathConstraint? FollowPath;
+    /// <summary>Target curve resolved from <see cref="CamTimeline.Curves"/> (runtime reference).</summary>
+    public CurveObject? FollowCurve;
 
     public CamTrack Clone() => new()
     {
         Name = Name, Color = Color, Muted = Muted, Solo = Solo,
         Keys = Keys.Select(k => k.Clone()).ToList(),
         Shots = Shots.Select(s => s.Clone()).ToList(),
+        FollowPath = FollowPath?.Clone(), FollowCurve = FollowCurve,
     };
 }
 
@@ -68,8 +73,58 @@ public sealed class CamTimeline
 
     public long Revision { get; private set; }
     public void Touch() => Revision++;
-    private readonly List<(List<CamTrack> tracks, int active, int fps, int length)> _undo = [];
-    private readonly List<(List<CamTrack> tracks, int active, int fps, int length)> _redo = [];
+
+    /// <summary>User-placed curve objects (world space), targets for Follow Path constraints.</summary>
+    public List<CurveObject> Curves { get; private set; } = [];
+
+    /// <summary>Points every track's Follow Path constraint at its curve object (after undo, deletion, ...).</summary>
+    public void ResolveConstraints()
+    {
+        foreach(var track in Tracks)
+            track.FollowCurve = track.FollowPath is { } c ? Curves.FirstOrDefault(x => x.Id == c.CurveId) : null;
+    }
+
+    /// <summary>Adds a Follow Path constraint; node positions start at their nearest points on the curve.</summary>
+    public void SetFollowPath(CamTrack track, CurveObject curve)
+    {
+        Snapshot();
+        track.FollowPath = new FollowPathConstraint { CurveId = curve.Id };
+        ResolveConstraints();
+        CurveModel.Ensure(track, Fps);
+        Touch();
+    }
+
+    /// <summary>Removes the constraint and bakes the followed node positions back into the node path.</summary>
+    public void ClearFollowPath(CamTrack track)
+    {
+        if(track.FollowPath == null) return;
+        Snapshot();
+        var poses = track.Shots.SelectMany(s => track.Keys.Where(k => s.SeededNodes.Contains(k.Id)).Select(k => (s, k, pose: s.NodePose(k)))).ToList();
+        track.FollowPath = null; track.FollowCurve = null;
+        foreach(var shot in track.Shots) shot.ClearFollow();
+        foreach(var (shot, node, pose) in poses) shot.WritePose(node, pose, true, true, false);
+        CurveModel.Ensure(track, Fps);
+        Touch();
+    }
+
+    public void RemoveCurve(CurveObject curve)
+    {
+        Snapshot();
+        foreach(var track in Tracks.Where(t => t.FollowPath?.CurveId == curve.Id).ToList())
+        {
+            var poses = track.Shots.SelectMany(s => track.Keys.Where(k => s.SeededNodes.Contains(k.Id)).Select(k => (s, k, pose: s.NodePose(k)))).ToList();
+            track.FollowPath = null; track.FollowCurve = null;
+            foreach(var shot in track.Shots) shot.ClearFollow();
+            foreach(var (shot, node, pose) in poses) shot.WritePose(node, pose, true, true, false);
+            CurveModel.Ensure(track, Fps);
+        }
+        Curves.Remove(curve);
+        ResolveConstraints();
+        Touch();
+    }
+
+    private readonly List<(List<CamTrack> tracks, int active, int fps, int length, List<CurveObject> curves)> _undo = [];
+    private readonly List<(List<CamTrack> tracks, int active, int fps, int length, List<CurveObject> curves)> _redo = [];
     private const int MaxUndo = 64;
 
     public bool CanUndo => _undo.Count > 0;
@@ -327,7 +382,8 @@ public sealed class CamTimeline
 
     // ---------------- undo ----------------
 
-    private (List<CamTrack>, int, int, int) Capture() => (Tracks.Select(t => t.Clone()).ToList(), ActiveTrackIndex, Fps, Length);
+    private (List<CamTrack>, int, int, int, List<CurveObject>) Capture() =>
+        (Tracks.Select(t => t.Clone()).ToList(), ActiveTrackIndex, Fps, Length, Curves.Select(c => c.Clone()).ToList());
 
     public void Snapshot()
     {
@@ -339,14 +395,16 @@ public sealed class CamTimeline
     public void Undo() => Swap(_undo, _redo);
     public void Redo() => Swap(_redo, _undo);
 
-    private void Swap(List<(List<CamTrack> tracks, int active, int fps, int length)> from,
-        List<(List<CamTrack> tracks, int active, int fps, int length)> to)
+    private void Swap(List<(List<CamTrack> tracks, int active, int fps, int length, List<CurveObject> curves)> from,
+        List<(List<CamTrack> tracks, int active, int fps, int length, List<CurveObject> curves)> to)
     {
         if(from.Count == 0) return;
         to.Add(Capture());
-        var (tracks, active, fps, length) = from[^1];
+        var (tracks, active, fps, length, curves) = from[^1];
         from.RemoveAt(from.Count - 1);
         Tracks = tracks.Select(t => t.Clone()).ToList();
+        Curves = curves.Select(c => c.Clone()).ToList();
+        ResolveConstraints();
         ActiveTrackIndex = active;
         Fps = fps; Length = length;
         SelectNodes(SelectedNodes.ToArray());

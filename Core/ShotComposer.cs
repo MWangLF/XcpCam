@@ -70,6 +70,7 @@ public sealed class ShotComposer
     public static ShotComposer? Create(CamTimeline tl, PathSettings settings)
     {
         int n = tl.Tracks.Count;
+        tl.ResolveConstraints();
         var seq = new ShotSequence?[n];
         for(int i = 0; i < n; i++) seq[i] = ShotSequence.Create(tl.Tracks[i], tl.Fps);
 

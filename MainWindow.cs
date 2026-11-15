@@ -19,6 +19,7 @@ public sealed class MainWindow : Window, IDisposable
     private readonly BrioBridge _brio;
     private readonly Overlay _overlay;
     private readonly GizmoEditor _gizmo = new();
+    private readonly CurveTool _curveTool;
     private readonly TimelineWidget _tlw = new();
     private readonly GraphEditor _graph = new();
     private int _graphShot;
@@ -35,6 +36,8 @@ public sealed class MainWindow : Window, IDisposable
     private bool _followBrioPlayhead;
     private bool _drivePlayheadToBrio;
     private bool _lookThrough;
+    /// <summary>Playhead last pushed to the preview camera; null forces a sync.</summary>
+    private float? _lookSynced;
     private int _defaultGapFrames = 60;
     private string _status = "";
     private bool _statusIsError;
@@ -64,7 +67,6 @@ public sealed class MainWindow : Window, IDisposable
 
     private readonly Configuration _config;
     private readonly Action _saveConfig;
-    private readonly IKeyState? _keys;
     private bool _deleteWasDown;
     private long _seenSelection = -1;
     private bool _selectSettings;
@@ -73,7 +75,7 @@ public sealed class MainWindow : Window, IDisposable
     public void OpenSettings() { IsOpen = true; _selectSettings = true; }
 
     public MainWindow(ITargetManager targets, IClientState clientState, IPluginLog log, BrioBridge brio, Overlay overlay,
-        Configuration config, Action saveConfig, IKeyState? keys = null)
+        Configuration config, Action saveConfig)
         : base("XcpCam - 相机时间轴###xcpcam_main")
     {
         _targets = targets;
@@ -88,13 +90,15 @@ public sealed class MainWindow : Window, IDisposable
             Clock = ReadBoundClock,
             ClockCycle = () => _source == BindSource.Animation && _anim.Wrapped,
             ClockGeneration = () => _clockEpoch + (_source == BindSource.Animation ? _anim.Generation : 0),
+            Base = () => CameraCapture.TryGetBase(_targets, out var bp, out var br, out _, out _) ? (bp, br) : null,
         };
         _bake = new TimelineBake(brio, log);
-        _config = config; _saveConfig = saveConfig; _keys = keys;
+        _config = config; _saveConfig = saveConfig;
         NodeRange.MaxRange = config.MovementLimit;
         overlay.Enabled = config.OverlayEnabled; overlay.ShowPath = config.ShowPath; overlay.ShowFrustums = config.ShowFrustums;
         overlay.ShowLabels = config.ShowLabels; overlay.SpeedColors = config.SpeedColors; overlay.FrustumSize = config.FrustumSize;
         _tlw.BeforeTrackEdit = _tl.Snapshot;
+        _curveTool = new CurveTool(_tl, overlay, _gizmo, ShotFor, n => WriteNodePose(n, true, false, false), SetStatus);
         Size = new Vector2(900, 600);
         SizeCondition = ImGuiCond.FirstUseEver;
     }
@@ -281,6 +285,8 @@ public sealed class MainWindow : Window, IDisposable
     public void FrameworkTick(float dt)
     {
         bool gpose = _clientState.IsGPosing;
+        // the movement limit is measured from the current GPose target (no target: no limit)
+        NodeRange.Center = gpose && CameraCapture.TryGetBase(_targets, out var targetPos, out _, out _, out _) ? targetPos : null;
         if(!gpose)
         {
             if(_wasGpose)
@@ -362,13 +368,16 @@ public sealed class MainWindow : Window, IDisposable
     private void LookThroughPlayhead()
     {
         if(!_brio.IsConnected || _comp == null) return;
-        if(!CameraCapture.TryGetBase(_targets, out var bp, out var br, out _, out _)) return;
+        // Paused and not scrubbing: leave the free camera to the user (look around, change FoV).
+        // Playing, moving the playhead or turning preview on re-syncs it to the path.
+        if(!_playing && _lookSynced is float last && last == _tl.Playhead) return;
+        _lookSynced = _tl.Playhead;
+        // node poses are world coordinates
         var s = _comp.Sample(_tl.Playhead);
         // Never push a non-finite or out-of-range pose into the live game camera.
         if(!XcpMath.IsFinite(s.Pos) || !XcpMath.IsFinite(s.Rot) || !float.IsFinite(s.Fov)) return;
-        s = s with { Pos = GizmoEditor.ClampRange(s.Pos) };
-        var wp = Vector3.Transform(s.Pos, br) + bp;
-        var wr = Quaternion.Normalize(br * s.Rot);
+        var wp = GizmoEditor.ClampRange(s.Pos);
+        var wr = Quaternion.Normalize(s.Rot);
         var (yaw, pitch, roll) = FreeCamMath.FromWorldRotation(wr);
         if(!_brio.SetCurrentFreeCamPose(wp, yaw, pitch, roll, s.Fov - _bake.BaseFov))
         {
@@ -379,7 +388,136 @@ public sealed class MainWindow : Window, IDisposable
 
     // ------------------------------------------------------------------ overlay (drawn in OverlayWindow)
 
-    public bool OverlayWantsInput => _gizmo.Enabled && (Selected != null || _tl.SelectedNodes.Count > 1) && (_gizmo.IsOver || _gizmo.IsUsing);
+    private bool GizmoBusy => _gizmo.Enabled && (_curveTool.Active ? _curveTool.HasGizmoTarget : Selected != null || _tl.SelectedNodes.Count > 1)
+        && (_gizmo.IsOver || _gizmo.IsUsing);
+    // the overlay only takes the mouse over the gizmo or a pickable node / curve point, so the game camera keeps working elsewhere
+    public bool OverlayWantsInput => GizmoBusy || _hoverNode != null || _curveTool.Hover != null;
+    private Keyframe? _hoverNode;
+    private bool _overlayFocused;
+
+    /// <summary>Click a node camera in the game view to select it; Ctrl+click adds/removes it from the selection.</summary>
+    private int _deleteFrame = -1;
+    private bool _mainFocused;
+
+    /// <summary>Delete removes the selected nodes. Called from the main window and the overlay (whichever is
+    /// drawn), evaluated once per frame. The key is read from Windows: neither ImGui nor the game key state
+    /// reliably reports it here. Accepted while this window, the game view or the node overlay has focus,
+    /// never while another plugin window is focused or a text field is active.</summary>
+    private void HandleDeleteKey(bool? mainFocused = null)
+    {
+        if(mainFocused is bool f) _mainFocused = f;
+        if(!IsOpen) _mainFocused = false;
+        int frame = ImGui.GetFrameCount();
+        if(frame == _deleteFrame) return;
+        _deleteFrame = frame;
+        bool foreground = Win32.GameIsForeground();
+        bool down = foreground && (Win32.GetAsyncKeyState(0x2E) & 0x8000) != 0; // VK_DELETE
+        if(down && !_deleteWasDown)
+        {
+            bool otherFocused = ImGui.IsWindowFocused(ImGuiFocusedFlags.AnyWindow) && !_mainFocused && !_overlayFocused;
+            // in curve edit mode Delete removes the selected control points instead of camera nodes
+            if(!otherFocused && !ImGui.GetIO().WantTextInput && !_curveTool.DeleteSelected()) DeleteSelectedNodes();
+        }
+        _deleteWasDown = down;
+    }
+
+    private void PickNodeInOverlay()
+    {
+        // picking a node focuses the overlay window; that still counts as "the game view has focus" for Delete
+        _overlayFocused = ImGui.IsWindowFocused();
+        HandleDeleteKey();
+        _hoverNode = null; _curveTool.Hover = null;
+        bool blank = PickNodeUnderMouse(out var at);
+        TrackBlankClick(blank);
+        if(_curveTool.Hover is { } part)
+        {
+            ImGui.GetBackgroundDrawList().AddCircle(at, 10, 0xFFFFFFFF, 16, 2f);
+            ImGui.SetTooltip(part.Spline < 0 ? "物体模式：用变换手柄整体移动/旋转/缩放曲线"
+                : part.Part == CurvePart.Point ? "单击选中控制点，Ctrl+单击加选 / 取消" : "单击选中手柄，Ctrl+单击加选 / 取消");
+            if(ImGui.IsWindowHovered() && ImGui.IsMouseClicked(ImGuiMouseButton.Left)) _curveTool.Click(part, ImGui.GetIO().KeyCtrl);
+            return;
+        }
+        if(_hoverNode is not { } k) return;
+        ImGui.GetBackgroundDrawList().AddCircle(at, 10, 0xFFFFFFFF, 16, 2f);
+        ImGui.SetTooltip("单击选中镜头节点，Ctrl+单击加选 / 取消");
+        // act only once the overlay actually owns the mouse, so the click never also reaches the game
+        if(!ImGui.IsWindowHovered() || !ImGui.IsMouseClicked(ImGuiMouseButton.Left)) return;
+        if(ImGui.GetIO().KeyCtrl)
+        {
+            if(_tl.SelectedNodes.Count == 0 && Selected is { } primary) _tl.SelectNodes([primary.Id]);
+            _tl.ToggleNode(k.Id);
+            Selected = _tl.SelectedNodes.Contains(k.Id) ? k : null;
+        }
+        else { _tl.SelectNodes([k.Id]); Selected = k; }
+        if(_tl.TrackOf(k) is { } owner) _tl.ActiveTrackIndex = _tl.Tracks.IndexOf(owner);
+    }
+
+    /// <summary>Sets <see cref="_hoverNode"/>; returns true when the mouse is over empty game space
+    /// (no node, gizmo or ImGui window).</summary>
+    private bool PickNodeUnderMouse(out Vector2 at)
+    {
+        at = default;
+        if(!_clientState.IsGPosing || GizmoBusy) return false;
+        // another ImGui window (this panel, Brio, ...) under the mouse keeps the click
+        if(ImGui.IsWindowHovered(ImGuiHoveredFlags.AnyWindow) && !ImGui.IsWindowHovered()) return false;
+        var mouse = ImGui.GetIO().MousePos;
+        float best = 12f * 12f;
+        if(_curveTool.Active)
+        {
+            // curve editing: control points and handles are picked instead of camera nodes
+            foreach(var (part, screen) in _curveTool.Candidates)
+            {
+                float d = Vector2.DistanceSquared(screen, mouse);
+                if(d <= best) { best = d; _curveTool.Hover = part; at = screen; }
+            }
+            return _curveTool.Hover == null;
+        }
+        foreach(var (key, screen) in _overlay.NodeScreens)
+        {
+            float d = Vector2.DistanceSquared(screen, mouse);
+            if(d <= best) { best = d; _hoverNode = key; at = screen; }
+        }
+        return _hoverNode == null;
+    }
+
+    private bool _lmbWasDown;
+    private Win32.Point? _blankPress;
+
+    /// <summary>A short left click on empty game space clears the selection. The game owns the mouse there,
+    /// so ImGui does not reliably see the click; the button and cursor are read from Windows instead. The game
+    /// still receives the click, and dragging to rotate the camera (cursor moves) does not deselect.</summary>
+    private void TrackBlankClick(bool blank)
+    {
+        bool down = Win32.GameIsForeground() && (Win32.GetAsyncKeyState(0x01) & 0x8000) != 0;
+        Win32.GetCursorPos(out var cur);
+        if(down && !_lmbWasDown) _blankPress = blank ? cur : null;
+        else if(_blankPress is { } p)
+        {
+            int dx = cur.X - p.X, dy = cur.Y - p.Y;
+            if(dx * dx + dy * dy > 16) _blankPress = null;
+            else if(!down)
+            {
+                if(_curveTool.Active) _curveTool.ClearSelection();
+                else { _tl.SelectNodes([]); Selected = null; }
+                _blankPress = null;
+            }
+        }
+        _lmbWasDown = down;
+    }
+
+    private static class Win32
+    {
+        public struct Point { public int X, Y; }
+        [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern short GetAsyncKeyState(int key);
+        [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool GetCursorPos(out Point p);
+        [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
+        [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+        public static bool GameIsForeground()
+        {
+            GetWindowThreadProcessId(GetForegroundWindow(), out uint pid);
+            return pid == (uint)Environment.ProcessId;
+        }
+    }
 
     public void DrawOverlay()
     {
@@ -387,16 +525,24 @@ public sealed class MainWindow : Window, IDisposable
             ? _tl.Playhead : null;
         float? syncFrame = _comp != null && _sync.PlayheadSec is float sec ? _comp.FirstFrame + sec * _tl.Fps : null;
         _overlay.Draw(_comp, _tl, previewFrame, syncFrame, Selected);
+        if(_clientState.IsGPosing) _curveTool.DrawScene();
+        PickNodeInOverlay();
+        if(_curveTool.Active)
+        {
+            // the gizmo edits curves (points / handles / whole curve) instead of camera nodes
+            if(_clientState.IsGPosing) _curveTool.DrawGizmo();
+            return;
+        }
 
         var sel = Selected;
         var group = SelectedGroup();
-        if(group.Count > 1 && _clientState.IsGPosing && CameraCapture.TryGetBase(_targets, out var gbp, out var gbr, out _, out _))
+        if(group.Count > 1 && _clientState.IsGPosing)
         {
             // Group: translate-only gizmo at the centre; every selected node moves by the same delta.
             var center = GroupCenter(group);
             var proxy = new Keyframe { Pos = center, Rot = Quaternion.Identity, Fov = sel?.Fov ?? 0.78f };
             var op = _gizmo.Operation; _gizmo.Operation = GizmoEditor.Op.Translate;
-            bool moved = _gizmo.Draw(proxy, gbp, gbr);
+            bool moved = _gizmo.Draw(proxy, Vector3.Zero, Quaternion.Identity);
             _gizmo.Operation = op;
             if(_gizmo.DragStarted) _tl.Snapshot();
             if(moved) MoveGroup(group, proxy.Pos - center);
@@ -404,12 +550,12 @@ public sealed class MainWindow : Window, IDisposable
                 SetStatus($"变换手柄已限制：节点需保持在目标周围 {GizmoEditor.MaxRange:0} 米内，单帧跳动过大的拖动会被忽略。", true);
             return;
         }
-        if(sel != null && _clientState.IsGPosing && CameraCapture.TryGetBase(_targets, out var bp, out var br, out _, out _))
+        if(sel != null && _clientState.IsGPosing)
         {
             RefreshNodePose(sel);
             var prePos = sel.Pos;
             var preRot = sel.Rot;
-            bool changed = _gizmo.Draw(sel, bp, br);
+            bool changed = _gizmo.Draw(sel, Vector3.Zero, Quaternion.Identity); // world-space nodes
             if(_gizmo.DragStarted)
             {
                 // snapshot the pose from before this drag, then re-apply the first frame of the drag
@@ -502,12 +648,7 @@ public sealed class MainWindow : Window, IDisposable
     public override void Draw()
     {
         bool gpose = _clientState.IsGPosing;
-        // Delete removes the selected nodes. Read from the game key state (ImGui key events are not
-        // reliably delivered here), edge-triggered, only while this window is focused and no text field is active.
-        bool deleteDown = _keys != null && _keys[Dalamud.Game.ClientState.Keys.VirtualKey.DELETE];
-        if(deleteDown && !_deleteWasDown && ImGui.IsWindowFocused(ImGuiFocusedFlags.RootAndChildWindows) && !ImGui.GetIO().WantTextInput)
-            DeleteSelectedNodes();
-        _deleteWasDown = deleteDown;
+        HandleDeleteKey(ImGui.IsWindowFocused(ImGuiFocusedFlags.RootAndChildWindows));
         // a selection cleared elsewhere (curve editors' blank click) also drops the primary node
         if(_seenSelection != _tl.SelectionRevision)
         {
@@ -527,6 +668,11 @@ public sealed class MainWindow : Window, IDisposable
             if(ImGui.BeginTabItem("曲线编辑器"))
             {
                 DrawGraphTab();
+                ImGui.EndTabItem();
+            }
+            if(ImGui.BeginTabItem("曲线"))
+            {
+                _curveTool.DrawPanel(gpose);
                 ImGui.EndTabItem();
             }
             var settingsFlags = _selectSettings ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None;
@@ -665,7 +811,7 @@ public sealed class MainWindow : Window, IDisposable
 
         // --- capture row ---
         ImGui.BeginDisabled(!gpose);
-        if(ImGui.Button("在播放头抓取镜头")) CaptureAtPlayhead();
+        if(ImGui.Button("添加镜头关键帧")) CaptureAtPlayhead();
         ImGui.EndDisabled();
         if(ImGui.IsItemHovered()) ImGui.SetTooltip("在当前播放头所在帧添加镜头节点（该帧已有节点则替换它的镜头）");
         ImGui.SameLine();
@@ -674,7 +820,7 @@ public sealed class MainWindow : Window, IDisposable
         ImGui.EndDisabled();
         ImGui.SameLine();
         ImGui.BeginDisabled(!gpose || _tl.Keys.Count == 0);
-        if(ImGui.Button("在播放头切镜")) CutAtPlayhead();
+        if(ImGui.Button("切镜")) CutAtPlayhead();
         ImGui.EndDisabled();
         if(ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
             ImGui.SetTooltip("在播放头所在帧抓取当前镜头，并从上一个节点「硬切」过来（瞬间切换，不移动过去）。\n之后的节点会接着这个新镜头继续运镜。");
@@ -724,6 +870,7 @@ public sealed class MainWindow : Window, IDisposable
         if(_tlw.PlayheadChanged) SeekPlayhead(_tl.Playhead);
         ImGui.TextWrapped("拖节点改帧 · 标尺拖播放头 · 空白左键/中键拖视图 · Ctrl+滚轮缩放帧轴 · Ctrl+Alt+滚轮缩放轨道行 · Alt+滚轮滚轨道 · Ctrl+左键空白框选 · 双击节点跳转 · ✂=恒定切镜");
         DrawGizmoBar();
+        _curveTool.DrawConstraint();
 
         ImGui.Separator();
         ImGui.TextDisabled("「曲线编辑器」可选择高级/简单曲线；高级直接调数值、速度和帧，简单调节奏，另一层锁定并保留。");
@@ -768,7 +915,7 @@ public sealed class MainWindow : Window, IDisposable
         if(k == null)
         {
             ImGui.TextDisabled(!_tl.AllKeys.Any()
-                ? "还没有镜头节点。在 Brio 里摆好镜头后点「在播放头抓取镜头」。"
+                ? "还没有镜头节点。在 Brio 里摆好镜头后点「添加镜头关键帧」。"
                 : _gizmo.Enabled
                     ? "点击时间轴上的◆选中一个镜头节点进行编辑；选中后可在游戏画面中用变换手柄直接移动/旋转它。"
                     : "点击时间轴上的◆选中一个镜头节点进行编辑。（勾选上方「变换手柄」可在游戏画面中直接调整）");
@@ -817,15 +964,30 @@ public sealed class MainWindow : Window, IDisposable
         RefreshNodePose(k);
         ImGui.TextDisabled("节点姿态修改写回高级曲线；简单曲线的节奏数据独立保留。");
 
-        // transform fields (relative to target)
+        // transform fields (world coordinates); a following node is positioned by its factor along the curve
+        var followShot = ShotFor(k);
+        if(followShot?.NodeFactor(k) is double factor)
+        {
+            float percent = (float)(factor * 100);
+            ImGui.SetNextItemWidth(160);
+            bool factorChanged = ImGui.DragFloat("路径进度 (%)", ref percent, 0.1f, 0f, 100f, "%.2f");
+            if(ImGui.IsItemActivated()) _tl.Snapshot();
+            if(factorChanged && followShot.SetNodeFactor(k, percent / 100.0)) { RefreshNodePose(k); _tl.Touch(); }
+            if(ImGui.IsItemHovered())
+                ImGui.SetTooltip("跟随路径：位置由节点在曲线上的进度决定，不受抓取时相机位置影响。\n默认首节点 0%、末节点 100%，其余按帧均分；手动修改或在游戏内沿曲线拖动后保持手动值。");
+        }
         var pos = k.Pos;
-        ImGui.SetNextItemWidth(260);
-        bool positionChanged = ImGui.DragFloat3("相对位置 (米)", ref pos, 0.01f);
-        if(ImGui.IsItemActivated()) _tl.Snapshot();
+        bool positionChanged = false;
+        if(followShot?.IsFollowing != true)
+        {
+            ImGui.SetNextItemWidth(260);
+            positionChanged = ImGui.DragFloat3("位置 (世界坐标, 米)", ref pos, 0.01f);
+            if(ImGui.IsItemActivated()) _tl.Snapshot();
+        }
         if(positionChanged)
         {
             var limited = GizmoEditor.ClampRange(pos);
-            if(limited != pos) SetStatus($"相对位置已限制在目标周围 {GizmoEditor.MaxRange:0} 米内，超出后游戏无法正常渲染。", true);
+            if(limited != pos) SetStatus($"位置已限制在目标周围 {GizmoEditor.MaxRange:0} 米内，超出后游戏无法正常渲染。", true);
             k.Pos = limited; WriteNodePose(k, true, false, false);
         }
 
@@ -889,15 +1051,9 @@ public sealed class MainWindow : Window, IDisposable
     private void DrawTargetWarnings(bool gpose)
     {
         if(!_tl.AllKeys.Any()) return;
-        var names = _tl.AllKeys.Select(k => k.TargetName).Where(n => n.Length > 0).Distinct().Count();
-        if(names > 1)
-            ImGui.TextColored(new Vector4(1, 0.4f, 0.4f, 1), "警告：镜头节点抓取时的 GPose 目标不一致，播放时会错位。");
-        else if(gpose && CameraCapture.TryGetBase(_targets, out var bp, out var br, out var nm, out _))
-        {
-            var k0 = _tl.AllKeys.First();
-            if(k0.TargetName.Length > 0 && (nm != k0.TargetName || Vector3.Distance(bp, k0.BasePos) > 0.01f || MathF.Abs(Quaternion.Dot(br, k0.BaseRot)) < 0.9999f))
-                ImGui.TextColored(new Vector4(1, 0.7f, 0.3f, 1), "提示：目标角色在抓取后移动/旋转或已更换。运镜是相对目标的，会跟随当前目标。");
-        }
+        // Nodes and curves are world coordinates; only .xcp export / XAT sync need the target.
+        if(gpose && !CameraCapture.TryGetBase(_targets, out _, out _, out _, out _))
+            ImGui.TextColored(new Vector4(1, 0.7f, 0.3f, 1), "提示：未选中 GPose 目标。镜头节点是世界坐标，可以照常编辑；导出 .xcp / 联动 XAT 需要目标。");
     }
 
     // ---------------- in-game display & gizmo (merged into the timeline tab) ----------------
@@ -912,10 +1068,21 @@ public sealed class MainWindow : Window, IDisposable
         if(ImGui.IsItemHovered()) ImGui.SetTooltip("选中一个镜头节点后，在游戏画面中该镜头处显示手柄，可直接拖动移动/旋转。");
         ImGui.BeginDisabled(!_gizmo.Enabled);
         ImGui.SameLine();
+        int target = _curveTool.Active ? 1 : 0;
+        ImGui.SetNextItemWidth(70);
+        if(ImGui.Combo("##gizmotarget", ref target, "节点\0曲线\0")) { _curveTool.Active = target == 1; _curveTool.ClearSelection(); }
+        if(ImGui.IsItemHovered()) ImGui.SetTooltip("变换手柄作用对象：镜头节点，或曲线（控制点、贝塞尔曲率手柄、整条曲线；详见「曲线」页）。");
+        ImGui.SameLine();
         int op = (int)_gizmo.Operation;
         if(ImGui.RadioButton("移动", ref op, 0)) _gizmo.Operation = GizmoEditor.Op.Translate;
         ImGui.SameLine();
         if(ImGui.RadioButton("旋转", ref op, 1)) _gizmo.Operation = GizmoEditor.Op.Rotate;
+        if(_curveTool.Active)
+        {
+            ImGui.SameLine();
+            if(ImGui.RadioButton("缩放", ref op, 2)) _gizmo.Operation = GizmoEditor.Op.Scale;
+        }
+        else if(_gizmo.Operation == GizmoEditor.Op.Scale) _gizmo.Operation = GizmoEditor.Op.Translate;
         ImGui.SameLine();
         ImGui.Checkbox("本地坐标", ref _gizmo.LocalSpace);
         ImGui.SameLine();
@@ -964,7 +1131,7 @@ public sealed class MainWindow : Window, IDisposable
             changed |= ImGui.IsItemDeactivatedAfterEdit();
             ImGui.SameLine();
             if(ImGui.SmallButton("恢复默认")) { NodeRange.MaxRange = NodeRange.DefaultRange; changed = true; }
-            ImGui.TextDisabled($"镜头节点距 GPose 目标不超过此距离（{NodeRange.MinimumRange:0}–{NodeRange.MaximumRange:0} 米，默认 {NodeRange.DefaultRange:0}）。\n作用于变换手柄、相对位置输入与预览镜头；已有节点不会被自动挪动，下次编辑时才被限制。\n超出游戏渲染范围时可能无法正常显示，可酌情调小。");
+            ImGui.TextDisabled($"镜头节点距当前 GPose 目标不超过此距离（{NodeRange.MinimumRange:0}–{NodeRange.MaximumRange:0} 米，默认 {NodeRange.DefaultRange:0}）；没有目标时不限制。\n节点与曲线都是世界坐标，只在导出 .xcp / 联动 XAT 时换算为相对目标。\n作用于变换手柄、位置输入与预览镜头；已有节点不会被自动挪动，下次编辑时才被限制。\n超出游戏渲染范围时可能无法正常显示，可酌情调小。");
         }
         if(changed) SaveConfig();
         if(ImGui.CollapsingHeader("Brio 联动", ImGuiTreeNodeFlags.DefaultOpen))
@@ -982,18 +1149,22 @@ public sealed class MainWindow : Window, IDisposable
     private void DrawLookThroughToggle()
     {
         ImGui.BeginDisabled(!_brio.IsConnected || _comp == null);
-        if(ImGui.Checkbox("预览镜头", ref _lookThrough) && _lookThrough && !_brio.CurrentCameraIsFree)
+        if(ImGui.Checkbox("预览镜头", ref _lookThrough))
         {
-            _lookThrough = false;
-            SetStatus("请先在 Brio 中切换到一个自由相机（Free）。", true);
+            _lookSynced = null; // sync once right away
+            if(_lookThrough && !_brio.CurrentCameraIsFree)
+            {
+                _lookThrough = false;
+                SetStatus("请先在 Brio 中切换到一个自由相机（Free）。", true);
+            }
         }
         ImGui.EndDisabled();
         if(ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
             ImGui.SetTooltip(!_brio.IsConnected ? "需要连接 Brio。"
                 : _comp == null ? "需要至少一个镜头节点。"
-                : "把 Brio 当前的自由相机放到播放头位置，直接看到这一帧的画面。\n播放或拖动时间轴即可预览运镜。");
+                : "把 Brio 当前的自由相机放到播放头位置，直接看到这一帧的画面。\n暂停时可以自由旋转视角、调整 FoV；播放或移动播放头时重新同步到运镜。");
         if(_lookThrough)
-            ImGui.TextColored(new Vector4(1, 0.7f, 0.3f, 1), "预览镜头：Brio 自由相机正被运镜接管，抓取镜头前请先关闭。");
+            ImGui.TextColored(new Vector4(1, 0.7f, 0.3f, 1), "预览镜头：Brio 自由相机正被运镜接管；暂停时调整后的画面可直接添加关键帧或切镜。");
     }
 
     // ---------------- Brio tab ----------------
@@ -1115,9 +1286,8 @@ public sealed class MainWindow : Window, IDisposable
         if(ImGui.Button("烘焙到 Brio 时间轴"))
             Try(() =>
             {
-                if(!CameraCapture.TryGetBase(_targets, out var bp, out var br, out _, out var err))
-                    throw new InvalidOperationException(err);
-                _bake.Bake(cams[_bakeCamIndex], _comp!, bp, br);
+                // the free camera is world space, like the nodes: no target conversion
+                _bake.Bake(cams[_bakeCamIndex], _comp!, Vector3.Zero, Quaternion.Identity);
                 SetStatus(_bake.Status, false);
             });
         ImGui.EndDisabled();
@@ -1144,23 +1314,20 @@ public sealed class MainWindow : Window, IDisposable
 
     private Keyframe? MakeKey()
     {
-        if(_lookThrough)
-        {
-            SetStatus("请先关闭「预览镜头」再抓取新镜头。", true);
-            return null;
-        }
+        // works while previewing too: the previewed (and, when paused, freely adjusted) view is what gets captured
         if(!CameraCapture.TryCapture(_targets, out var s, out var err) || s is null)
         {
             SetStatus(err, true);
             return null;
         }
 
-        var (pos, rot) = XcpMath.WorldToRelative(s.WorldPos, s.WorldRot, s.BasePos, s.BaseRot);
-        var rebuilt = XcpMath.BrioPlaybackView(pos, rot, s.BasePos, s.BaseRot);
+        // nodes are stored in world coordinates; the self check rebuilds the view with an identity base
+        var pos = s.WorldPos; var rot = Quaternion.Normalize(s.WorldRot);
+        var rebuilt = XcpMath.BrioPlaybackView(pos, rot, Vector3.Zero, Quaternion.Identity);
         var err2 = XcpMath.MaxAffineDiff(rebuilt, s.View);
 
         float fov = _useProjectionFov && s.FovProjection > 0.01f ? s.FovProjection : s.FovRender;
-        _log.Info($"capture world={s.WorldPos} base={s.BasePos} rel={pos} rot={rot} fov={fov} selfCheck={err2}");
+        _log.Info($"capture world={pos} rot={rot} target={s.BasePos} fov={fov} selfCheck={err2}");
 
         if(!XcpMath.IsFinite(pos) || !XcpMath.IsFinite(rot) || !float.IsFinite(fov))
         {
@@ -1185,7 +1352,7 @@ public sealed class MainWindow : Window, IDisposable
         if(existing != null)
         {
             CopyPose(k, existing);
-            WriteNodePose(existing);
+            ApplyCapture(existing);
             Selected = existing;
             SetStatus($"已替换第 {frame} 帧的镜头", false);
             return;
@@ -1193,6 +1360,7 @@ public sealed class MainWindow : Window, IDisposable
         k.Frame = frame;
         EnsureLength(k.Frame);
         _tl.Keys.Add(k);
+        if(_tl.ActiveTrack.FollowPath != null) ApplyCapture(k);
         Selected = k;
         SetStatus($"已在「{_tl.ActiveTrack.Name}」第 {frame} 帧添加节点 {_tl.Keys.Count}", false);
     }
@@ -1223,7 +1391,7 @@ public sealed class MainWindow : Window, IDisposable
         }
         k.CutIn = true;
         k.CutAuto = false;
-        WriteNodePose(k);
+        ApplyCapture(k);
         Selected = k;
         SetStatus($"已在第 {frame} 帧切镜：之前的运镜到这里结束，镜头瞬间切到新镜头。", false);
     }
@@ -1236,6 +1404,7 @@ public sealed class MainWindow : Window, IDisposable
         k.Frame = _tl.Keys.Count == 0 ? (int)MathF.Round(_tl.Playhead) : CamTimeline.TrackLastFrame(_tl.ActiveTrack) + _defaultGapFrames;
         EnsureLength(k.Frame);
         _tl.Keys.Add(k);
+        if(_tl.ActiveTrack.FollowPath != null) ApplyCapture(k);
         Selected = k;
         _tl.Playhead = k.Frame;
         _tlw.EnsureVisible(k.Frame, 700);
@@ -1280,9 +1449,21 @@ public sealed class MainWindow : Window, IDisposable
         if(k is null) return;
         _tl.Snapshot();
         CopyPose(k, target);
-        WriteNodePose(target);
+        ApplyCapture(target);
         var owner = _tl.TrackOf(target);
         SetStatus($"已用当前镜头替换节点 {(owner?.Keys.IndexOf(target) ?? 0) + 1}", false);
+    }
+
+    /// <summary>
+    /// Writes a captured camera into a node. On a track with a Follow Path constraint only rotation and FoV come
+    /// from the camera: the position is the node's factor along the curve (first node 0 %, last 100 %, the rest
+    /// spread by frame), so the player camera position is ignored.
+    /// </summary>
+    private void ApplyCapture(Keyframe node)
+    {
+        bool following = (_tl.TrackOf(node) ?? _tl.ActiveTrack).FollowPath != null;
+        WriteNodePose(node, !following, true, true);
+        if(following) RefreshNodePose(node);
     }
 
     private static void CopyPose(Keyframe from, Keyframe to)
@@ -1321,7 +1502,10 @@ public sealed class MainWindow : Window, IDisposable
         try
         {
             if(_comp == null) throw new InvalidOperationException("至少需要一个镜头节点");
-            var frames = _comp.BakeXcp(PathBuilder.Fps);
+            // .xcp is relative to the GPose target: convert the world-space path with the current target
+            if(!CameraCapture.TryGetBase(_targets, out var bp, out var br, out _, out var err))
+                throw new InvalidOperationException($"导出 .xcp 需要 GPose 目标（{err}）");
+            var frames = XcpMath.ToRelative(_comp.BakeXcp(PathBuilder.Fps), bp, br);
             XcpWriter.Write(path, frames);
             _lastDir = Path.GetDirectoryName(path) ?? _lastDir;
             string cutNote = _comp.CutFrames.Count > 0 ? $"，{_comp.CutFrames.Count} 处切镜（.xcp 切镜处约有 1 帧过渡）" : "";

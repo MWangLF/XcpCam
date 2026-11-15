@@ -67,6 +67,18 @@ public static class XcpMath
         return (pos, rot);
     }
 
+    /// <summary>World-space frames → frames relative to the GPose target (the .xcp / XAT convention).</summary>
+    public static System.Collections.Generic.List<XcpFrame> ToRelative(System.Collections.Generic.IReadOnlyList<XcpFrame> world, Vector3 basePos, Quaternion baseRot)
+    {
+        var result = new System.Collections.Generic.List<XcpFrame>(world.Count);
+        foreach(var f in world)
+        {
+            var (pos, rot) = WorldToRelative(f.Pos, f.Rot, basePos, baseRot);
+            result.Add(new XcpFrame(pos, rot, f.Fov));
+        }
+        return result;
+    }
+
     /// <summary>Exactly what Brio's cutscene player builds (Scale=1, Offset=0).</summary>
     public static Matrix4x4 BrioPlaybackView(Vector3 pos, Quaternion rot, Vector3 basePos, Quaternion baseRot)
     {

@@ -25,6 +25,16 @@ public static class NodeRange
         return length > MaxRange ? rel * (MaxRange / length) : rel;
     }
 
+    /// <summary>World position of the current GPose target; the limit is measured from it. Null = no target, no limit.</summary>
+    public static Vector3? Center;
+
+    /// <summary>Limits a world position to <see cref="MaxRange"/> around <see cref="Center"/>.</summary>
+    public static Vector3 ClampWorld(Vector3 world)
+    {
+        if(Center is not Vector3 c) return XcpMath.IsFinite(world) ? world : Vector3.Zero;
+        return XcpMath.IsFinite(world) ? c + Clamp(world - c) : c;
+    }
+
     /// <summary>In front of the camera and near the viewport (row-vector convention, like ImGuizmo).</summary>
     public static bool Visible(Vector3 world, Matrix4x4 view, Matrix4x4 proj)
     {

@@ -15,7 +15,7 @@ namespace XcpCam;
 /// </summary>
 public sealed unsafe class GizmoEditor
 {
-    public enum Op { Translate, Rotate }
+    public enum Op { Translate, Rotate, Scale }
 
     public bool Enabled = true;
     public Op Operation = Op.Translate;
@@ -83,13 +83,14 @@ public sealed unsafe class GizmoEditor
         ImGuizmo.SetOrthographic(false);
         ImGuizmo.Enable(true);
 
-        var op = Operation == Op.Translate ? ImGuizmoOperation.Translate : ImGuizmoOperation.Rotate;
+        // camera nodes have no scale: Scale mode moves them
+        var op = Operation == Op.Rotate ? ImGuizmoOperation.Rotate : ImGuizmoOperation.Translate;
         var mode = LocalSpace ? ImGuizmoMode.Local : ImGuizmoMode.World;
 
         bool changed;
         if(Snap)
         {
-            var snap = Operation == Op.Translate ? new Vector3(SnapTranslate) : new Vector3(SnapRotateDeg);
+            var snap = Operation != Op.Rotate ? new Vector3(SnapTranslate) : new Vector3(SnapRotateDeg);
             var delta = Matrix4x4.Identity;
             changed = ImGuizmo.Manipulate(&view.M11, &proj.M11, op, mode, &model.M11, &delta.M11, &snap.X);
         }
@@ -120,6 +121,54 @@ public sealed unsafe class GizmoEditor
         return true;
     }
 
-    public static Vector3 ClampRange(Vector3 rel) => NodeRange.Clamp(rel);
+    /// <summary>Node positions are world coordinates; the limit is measured from the current GPose target.</summary>
+    public static Vector3 ClampRange(Vector3 world) => NodeRange.ClampWorld(world);
+
+    /// <summary>
+    /// World-space transform gizmo for curve objects and curve points (Blender G / R / S). Same safety rules as
+    /// the node gizmo: skipped when off screen, oversized single-frame jumps rejected, position range-limited.
+    /// </summary>
+    public bool DrawTransform(ref Vector3 position, ref Quaternion rotation, ref Vector3 scale, Op operation)
+    {
+        DragStarted = false;
+        IsUsing = false; IsOver = false;
+        if(!Enabled) { _wasUsing = false; return false; }
+        if(!TryGetCameraMatrices(out var view, out var proj)) return false;
+        if(!XcpMath.IsFinite(position) || !GizmoVisible(position, view, proj)) { _wasUsing = false; return false; }
+        var model = Matrix4x4.CreateScale(scale) * Matrix4x4.CreateFromQuaternion(Quaternion.Normalize(rotation)) * Matrix4x4.CreateTranslation(position);
+        var io = ImGui.GetIO();
+        ImGuizmo.SetID(GizmoId + 1);
+        ImGuizmo.BeginFrame();
+        ImGuizmo.SetDrawlist();
+        ImGuizmo.SetRect(0, 0, io.DisplaySize.X, io.DisplaySize.Y);
+        ImGuizmo.SetOrthographic(false);
+        ImGuizmo.Enable(true);
+        var op = operation switch { Op.Rotate => ImGuizmoOperation.Rotate, Op.Scale => ImGuizmoOperation.Scale, _ => ImGuizmoOperation.Translate };
+        var mode = LocalSpace || operation == Op.Scale ? ImGuizmoMode.Local : ImGuizmoMode.World;
+        bool changed;
+        if(Snap)
+        {
+            var snap = operation == Op.Rotate ? new Vector3(SnapRotateDeg) : operation == Op.Scale ? new Vector3(.1f) : new Vector3(SnapTranslate);
+            var delta = Matrix4x4.Identity;
+            changed = ImGuizmo.Manipulate(&view.M11, &proj.M11, op, mode, &model.M11, &delta.M11, &snap.X);
+        }
+        else changed = ImGuizmo.Manipulate(ref view, ref proj, op, mode, ref model);
+        IsUsing = ImGuizmo.IsUsing();
+        IsOver = ImGuizmo.IsOver();
+        ImGuizmo.SetID(0);
+        if(IsUsing && !_wasUsing) DragStarted = true;
+        _wasUsing = IsUsing;
+        if(!changed) return false;
+        if(!Matrix4x4.Decompose(model, out var s, out var r, out var p)) return false;
+        if(!XcpMath.IsFinite(p) || !XcpMath.IsFinite(r) || !XcpMath.IsFinite(s)) return false;
+        Limited = false;
+        if(Vector3.Distance(p, position) > MaxStep) { Limited = true; return false; }
+        var clamped = ClampRange(p);
+        Limited = clamped != p;
+        position = clamped;
+        rotation = Quaternion.Normalize(r);
+        scale = Vector3.Clamp(s, new Vector3(1e-3f), new Vector3(1e3f));
+        return true;
+    }
     private static bool GizmoVisible(Vector3 world, Matrix4x4 view, Matrix4x4 proj) => NodeRange.Visible(world, view, proj);
 }

@@ -39,6 +39,8 @@ public sealed class Overlay
 
     public int SelectedKey = -1;
     public float? PreviewTime;
+    /// <summary>Screen position of every node camera drawn this frame, for click picking.</summary>
+    public readonly List<(Keyframe Key, Vector2 Screen)> NodeScreens = new();
 
     public Overlay(IGameGui gui, IClientState clientState, ITargetManager targets)
     {
@@ -54,13 +56,15 @@ public sealed class Overlay
     /// <param name="selected">Node to highlight (reference compare).</param>
     public void Draw(ShotComposer? comp, CamTimeline tl, float? previewFrame, float? externalFrame, Keyframe? selected = null)
     {
+        NodeScreens.Clear();
         if(!Enabled || !_clientState.IsGPosing) return;
-        if(!CameraCapture.TryGetBase(_targets, out var basePos, out var baseRot, out _, out _)) return;
         // a composer built for a different track list (track just added / removed) is stale for this frame
         if(comp != null && comp.TrackCount != tl.Tracks.Count) comp = null;
 
         var dl = ImGui.GetBackgroundDrawList();
-        Vector3 ToWorld(Vector3 rel) => Vector3.Transform(rel, baseRot) + basePos;
+        // node poses and curves are world coordinates
+        var baseRot = Quaternion.Identity;
+        static Vector3 ToWorld(Vector3 world) => world;
 
         // ---- paths, per track / per segment ----
         if(ShowPath && comp != null)
@@ -117,12 +121,13 @@ public sealed class Overlay
                 for(int i = 0; i < track.Keys.Count; i++)
                 {
                     var k = track.Keys[i];
-                    bool sel = selected != null && ReferenceEquals(k, selected);
+                    bool sel = selected != null && ReferenceEquals(k, selected) || tl.SelectedNodes.Contains(k.Id);
                     uint col = sel ? 0xFF00FFFF : active ? track.Color : Dim(track.Color);
                     var seq = comp?.SequenceOf(t);
                     var pose = seq == null ? new XcpFrame(k.Pos, k.Rot, k.Fov)
                         : seq.Segments[seq.SegmentAt(k.Frame)].Curves.NodePose(k);
                     DrawFrustum(dl, ToWorld(pose.Pos), Quaternion.Normalize(baseRot * pose.Rot), pose.Fov, col, sel ? 2.5f : 1.5f);
+                    if(_gui.WorldToScreen(ToWorld(pose.Pos), out var eye) && IsSane(eye)) NodeScreens.Add((k, eye));
                     if(ShowLabels && _gui.WorldToScreen(ToWorld(pose.Pos), out var sp) && IsSane(sp))
                     {
                         var label = tl.Tracks.Count > 1 ? $"{track.Name} #{i + 1}  F{k.Frame}" : $"#{i + 1}  F{k.Frame}";
@@ -210,6 +215,40 @@ public sealed class Overlay
     }
 
     private static bool IsSane(Vector2 v) => float.IsFinite(v.X) && float.IsFinite(v.Y) && MathF.Abs(v.X) < 20000 && MathF.Abs(v.Y) < 20000;
+
+    // ---------------- helpers for the curve tool (world space, background draw list) ----------------
+
+    public bool ToScreen(Vector3 world, out Vector2 screen) => _gui.WorldToScreen(world, out screen) && IsSane(screen);
+
+    public void DrawLine(Vector3 a, Vector3 b, uint col, float thick = 1.5f, bool dashed = false)
+    {
+        var dl = ImGui.GetBackgroundDrawList();
+        if(dashed) DashedLine(dl, a, b, col); else Line(dl, a, b, col, thick);
+    }
+
+    public void DrawPolyline(IReadOnlyList<Vector3> points, uint col, float thick)
+    {
+        var dl = ImGui.GetBackgroundDrawList();
+        for(int i = 0; i + 1 < points.Count; i++) Line(dl, points[i], points[i + 1], col, thick);
+    }
+
+    /// <summary>Square control point / round handle markers like Blender's edit mode.</summary>
+    public void DrawMarker(Vector3 world, uint col, bool square, bool selected)
+    {
+        if(!ToScreen(world, out var s)) return;
+        var dl = ImGui.GetBackgroundDrawList();
+        float r = selected ? 5 : 4;
+        if(square) { dl.AddRectFilled(s - new Vector2(r), s + new Vector2(r), col); dl.AddRect(s - new Vector2(r + 1), s + new Vector2(r + 1), 0xFF000000); }
+        else { dl.AddCircleFilled(s, r, col); dl.AddCircle(s, r + 1, 0xFF000000); }
+    }
+
+    public void DrawLabel(Vector3 world, string text, uint col)
+    {
+        if(!ToScreen(world, out var s)) return;
+        var dl = ImGui.GetBackgroundDrawList();
+        dl.AddText(s + new Vector2(8, -18), 0xFF000000, text);
+        dl.AddText(s + new Vector2(7, -19), col, text);
+    }
 
     /// <summary>Blue (slow) -> green -> red (fast), ABGR.</summary>
     private static uint SpeedColor(float t)

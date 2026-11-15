@@ -21,6 +21,7 @@ public static class ConstantCuts
         var interval = shot.Intervals.FirstOrDefault(i => i.EndNodeId == endNode);
         if(interval == null) return;
         var keys = Enum.GetValues<SpatialChannel>().Select(c => shot.Space.Channels[c].Keys.FirstOrDefault(k => k.NodeId == interval.StartNodeId))
+            .Concat(shot.Offset.Prepend(shot.PathProgress).Select(c => c.Keys.FirstOrDefault(k => k.NodeId == interval.StartNodeId)))
             .Where(k => k != null).Select(k => k!)
             .Concat(interval.Channels.Values.Distinct().SelectMany(c => c.Keys.Take(Math.Max(0, c.Keys.Count - 1)))).ToList();
         foreach(var key in keys)

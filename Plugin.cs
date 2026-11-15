@@ -20,7 +20,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly BrioBridge _brio;
 
     public Plugin(IDalamudPluginInterface pi, ICommandManager commands, ITargetManager targets, IClientState clientState,
-        IGameGui gameGui, IFramework framework, IPluginLog log, IKeyState keyState)
+        IGameGui gameGui, IFramework framework, IPluginLog log)
     {
         _pi = pi;
         _commands = commands;
@@ -30,7 +30,7 @@ public sealed class Plugin : IDalamudPlugin
         _brio = new BrioBridge(log);
         var config = pi.GetPluginConfig() as Configuration ?? new Configuration();
         var overlay = new Overlay(gameGui, clientState, targets);
-        _main = new MainWindow(targets, clientState, log, _brio, overlay, config, () => pi.SavePluginConfig(config), keyState);
+        _main = new MainWindow(targets, clientState, log, _brio, overlay, config, () => pi.SavePluginConfig(config));
         _overlayWindow = new OverlayWindow(_main.DrawOverlay, () => _main.OverlayWantsInput);
 
         // overlay first so the main window is drawn on top of it

@@ -9,6 +9,7 @@ public static class SmoothTiming
 {
     public static double Distance(MotionInterval interval)
     {
+        if(interval.FollowDistance is double follow) return follow;
         if(interval.Path == null || !interval.Ranges.TryGetValue(CameraChannel.Position, out var range)) return 0;
         return Math.Max(0, interval.Path.Distance(range.end) - interval.Path.Distance(range.start));
     }

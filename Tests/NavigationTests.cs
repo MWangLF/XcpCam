@@ -23,9 +23,15 @@ public static class NavigationTests
         CurveModel.Ensure(track); var space=track.Shots[0].Space;
         check(space.Channels.Values.All(c=>c.Keys.All(k=>k.Mode==HandleMode.Auto)),"New spatial path defaults to Auto, not AutoClamped");
         var x=space.Channels[SpatialChannel.PositionX];
-        double incoming=x.Keys[1].Left.Y/(track.Keys[1].Frame-track.Keys[0].Frame)*-3;
-        double outgoing=x.Keys[1].Right.Y/(track.Keys[2].Frame-track.Keys[1].Frame)*3;
-        check(Math.Abs(incoming-outgoing)<1e-7,"Nonuniform frame-aware Auto tangents share physical node velocity");
+        // The position path is a 3D Bezier curve with Blender Auto handles: G1 through the node and the
+        // same handles as Blender's calchandleNurb_intern (physical speed comes from the path progress).
+        var spline=new Spline();
+        foreach(var item in new[]{0f,2f,8f,9f}) spline.Points.Add(new CurvePoint { Co=new(item,0,0) });
+        spline.CalcHandles();
+        check(Math.Abs(x.Keys[1].Left.Y-(spline.Points[1].Left.X-2))<1e-5 && Math.Abs(x.Keys[1].Right.Y-(spline.Points[1].Right.X-2))<1e-5
+            && x.Keys[1].Left.Y<0 && x.Keys[1].Right.Y>0,"Default position path uses Blender 3D Auto handles (G1 through the node)");
+        check(Math.Abs(x.Keys[1].Left.X+(x.Keys[1].Frame-x.Keys[0].Frame)/3f)<1e-3 && Math.Abs(x.Keys[1].Right.X-(x.Keys[2].Frame-x.Keys[1].Frame)/3f)<1e-3,
+            "Position keys keep handle X at a third of the parameter span (exact 3D Bezier)");
         var outside=x.Keys[0].Clone(); var end=x.Keys[^1].Clone();
         SpatialTangents.Apply(space,track.Keys,SpatialChannel.PositionX,track.Keys.Skip(1).Take(2).Select(k=>k.Id).ToHashSet(),true);
         check(x.Keys[0].Left==outside.Left && x.Keys[0].Right==outside.Right && x.Keys[^1].Left==end.Left && x.Keys[^1].Right==end.Right,"Selected continuous tangent group never rewrites outside handles");

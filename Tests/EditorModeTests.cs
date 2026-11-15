@@ -20,8 +20,14 @@ public static class EditorModeTests
         x.Keys[0].Mode=HandleMode.Free; x.Keys[0].Right=new Vector2(100,0);
         x.Keys[1].Mode=HandleMode.Free; x.Keys[1].Left=new Vector2(-600,-1);
         shot.Space.Touch();
-        double parameter=SpatialFrameMap.Parameter(shot,SpatialChannel.PositionX,15);
-        check(Math.Abs(shot.Sample(15).Pos.X-x.Evaluate(parameter))<1e-6,"Advanced curve speed is not arc-length normalized");
+        // Blender Follow Path: advanced position timing is the path progress, a length factor, so a
+        // linear progress segment moves at constant physical speed whatever the curve's handles are.
+        foreach(var k in shot.PathProgress.Keys) k.Interpolation=CurveInterpolation.Linear;
+        // arc length travelled per frame (sub-stepped, so chord error at the sharp X bend does not count)
+        var speeds=Enumerable.Range(1,59).Select(f=>Enumerable.Range(0,16).Sum(s=>Vector3.Distance(shot.Sample(f-1+s/16f).Pos,shot.Sample(f-1+(s+1)/16f).Pos))).ToArray();
+        check(speeds.Max()-speeds.Min()<speeds.Average()*.01,$"Advanced position follows path progress by arc length (speed spread {(speeds.Max()-speeds.Min())/speeds.Average():P2})");
+        check(Vector3.Distance(shot.Sample(60).Pos,timeline.Keys[1].Pos)<1e-4,"Advanced path progress reaches each node at its frame");
+        foreach(var k in shot.PathProgress.Keys) k.Interpolation=CurveInterpolation.Bezier;
         var frozen=shot.Clone(); var key=x.Keys[1]; int start=timeline.Keys[1].Frame;
         int target=start+7;
         for(int n=0;n<5;n++)

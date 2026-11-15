@@ -54,7 +54,12 @@ public static class PathInfluenceTests
         var b = one.ActiveTrack.Shots[0].Space.Channels[SpatialChannel.PositionX].Keys;
         check(a.Count == b.Count && a.Zip(b).All(p => Vector2.Distance(p.First.Left, p.Second.Left) < 1e-4f && Vector2.Distance(p.First.Right, p.Second.Right) < 1e-4f),
             "Default path: nodes captured one at a time get Bezier Auto tangents without editing");
-        check(b.Skip(1).Take(b.Count - 2).All(k => Math.Abs(k.Right.Y) > 1e-6f || Math.Abs(k.Left.Y) > 1e-6f) && b.All(k => k.Right.X > 0),
+        // (these test poses fold straight back along one line, where Blender's Auto direction is undefined;
+        // the bend case below checks that interior captured nodes get real handles)
+        var bend = new CamTimeline { Length = 300 };
+        foreach(var (f, x) in Poses) { bend.Keys.Add(new Keyframe { Frame = f, Pos = new(f / 10f, x, x * x * .1f), Rot = Quaternion.Identity, Fov = .8f }); CurveModel.Ensure(bend.ActiveTrack, 30); }
+        var c = bend.ActiveTrack.Shots[0].Space.Channels[SpatialChannel.PositionX].Keys;
+        check(c.Skip(1).Take(c.Count - 2).All(k => Math.Abs(k.Right.Y) > 1e-6f || Math.Abs(k.Left.Y) > 1e-6f) && c.All(k => k.Right.X > 0),
             "Default path: interior captured nodes are not left with flat/zero handles");
     }
 

@@ -1,6 +1,7 @@
 using Dalamud.Plugin.Services;
 using System;
 using System.IO;
+using System.Numerics;
 using XcpCam.Core;
 
 namespace XcpCam.BrioInterop;
@@ -43,9 +44,13 @@ public sealed class TimelineSync
     private (bool playing, double frame, int fps) Read() =>
         Clock?.Invoke() ?? (_brio.TimelineIsPlaying, _brio.TimelineTime, _brio.TimelineFps);
 
+    /// <summary>Current GPose target (world position / rotation); .xcp frames are written relative to it.</summary>
+    public Func<(Vector3 pos, Quaternion rot)?>? Base;
+
     public void Bind(ShotComposer comp)
     {
-        var frames = comp.BakeXcp(PathBuilder.Fps);
+        var target = Base?.Invoke() ?? throw new InvalidOperationException("联动 XAT 需要 GPose 目标：.xcp 是相对目标的格式。");
+        var frames = XcpMath.ToRelative(comp.BakeXcp(PathBuilder.Fps), target.pos, target.rot);
         XcpWriter.Write(TempFile, frames);
         _brio.LoadCutsceneFile(TempFile);
         _brio.SetCutsceneLoop(false);

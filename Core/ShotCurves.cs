@@ -21,6 +21,8 @@ public sealed class MotionInterval
     public void MarkManual() { AutoTiming = false; AutoSnapshot = null; }
     public Dictionary<CameraChannel, FCurve> Channels = new();
     internal PosePath? Path;
+    /// <summary>Leg length along a Follow Path target curve (overrides the node path distance for timing).</summary>
+    internal double? FollowDistance;
     internal Dictionary<CameraChannel, (double start, double end)> Ranges = new();
     private readonly Dictionary<FCurve, (FCurve original, FCurve effective, int start, int end)> evaluationCache = new();
     // Holds can place a subdivision at fractional authored time. Keep the immutable timing
@@ -206,6 +208,20 @@ public sealed class ShotCurves
     private List<Keyframe> nodes = [];
     private Dictionary<Guid, XcpFrame> poses = new();
     public SpatialCurves Space = new();
+    /// <summary>
+    /// Advanced-mode position timing: frame → length factor (0..1) along this shot's path, keyed at every node
+    /// (Blender Follow Path "fixed position" offset factor animated per node). For the node path the key
+    /// values are the nodes' own positions on the path, so only the timing between nodes is edited.
+    /// </summary>
+    public FCurve PathProgress = new();
+    /// <summary>Location offset X/Y/Z on top of the path point, world axes (Blender: the object's own location under Follow Path).</summary>
+    public FCurve[] Offset = [new(), new(), new()];
+    /// <summary>Follow Path target, set by <see cref="CurveModel.Ensure"/> from the track constraint.</summary>
+    internal FollowBinding? Follow;
+    /// <summary>Curve the path-progress values were initialised for; a new target re-projects the nodes.</summary>
+    private Guid followCurve;
+    public bool IsFollowing => Follow != null;
+    internal void ClearFollow() { Follow = null; followCurve = Guid.Empty; }
     public CurveEditorMode EditorMode { get; private set; }
     private bool simpleVisited;
     private bool neutralSimple;
@@ -261,7 +277,148 @@ public sealed class ShotCurves
         Intervals = Intervals.Select(i => i.Clone()).ToList(), SeededNodes = new(SeededNodes),
         CutRestore = new(CutRestore), CutObserved = new(CutObserved),
         HoldRegions = [.. HoldRegions], nodes = nodes.Select(n => n.Clone()).ToList(), poses = new(poses), Space = Space.Clone(),
+        PathProgress = PathProgress.Clone(), Offset = Offset.Select(c => c.Clone()).ToArray(),
+        Follow = Follow, followCurve = followCurve, ManualFactors = [.. ManualFactors],
     };
+
+    private CurveKey? ProgressKey(Guid node) => PathProgress.Keys.FirstOrDefault(k => k.NodeId == node);
+
+    /// <summary>Length factor along the Follow Path target at a frame.</summary>
+    private double FollowFactor(MotionInterval interval, double frame)
+    {
+        double a = ProgressKey(interval.StartNodeId)?.Value ?? 0, b = ProgressKey(interval.EndNodeId)?.Value ?? a;
+        if(EditorMode == CurveEditorMode.Advanced || neutralSimple) return PathProgress.Evaluate(TimingFrame(interval, frame));
+        return a + (b - a) * interval.Evaluate(CameraChannel.Position, frame);
+    }
+
+    private XcpFrame FollowPose(double factor, Vector3 offset, XcpFrame own) =>
+        Follow!.Constraint.Apply(Follow.Path.Sample(factor), offset, own.Rot, own.Fov);
+
+    /// <summary>Time inside an interval with its node hold removed (the hold freezes every channel).</summary>
+    private static double TimingFrame(MotionInterval interval, double frame)
+    {
+        double release = Math.Min(interval.End, (double)interval.Start + Math.Max(0, interval.HoldFrames));
+        if(frame <= release) return interval.Start;
+        if(frame >= interval.End) return interval.End;
+        return interval.Start + (frame - release) * ((double)interval.End - interval.Start) / (interval.End - release);
+    }
+
+    public Vector3 OffsetAt(double frame) => Offset[0].Keys.Count == 0 ? Vector3.Zero :
+        new Vector3((float)Offset[0].Evaluate(frame), (float)Offset[1].Evaluate(frame), (float)Offset[2].Evaluate(frame));
+
+    private Vector3 OffsetAt(MotionInterval? interval, double frame) => OffsetAt(interval == null ? frame : TimingFrame(interval, frame));
+
+    /// <summary>
+    /// Advanced position parameter: the path progress (a length factor) is mapped by arc length inside the
+    /// current node-to-node leg, so cuts (zero-length constant legs) and holds stay exact. Progress that
+    /// overshoots the leg falls back to the whole-path arc-length mapping.
+    /// </summary>
+    private double AdvancedPosition(MotionInterval interval, double frame)
+    {
+        var a = PathProgress.Keys.FirstOrDefault(k => k.NodeId == interval.StartNodeId);
+        var b = PathProgress.Keys.FirstOrDefault(k => k.NodeId == interval.EndNodeId);
+        if(a == null || b == null || interval.Path == null) return DirectParameter(CameraChannel.Position, frame, interval);
+        double u = PathProgress.Evaluate(TimingFrame(interval, frame));
+        double lo = Math.Min(a.Value, b.Value), hi = Math.Max(a.Value, b.Value);
+        if(hi - lo <= 1e-12) return DirectParameter(CameraChannel.Position, frame, interval);
+        var range = interval.Ranges[CameraChannel.Position];
+        if(u >= lo - 1e-12 && u <= hi + 1e-12)
+            return interval.Path.Parameter(CameraChannel.Position, range.start, range.end, (u - a.Value) / (b.Value - a.Value));
+        return interval.Path.Parameter(CameraChannel.Position, Space.Start, Space.End, Math.Clamp(u, 0, 1));
+    }
+
+    /// <summary>
+    /// Keeps one path-progress key and one offset key per node at the node frame. Progress values follow the
+    /// nodes' positions on the path (length factors); new offset keys take the current offset curve value, so
+    /// inserting a node does not change the motion. Automatic handles refit like Blender F-curves
+    /// (Auto Clamped, flat at the first and last key).
+    /// </summary>
+    /// <summary>
+    /// Follow Path factors: the first node is 0 %, the last 100 %; nodes set by hand (dragged along the curve,
+    /// typed in) keep their value, the others are spread by frame between their neighbouring fixed nodes.
+    /// Speed between nodes is then shaped by the timing curves (simple editor) as usual.
+    /// </summary>
+    private double[] AutoFactors()
+    {
+        int n = nodes.Count;
+        var result = new double[n];
+        if(n == 0) return result;
+        var fixedAt = new SortedDictionary<int, double>();
+        for(int i = 0; i < n; i++)
+            if(ManualFactors.Contains(nodes[i].Id) && ProgressKey(nodes[i].Id) is { } key) fixedAt[i] = key.Value;
+        if(!fixedAt.ContainsKey(0)) fixedAt[0] = 0;
+        if(n > 1 && !fixedAt.ContainsKey(n - 1)) fixedAt[n - 1] = 1;
+        var anchors = fixedAt.ToList();
+        for(int a = 0; a < anchors.Count; a++)
+        {
+            result[anchors[a].Key] = anchors[a].Value;
+            if(a + 1 >= anchors.Count) break;
+            var (i0, v0) = anchors[a]; var (i1, v1) = anchors[a + 1];
+            double f0 = nodes[i0].Frame, f1 = nodes[i1].Frame;
+            for(int i = i0 + 1; i < i1; i++)
+                result[i] = f1 > f0 ? v0 + (v1 - v0) * (nodes[i].Frame - f0) / (f1 - f0) : v0;
+        }
+        return result;
+    }
+
+    /// <summary>Following nodes whose factor was set by hand (kept instead of the automatic time distribution).</summary>
+    internal HashSet<Guid> ManualFactors = [];
+
+    /// <summary>Sets a following node's position on the curve (0..1, cyclic curves wrap) and keeps it.</summary>
+    public bool SetNodeFactor(Keyframe node, double factor)
+    {
+        if(Follow == null || ProgressKey(node.Id) is not { } key || !double.IsFinite(factor)) return false;
+        key.Value = Follow.Path.Cyclic ? factor : Math.Clamp(factor, 0, 1);
+        ManualFactors.Add(node.Id);
+        Space.Touch();
+        return true;
+    }
+
+    /// <summary>Marks a factor edited elsewhere (advanced editor) as hand-set.</summary>
+    public void MarkFactorManual(Guid node) { if(Follow != null) ManualFactors.Add(node); }
+
+    /// <summary>Returns every following node to the automatic 0–100 % time distribution.</summary>
+    public void ResetFactors() { ManualFactors.Clear(); Space.Touch(); }
+
+    private void SyncPositionTiming()
+    {
+        var path = spatialPath;
+        double start = path?.Distance(Space.Start) ?? 0, total = (path?.Distance(Space.End) ?? 0) - start;
+        // A new Follow Path target resets every factor to the automatic time distribution.
+        if(Follow != null && followCurve != Follow.CurveId) ManualFactors.Clear();
+        var factors = Follow != null ? AutoFactors() : null;
+        foreach(var (curve, progress) in Offset.Select(c => (c, false)).Prepend((PathProgress, true)))
+        {
+            var old = curve.Clone();
+            var keys = new List<CurveKey>();
+            for(int i = 0; i < nodes.Count; i++)
+            {
+                var node = nodes[i];
+                var key = curve.Keys.FirstOrDefault(k => k.NodeId == node.Id);
+                key ??= new CurveKey { NodeId = node.Id, Mode = HandleMode.AutoClamped, Value = old.Keys.Count > 0 ? old.Evaluate(node.Frame) : 0 };
+                key.Frame = node.Frame;
+                if(progress && factors != null)
+                {
+                    // following a curve: the player camera position is ignored; the node is a factor on the curve
+                    if(!ManualFactors.Contains(node.Id)) key.Value = factors[i];
+                }
+                else if(progress)
+                    key.Value = path != null && total > 1e-12 && Space.Anchors.TryGetValue(node.Id, out var anchor)
+                        ? Math.Clamp((path.Distance(anchor[CameraChannel.Position]) - start) / total, 0, 1)
+                        : nodes.Count > 1 ? i / (double)(nodes.Count - 1) : 0;
+                keys.Add(key);
+            }
+            curve.Keys = keys;
+            if(keys.Count == 0) continue;
+            curve.RecalculateHandles();
+            foreach(var end in new[] { keys[0], keys[^1] })
+                if(end.Mode == HandleMode.AutoClamped && keys.Count > 1) { end.Left = new Vector2(end.Left.X, 0); end.Right = new Vector2(end.Right.X, 0); }
+        }
+        followCurve = Follow?.CurveId ?? Guid.Empty;
+        foreach(var interval in Intervals)
+            interval.FollowDistance = Follow == null ? null :
+                Math.Abs((ProgressKey(interval.EndNodeId)?.Value ?? 0) - (ProgressKey(interval.StartNodeId)?.Value ?? 0)) * Follow.Path.Length;
+    }
 
     private MotionInterval? At(double frame) => Intervals.FirstOrDefault(i => frame < i.End) ?? Intervals.LastOrDefault();
     public double Evaluate(CameraChannel channel, double frame) => At(frame)?.Evaluate(channel, frame) ?? 0;
@@ -275,14 +432,17 @@ public sealed class ShotCurves
             var n = nodes.FirstOrDefault();
             return n == null ? new XcpFrame(Vector3.Zero, Quaternion.Identity, MathF.PI / 4) : NodePose(n);
         }
+        XcpFrame pose;
         if(EditorMode == CurveEditorMode.Advanced || neutralSimple)
-            return Space.Sample(DirectParameter(CameraChannel.Position, frame, interval), DirectParameter(CameraChannel.Rotation, frame, interval), DirectParameter(CameraChannel.Fov, frame, interval));
-        if(parameterSimple)
+            pose = Space.Sample(AdvancedPosition(interval, frame), DirectParameter(CameraChannel.Rotation, frame, interval), DirectParameter(CameraChannel.Fov, frame, interval));
+        else if(parameterSimple)
         {
             double P(CameraChannel c) { var r = interval.Ranges[c]; return r.start + (r.end - r.start) * interval.Evaluate(c, frame); }
-            return Space.Sample(P(CameraChannel.Position), P(CameraChannel.Rotation), P(CameraChannel.Fov));
+            pose = Space.Sample(P(CameraChannel.Position), P(CameraChannel.Rotation), P(CameraChannel.Fov));
         }
-        return interval.Geometry(interval.Evaluate(CameraChannel.Position, frame), interval.Evaluate(CameraChannel.Rotation, frame), interval.Evaluate(CameraChannel.Fov, frame));
+        else pose = interval.Geometry(interval.Evaluate(CameraChannel.Position, frame), interval.Evaluate(CameraChannel.Rotation, frame), interval.Evaluate(CameraChannel.Fov, frame));
+        if(Follow != null) return FollowPose(FollowFactor(interval, frame), OffsetAt(interval, frame), pose);
+        return pose with { Pos = pose.Pos + OffsetAt(interval, frame) };
     }
 
     public XcpFrame SampleGeometry(int intervalIndex, double progress)
@@ -297,7 +457,8 @@ public sealed class ShotCurves
         var interval = At(frame);
         if(interval != null)
         {
-            if(EditorMode == CurveEditorMode.Advanced || neutralSimple) return DirectParameter(channel, frame, interval);
+            if(EditorMode == CurveEditorMode.Advanced || neutralSimple)
+                return channel == CameraChannel.Position ? AdvancedPosition(interval, frame) : DirectParameter(channel, frame, interval);
             if(parameterSimple) { var r = interval.Ranges[channel]; return r.start + (r.end - r.start) * interval.Evaluate(channel, frame); }
             return interval.Parameter(channel, interval.Evaluate(channel, frame));
         }
@@ -308,7 +469,92 @@ public sealed class ShotCurves
     public XcpFrame NodePose(Keyframe node)
     {
         if(!Space.Anchors.TryGetValue(node.Id, out var anchor)) return new XcpFrame(node.Pos, node.Rot, node.Fov);
-        return Space.Sample(anchor[CameraChannel.Position], anchor[CameraChannel.Rotation], anchor[CameraChannel.Fov]);
+        var pose = Space.Sample(anchor[CameraChannel.Position], anchor[CameraChannel.Rotation], anchor[CameraChannel.Fov]);
+        if(Follow != null && ProgressKey(node.Id) is { } key) return FollowPose(key.Value, OffsetAt(node.Frame), pose);
+        return pose with { Pos = pose.Pos + OffsetAt(node.Frame) };
+    }
+
+    /// <summary>The node's point on the path (node path or Follow Path target), without the location offset.</summary>
+    public Vector3 NodePathPoint(Keyframe node)
+    {
+        if(Follow != null && ProgressKey(node.Id) is { } key) return Follow.Path.Position(key.Value);
+        return NodePose(node).Pos - OffsetAt(node.Frame);
+    }
+
+    /// <summary>Length factor of a node along the Follow Path target (null when not following).</summary>
+    public double? NodeFactor(Keyframe node) => Follow != null ? ProgressKey(node.Id)?.Value : null;
+
+    // ---------------- node path as a 3D Bezier curve (handles edited in the game view) ----------------
+
+    private (CurveKey x, CurveKey y, CurveKey z)? PositionKeys(Keyframe node)
+    {
+        var x = Space.Channels[SpatialChannel.PositionX].Keys.FirstOrDefault(k => k.NodeId == node.Id);
+        var y = Space.Channels[SpatialChannel.PositionY].Keys.FirstOrDefault(k => k.NodeId == node.Id);
+        var z = Space.Channels[SpatialChannel.PositionZ].Keys.FirstOrDefault(k => k.NodeId == node.Id);
+        return x != null && y != null && z != null ? (x, y, z) : null;
+    }
+
+    public static CurveHandle HandleType(HandleMode mode) => mode switch
+    {
+        HandleMode.Vector => CurveHandle.Vector, HandleMode.Aligned => CurveHandle.Aligned, HandleMode.Free => CurveHandle.Free, _ => CurveHandle.Auto,
+    };
+    private static HandleMode Mode(CurveHandle type) => type switch
+    {
+        CurveHandle.Vector => HandleMode.Vector, CurveHandle.Aligned => HandleMode.Aligned, CurveHandle.Free => HandleMode.Free, _ => HandleMode.Auto,
+    };
+
+    /// <summary>The node's path handles as offsets from its path point, and their type (null when not on the node path).</summary>
+    public (Vector3 left, Vector3 right, CurveHandle type)? PathHandles(Keyframe node)
+    {
+        if(Follow != null || PositionKeys(node) is not { } k) return null;
+        return (new Vector3(k.x.Left.Y, k.y.Left.Y, k.z.Left.Y), new Vector3(k.x.Right.Y, k.y.Right.Y, k.z.Right.Y), HandleType(k.x.Mode));
+    }
+
+    /// <summary>
+    /// Drags one handle of the node path (Blender handle rules): an Auto handle turns the pair Aligned, a Vector
+    /// handle becomes Free; an Aligned partner keeps its length and points the opposite way. Handles stay
+    /// at a third of the parameter span horizontally, so the path remains an exact 3D Bezier curve.
+    /// </summary>
+    public bool SetPathHandle(Keyframe node, bool left, Vector3 offset)
+    {
+        if(Follow != null || PositionKeys(node) is not { } k || !XcpMath.IsFinite(offset)) return false;
+        var type = HandleType(k.x.Mode);
+        if(type == CurveHandle.Auto) type = CurveHandle.Aligned;
+        else if(type == CurveHandle.Vector) type = CurveHandle.Free;
+        var l = new Vector3(k.x.Left.Y, k.y.Left.Y, k.z.Left.Y); var r = new Vector3(k.x.Right.Y, k.y.Right.Y, k.z.Right.Y);
+        if(left) l = offset; else r = offset;
+        if(type == CurveHandle.Aligned)
+        {
+            var moved = left ? l : r; float other = (left ? r : l).Length();
+            if(moved.LengthSquared() > 1e-12f) { var opposite = -Vector3.Normalize(moved) * other; if(left) r = opposite; else l = opposite; }
+        }
+        foreach(var (key, lv, rv) in new[] { (k.x, l.X, r.X), (k.y, l.Y, r.Y), (k.z, l.Z, r.Z) })
+        {
+            key.Mode = Mode(type); key.AutomaticTangent = false;
+            key.Left = new Vector2(key.Left.X, lv); key.Right = new Vector2(key.Right.X, rv);
+        }
+        Space.Touch();
+        return true;
+    }
+
+    /// <summary>Sets the node path handle type (Blender V menu). Automatic types refit on the next sync.</summary>
+    public bool SetPathHandleType(Keyframe node, CurveHandle type)
+    {
+        if(Follow != null || PositionKeys(node) is not { } k) return false;
+        foreach(var key in new[] { k.x, k.y, k.z }) { key.Mode = Mode(type); key.AutomaticTangent = type is CurveHandle.Auto or CurveHandle.Vector; }
+        if(type == CurveHandle.Aligned)
+        {
+            // Blender: with nothing grabbed the left handle follows the right one
+            var r = new Vector3(k.x.Right.Y, k.y.Right.Y, k.z.Right.Y); var l = new Vector3(k.x.Left.Y, k.y.Left.Y, k.z.Left.Y);
+            if(r.LengthSquared() > 1e-12f)
+            {
+                l = -Vector3.Normalize(r) * l.Length();
+                k.x.Left = new Vector2(k.x.Left.X, l.X); k.y.Left = new Vector2(k.y.Left.X, l.Y); k.z.Left = new Vector2(k.z.Left.X, l.Z);
+            }
+        }
+        Space.MarkTangentsDirty(node.Id, 0);
+        Space.Touch();
+        return true;
     }
 
     public Vector3 NodeEuler(Keyframe node)
@@ -335,8 +581,27 @@ public sealed class ShotCurves
 
     public void WritePose(Keyframe node, XcpFrame pose, bool position = true, bool rotation = true, bool fov = true, int influence = 0)
     {
-        Space.WritePose(node, pose, position, rotation, fov, null, influence);
-        if(position) node.Pos = pose.Pos;
+        if(Follow != null && ProgressKey(node.Id) is { } key)
+        {
+            // Following a curve: the node slides along it (nearest point to the requested position);
+            // rotation is stored in the path frame so the final camera rotation is what was asked for.
+            var point = Follow.Path.Sample(key.Value);
+            var q = Follow.Constraint.Orientation(point);
+            if(position)
+            {
+                var offset = OffsetAt(node.Frame);
+                if(Follow.Constraint.UseRadius) offset *= point.Radius;
+                key.Value = Follow.Path.Project(pose.Pos - Vector3.Transform(offset, q));
+                ManualFactors.Add(node.Id); // dragged along the curve by hand
+                q = Follow.Constraint.Orientation(Follow.Path.Sample(key.Value));
+            }
+            var own = pose with { Rot = Quaternion.Normalize(Quaternion.Inverse(q) * pose.Rot) };
+            if(rotation || fov) Space.WritePose(node, own, false, rotation, fov, null, influence);
+            else Space.Touch();
+        }
+        // the path point is the node position minus its location offset
+        else Space.WritePose(node, pose with { Pos = pose.Pos - OffsetAt(node.Frame) }, position, rotation, fov, null, influence);
+        if(position) node.Pos = Follow != null ? NodePose(node).Pos : pose.Pos;
         if(rotation) node.Rot = pose.Rot;
         if(fov) node.Fov = pose.Fov;
     }
@@ -362,7 +627,8 @@ public sealed class ShotCurves
             }
             else if(after != null) parameter = checked(Space.Start - 1000);
             else parameter = Space.Anchors.Count == 0 ? 0 : checked(Space.End + 1000);
-            Space.Seed(node, parameter); added = true; seeded.Add(node.Id);
+            var seed = node.Clone(); seed.Pos -= OffsetAt(node.Frame); // the path point excludes the location offset
+            Space.Seed(seed, parameter); added = true; seeded.Add(node.Id);
         }
         // A new node changes its neighbours' Auto tangents too (an end node becomes interior, a lone
         // node gains a neighbour), so the default path is a true Bezier Auto fit without editing first.
@@ -374,6 +640,7 @@ public sealed class ShotCurves
         }
         SeededNodes = current.Select(n => n.Id).ToHashSet();
         EnsureGeometry();
+        SyncPositionTiming();
     }
 
     private void EnsureGeometry()
@@ -400,6 +667,9 @@ public sealed class ShotCurves
         if(source == null) return;
         EnsureGeometry();
         var sampled = source.Geometry(source.Evaluate(CameraChannel.Position, node.Frame), source.Evaluate(CameraChannel.Rotation, node.Frame), source.Evaluate(CameraChannel.Fov, node.Frame));
+        // following a curve: the new node keeps the current factor along it, so the motion is unchanged
+        double? followFactor = Follow != null ? FollowFactor(source, node.Frame) : null;
+        var followed = followFactor is double ff ? FollowPose(ff, OffsetAt(source, node.Frame), Sample(node.Frame) with { Rot = sampled.Rot }) : (XcpFrame?)null;
         var left = source.Clone(); var right = source.Clone();
         left.MarkManual(); right.MarkManual();
         right.Id = Guid.NewGuid(); left.EndNodeId = node.Id; right.StartNodeId = node.Id;
@@ -435,7 +705,14 @@ public sealed class ShotCurves
         right.splitCurves = right.Channels.ToDictionary(p => p.Key, p => p.Value.Clone());
         if(source.HoldFrames == 0 && source.splitTiming == null) { left.splitTiming = null; right.splitTiming = null; }
         Space.AddAnchor(node.Id, left.Ranges[CameraChannel.Position].end, left.Ranges[CameraChannel.Rotation].end, left.Ranges[CameraChannel.Fov].end);
-        node.Pos = sampled.Pos; node.Rot = sampled.Rot; node.Fov = sampled.Fov;
+        node.Pos = sampled.Pos + OffsetAt(node.Frame); node.Rot = sampled.Rot; node.Fov = sampled.Fov;
+        if(followFactor is double factor && followed is XcpFrame f)
+        {
+            node.Pos = f.Pos; node.Rot = f.Rot;
+            PathProgress.Keys.Add(new CurveKey { NodeId = node.Id, Frame = node.Frame, Value = factor, Mode = HandleMode.AutoClamped });
+            PathProgress.Sort();
+            ManualFactors.Add(node.Id); // keep the sampled position so inserting does not change the motion
+        }
         // Holds are node-authoritative. Commit their subdivision together with timing so
         // the next Ensure cannot replace the remaining hold with the new node's default zero.
         node.HoldFrames = right.HoldFrames;
@@ -471,6 +748,8 @@ public sealed class ShotCurves
             if(i.AutoTiming && i.AutoSnapshot != null) i.AutoSnapshot = i.Channels.ToDictionary(p => p.Key, p => p.Value.Clone());
         }
         Start = start; End = end; HoldRegions = holds;
+        PathProgress.Rescale(factor);
+        foreach(var curve in Offset) curve.Rescale(factor);
     }
 
     public static Vector3 Euler(Quaternion q, Vector3? near = null)
@@ -552,6 +831,10 @@ public static class CurveModel
                 intervals.Add(interval);
             }
             shot.Intervals = intervals; shot.AnchorNodeId = nodes[0].Id; shot.Start = nodes[0].Frame;
+            // Follow Path: bind to the evaluated target curve (rebuilt every time, so curve edits apply)
+            if(track.FollowPath is { Enabled: true } constraint && track.FollowCurve is { } target && CurvePath.Create(target) is { } targetPath)
+                shot.Follow = new FollowBinding(targetPath, constraint, target.Id);
+            else if(shot.Follow != null) shot.ClearFollow();
             int next = g + 1 < groups.Count ? groups[g + 1][0].Frame : int.MaxValue;
             long end = Math.Min((long)next - 1, (long)nodes[^1].Frame + Math.Max(0, nodes[^1].HoldFrames));
             shot.End = (int)Math.Clamp(end, shot.Start, int.MaxValue);
