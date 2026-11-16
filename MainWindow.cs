@@ -20,6 +20,8 @@ public sealed class MainWindow : Window, IDisposable
     private readonly Overlay _overlay;
     private readonly GizmoEditor _gizmo = new();
     private readonly CurveTool _curveTool;
+    private readonly BoneSource _bones;
+    private readonly ConstraintPanel _constraints;
     private readonly TimelineWidget _tlw = new();
     private readonly GraphEditor _graph = new();
     private int _graphShot;
@@ -75,10 +77,11 @@ public sealed class MainWindow : Window, IDisposable
     public void OpenSettings() { IsOpen = true; _selectSettings = true; }
 
     public MainWindow(ITargetManager targets, IClientState clientState, IPluginLog log, BrioBridge brio, Overlay overlay,
-        Configuration config, Action saveConfig)
+        BoneSource bones, Configuration config, Action saveConfig)
         : base("XcpCam - 相机时间轴###xcpcam_main")
     {
         _targets = targets;
+        _bones = bones;
         _clientState = clientState;
         _log = log;
         _brio = brio;
@@ -99,6 +102,7 @@ public sealed class MainWindow : Window, IDisposable
         overlay.ShowLabels = config.ShowLabels; overlay.SpeedColors = config.SpeedColors; overlay.FrustumSize = config.FrustumSize;
         _tlw.BeforeTrackEdit = _tl.Snapshot;
         _curveTool = new CurveTool(_tl, overlay, _gizmo, ShotFor, n => WriteNodePose(n, true, false, false), SetStatus);
+        _constraints = new ConstraintPanel(_tl, bones, SetStatus, StartRecording, () => _recording != null, StopRecording);
         Size = new Vector2(900, 600);
         SizeCondition = ImGuiCond.FirstUseEver;
     }
@@ -285,6 +289,7 @@ public sealed class MainWindow : Window, IDisposable
     public void FrameworkTick(float dt)
     {
         bool gpose = _clientState.IsGPosing;
+        _bones.NewTick();
         // the movement limit is measured from the current GPose target (no target: no limit)
         NodeRange.Center = gpose && CameraCapture.TryGetBase(_targets, out var targetPos, out _, out _, out _) ? targetPos : null;
         if(!gpose)
@@ -299,6 +304,7 @@ public sealed class MainWindow : Window, IDisposable
                 if(_sync.Bound) _sync.Unbind();
             }
             _wasGpose = false;
+            if(_recording != null) { _recording = null; SetStatus("已离开 GPose，录制目标轨迹已中止。", true); }
             return;
         }
         _wasGpose = true;
@@ -359,6 +365,7 @@ public sealed class MainWindow : Window, IDisposable
             _tl.Playhead = (float)Math.Clamp(SourceFrame, 0, _tl.Length);
         }
 
+        TickRecording();
         if(_lookThrough && _comp != null) LookThroughPlayhead();
 
         try { _sync.Tick(_comp?.DurationSec ?? 0); }
@@ -370,7 +377,8 @@ public sealed class MainWindow : Window, IDisposable
         if(!_brio.IsConnected || _comp == null) return;
         // Paused and not scrubbing: leave the free camera to the user (look around, change FoV).
         // Playing, moving the playhead or turning preview on re-syncs it to the path.
-        if(!_playing && _lookSynced is float last && last == _tl.Playhead) return;
+        // Tracking constraints own the rotation, so they keep following the (moving) target every frame.
+        if(!_playing && !_comp.Tracking && _lookSynced is float last && last == _tl.Playhead) return;
         _lookSynced = _tl.Playhead;
         // node poses are world coordinates
         var s = _comp.Sample(_tl.Playhead);
@@ -555,7 +563,12 @@ public sealed class MainWindow : Window, IDisposable
             RefreshNodePose(sel);
             var prePos = sel.Pos;
             var preRot = sel.Rot;
+            // a tracking constraint owns the rotation: the gizmo only moves the node
+            var userOp = _gizmo.Operation;
+            if(RotationLocked(sel) && userOp == GizmoEditor.Op.Rotate) _gizmo.Operation = GizmoEditor.Op.Translate;
             bool changed = _gizmo.Draw(sel, Vector3.Zero, Quaternion.Identity); // world-space nodes
+            bool translated = _gizmo.Operation == GizmoEditor.Op.Translate, rotated = _gizmo.Operation == GizmoEditor.Op.Rotate;
+            _gizmo.Operation = userOp;
             if(_gizmo.DragStarted)
             {
                 // snapshot the pose from before this drag, then re-apply the first frame of the drag
@@ -564,8 +577,7 @@ public sealed class MainWindow : Window, IDisposable
                 _tl.Snapshot();
                 sel.Pos = newPos; sel.Rot = newRot;
             }
-            if(changed) WriteNodePose(sel, _gizmo.Operation == GizmoEditor.Op.Translate,
-                _gizmo.Operation == GizmoEditor.Op.Rotate, false);
+            if(changed) WriteNodePose(sel, translated, rotated, false);
             if(_gizmo.IsUsing && _gizmo.Limited)
                 SetStatus($"变换手柄已限制：节点需保持在目标周围 {GizmoEditor.MaxRange:0} 米内，单帧跳动过大的拖动会被忽略。", true);
         }
@@ -622,6 +634,79 @@ public sealed class MainWindow : Window, IDisposable
         return h.ToHashCode();
     }
 
+    /// <summary>
+    /// Composer for offline output (.xcp, XAT, bake): tracking constraints use their recorded target
+    /// trajectories; constraints without a usable recording fall back to the target's current position.
+    /// </summary>
+    private ShotComposer? ExportComposer(out string warning)
+    {
+        warning = "";
+        if(_comp == null || !_comp.Tracking) return _comp;
+        int stale = _tl.Tracks.Where(t => t.Keys.Count > 0)
+            .Sum(t => t.TrackConstraints.Count(c => c.Enabled && c.RecordingStale(t.Keys.Min(k => k.Frame), CamTimeline.TrackLastFrame(t))));
+        if(stale > 0) warning = $"{stale} 个追踪约束没有录制目标轨迹或录制已过期，这部分按目标当前位置计算（可在「约束」页录制）。";
+        return ShotComposer.Create(_tl, _settings, new RecordedTargetSource(_bones));
+    }
+
+    // ------------------------------------------------------------------ target trajectory recording
+
+    private sealed class Recording
+    {
+        public required System.Collections.Generic.List<TrackConstraint> Constraints;
+        public int Start, End, LastFrame = -1, Ticks;
+    }
+    private Recording? _recording;
+
+    /// <summary>Plays the bound source over the active track's frames and records every constraint's bone each tick.</summary>
+    private void StartRecording(System.Collections.Generic.IReadOnlyList<TrackConstraint> constraints)
+    {
+        var track = _tl.ActiveTrack;
+        if(_recording != null || constraints.Count == 0) return;
+        if(track.Keys.Count == 0) { SetStatus("当前轨道没有镜头节点，无法确定录制范围。", true); return; }
+        if(!SourceAvailable) { SetStatus($"录制需要可用的{SourceName}：请进入 GPose、连接 Brio 并选中目标（「设置」页选择绑定）。", true); return; }
+        int start = track.Keys.Min(k => k.Frame), end = CamTimeline.TrackLastFrame(track);
+        _tl.Snapshot();
+        foreach(var c in constraints) { c.Recorded.Clear(); c.RecordedFor = c.TargetKey; }
+        _recording = new Recording { Constraints = constraints.ToList(), Start = start, End = end };
+        try
+        {
+            _tl.Playhead = start;
+            SetSourcePlaying(true);
+            SetStatus($"正在录制目标轨迹：第 {start}–{end} 帧，请勿操作时间轴……", false);
+        }
+        catch(Exception ex)
+        {
+            _recording = null;
+            SetStatus($"无法开始录制：{ex.Message}", true);
+        }
+    }
+
+    private void TickRecording()
+    {
+        if(_recording is not { } r) return;
+        r.Ticks++;
+        int frame = (int)MathF.Round(_tl.Playhead);
+        // looped back to the start: the range is done
+        if(r.LastFrame >= 0 && frame < r.LastFrame - 1) { StopRecording(); return; }
+        if(frame >= r.Start && frame <= r.End)
+            foreach(var c in r.Constraints)
+                if(_bones.Position(c, frame) is { } p) c.Recorded[frame] = p;
+        r.LastFrame = Math.Max(r.LastFrame, frame);
+        if(frame >= r.End || !SourcePlaying && r.Ticks > 10) StopRecording();
+    }
+
+    private void StopRecording()
+    {
+        if(_recording is not { } r) return;
+        _recording = null;
+        if(SourcePlaying) Try(() => SetSourcePlaying(false));
+        int covered = r.Constraints.Count == 0 ? 0 : r.Constraints.Min(c => c.Recorded.Count);
+        bool complete = r.Constraints.All(c => !c.RecordingStale(r.Start, r.End));
+        _tl.Touch();
+        SetStatus(complete ? $"已录制目标轨迹：{r.Constraints.Count} 个约束，每个 {covered} 帧（第 {r.Start}–{r.End} 帧）。导出、联动 XAT 与烘焙将使用录制结果。"
+            : $"录制未覆盖第 {r.Start}–{r.End} 帧（已记录 {covered} 帧），请检查绑定的时间轴能否播放到末尾，或角色 / 骨骼是否存在。", !complete);
+    }
+
     private void RebuildPathIfNeeded()
     {
         _tl.RefreshAutoCuts(); // node now 1 frame after its predecessor -> hard cut (unless switched off by hand)
@@ -633,8 +718,8 @@ public sealed class MainWindow : Window, IDisposable
         try
         {
             _tl.SyncSeconds();
-            _comp = ShotComposer.Create(_tl, _settings);
-            if(_sync.Bound && _comp != null) _sync.Refresh(_comp);
+            _comp = ShotComposer.Create(_tl, _settings, _bones);
+            if(_sync.Bound && ExportComposer(out _) is { } export) _sync.Refresh(export);
         }
         catch(Exception ex)
         {
@@ -673,6 +758,11 @@ public sealed class MainWindow : Window, IDisposable
             if(ImGui.BeginTabItem("曲线"))
             {
                 _curveTool.DrawPanel(gpose);
+                ImGui.EndTabItem();
+            }
+            if(ImGui.BeginTabItem("约束"))
+            {
+                _constraints.Draw(gpose);
                 ImGui.EndTabItem();
             }
             var settingsFlags = _selectSettings ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None;
@@ -870,7 +960,7 @@ public sealed class MainWindow : Window, IDisposable
         if(_tlw.PlayheadChanged) SeekPlayhead(_tl.Playhead);
         ImGui.TextWrapped("拖节点改帧 · 标尺拖播放头 · 空白左键/中键拖视图 · Ctrl+滚轮缩放帧轴 · Ctrl+Alt+滚轮缩放轨道行 · Alt+滚轮滚轨道 · Ctrl+左键空白框选 · 双击节点跳转 · ✂=恒定切镜");
         DrawGizmoBar();
-        _curveTool.DrawConstraint();
+        _constraints.DrawSummary(_tl.ActiveTrack);
 
         ImGui.Separator();
         ImGui.TextDisabled("「曲线编辑器」可选择高级/简单曲线；高级直接调数值、速度和帧，简单调节奏，另一层锁定并保留。");
@@ -992,9 +1082,15 @@ public sealed class MainWindow : Window, IDisposable
         }
 
         var nodeShot = ShotFor(k);
-        var euler = nodeShot?.NodeEuler(k) ?? QuatToEulerDeg(k.Rot);
+        bool rotationLocked = RotationLocked(k), fovLocked = FovLocked(k);
+        var driven = rotationLocked || fovLocked ? ConstrainedNodePose(k) : default;
+        var euler = rotationLocked ? QuatToEulerDeg(driven.Rot) : nodeShot?.NodeEuler(k) ?? QuatToEulerDeg(k.Rot);
         ImGui.SetNextItemWidth(260);
-        bool rotationChanged = ImGui.DragFloat3("旋转 偏航/俯仰/滚转 (°)", ref euler, 0.25f);
+        ImGui.BeginDisabled(rotationLocked);
+        bool rotationChanged = ImGui.DragFloat3("旋转 偏航/俯仰/滚转 (°)", ref euler, 0.25f) && !rotationLocked;
+        ImGui.EndDisabled();
+        if(ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled) && rotationLocked)
+            ImGui.SetTooltip("由追踪约束控制（显示的是约束后的旋转），不能手动修改。可在「约束」页停用或删除约束。");
         if(ImGui.IsItemActivated()) _tl.Snapshot();
         if(rotationChanged)
         {
@@ -1002,11 +1098,19 @@ public sealed class MainWindow : Window, IDisposable
             else { k.Rot = EulerDegToQuat(euler); WriteNodePose(k, false, true, false); }
         }
 
-        float fovDeg = k.Fov * 180f / MathF.PI;
+        float fovDeg = (fovLocked ? driven.Fov : k.Fov) * 180f / MathF.PI;
         ImGui.SetNextItemWidth(120);
-        bool fovChanged = ImGui.DragFloat("FoV (°)", ref fovDeg, 0.1f, 1f, 175f, "%.1f");
+        ImGui.BeginDisabled(fovLocked);
+        bool fovChanged = ImGui.DragFloat("FoV (°)", ref fovDeg, 0.1f, 1f, 175f, "%.1f") && !fovLocked;
+        ImGui.EndDisabled();
+        if(ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+        {
+            if(fovLocked) ImGui.SetTooltip("由追踪约束的「保持取景大小」控制，不能手动修改。\n取景大小由这条轨道第一个节点的 FoV 决定。");
+            else if(_tl.TrackOf(k)?.FovDriven == true) ImGui.SetTooltip("「保持取景大小」以这个首节点的 FoV 和到目标的距离为基准。");
+        }
         if(ImGui.IsItemActivated()) _tl.Snapshot();
         if(fovChanged) { k.Fov = fovDeg * MathF.PI / 180f; WriteNodePose(k, false, false, true); }
+        if(rotationLocked) ImGui.TextColored(new Vector4(0.6f, 0.9f, 1, 1), fovLocked ? "旋转与 FoV 由追踪约束控制" : "旋转由追踪约束控制");
 
         ImGui.SameLine();
         ImGui.BeginDisabled(!gpose);
@@ -1076,7 +1180,11 @@ public sealed class MainWindow : Window, IDisposable
         int op = (int)_gizmo.Operation;
         if(ImGui.RadioButton("移动", ref op, 0)) _gizmo.Operation = GizmoEditor.Op.Translate;
         ImGui.SameLine();
+        bool rotateLocked = !_curveTool.Active && Selected is { } locked && RotationLocked(locked);
+        ImGui.BeginDisabled(rotateLocked);
         if(ImGui.RadioButton("旋转", ref op, 1)) _gizmo.Operation = GizmoEditor.Op.Rotate;
+        ImGui.EndDisabled();
+        if(rotateLocked && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled)) ImGui.SetTooltip("所选节点的旋转由追踪约束控制。");
         if(_curveTool.Active)
         {
             ImGui.SameLine();
@@ -1233,7 +1341,11 @@ public sealed class MainWindow : Window, IDisposable
         if(!_sync.Bound)
         {
             if(ImGui.Button("绑定"))
-                Try(() => { _sync.Bind(_comp!); SetStatus($"已绑定到{SourceName}（XAT）", false); });
+                Try(() =>
+                {
+                    _sync.Bind(ExportComposer(out var warning)!);
+                    SetStatus($"已绑定到{SourceName}（XAT）" + (warning.Length > 0 ? "。" + warning : ""), warning.Length > 0);
+                });
         }
         else if(ImGui.Button("解绑"))
             Try(() =>
@@ -1287,8 +1399,8 @@ public sealed class MainWindow : Window, IDisposable
             Try(() =>
             {
                 // the free camera is world space, like the nodes: no target conversion
-                _bake.Bake(cams[_bakeCamIndex], _comp!, Vector3.Zero, Quaternion.Identity);
-                SetStatus(_bake.Status, false);
+                _bake.Bake(cams[_bakeCamIndex], ExportComposer(out var warning)!, Vector3.Zero, Quaternion.Identity);
+                SetStatus(_bake.Status + (warning.Length > 0 ? " " + warning : ""), warning.Length > 0);
             });
         ImGui.EndDisabled();
         ImGui.SameLine();
@@ -1457,13 +1569,31 @@ public sealed class MainWindow : Window, IDisposable
     /// <summary>
     /// Writes a captured camera into a node. On a track with a Follow Path constraint only rotation and FoV come
     /// from the camera: the position is the node's factor along the curve (first node 0 %, last 100 %, the rest
-    /// spread by frame), so the player camera position is ignored.
+    /// spread by frame), so the player camera position is ignored. Values driven by tracking constraints
+    /// (rotation, and FoV with Keep Framing) are not written either.
     /// </summary>
     private void ApplyCapture(Keyframe node)
     {
-        bool following = (_tl.TrackOf(node) ?? _tl.ActiveTrack).FollowPath != null;
-        WriteNodePose(node, !following, true, true);
-        if(following) RefreshNodePose(node);
+        var track = _tl.TrackOf(node) ?? _tl.ActiveTrack;
+        bool following = track.FollowPath != null;
+        bool rotation = !track.RotationDriven, fov = !FovLocked(node);
+        WriteNodePose(node, !following, rotation, fov);
+        if(following || !rotation || !fov) RefreshNodePose(node);
+    }
+
+    /// <summary>A tracking constraint drives this node's rotation.</summary>
+    private bool RotationLocked(Keyframe node) => _tl.TrackOf(node)?.RotationDriven == true;
+
+    /// <summary>Keep Framing drives the FoV; the track's first node stays editable (it sets the framing size).</summary>
+    private bool FovLocked(Keyframe node)
+        => _tl.TrackOf(node) is { FovDriven: true } track && track.Keys.Min(k => k.Frame) != node.Frame;
+
+    /// <summary>Node pose as output: with the tracking constraints of its track applied.</summary>
+    private XcpFrame ConstrainedNodePose(Keyframe node)
+    {
+        var pose = new XcpFrame(node.Pos, node.Rot, node.Fov);
+        var track = _tl.TrackOf(node);
+        return track != null && _comp?.SequenceOf(_tl.Tracks.IndexOf(track)) is { Tracking: true } seq ? seq.Constrain(pose, node.Frame) : pose;
     }
 
     private static void CopyPose(Keyframe from, Keyframe to)
@@ -1505,11 +1635,12 @@ public sealed class MainWindow : Window, IDisposable
             // .xcp is relative to the GPose target: convert the world-space path with the current target
             if(!CameraCapture.TryGetBase(_targets, out var bp, out var br, out _, out var err))
                 throw new InvalidOperationException($"导出 .xcp 需要 GPose 目标（{err}）");
-            var frames = XcpMath.ToRelative(_comp.BakeXcp(PathBuilder.Fps), bp, br);
+            var export = ExportComposer(out var warning)!;
+            var frames = XcpMath.ToRelative(export.BakeXcp(PathBuilder.Fps), bp, br);
             XcpWriter.Write(path, frames);
             _lastDir = Path.GetDirectoryName(path) ?? _lastDir;
             string cutNote = _comp.CutFrames.Count > 0 ? $"，{_comp.CutFrames.Count} 处切镜（.xcp 切镜处约有 1 帧过渡）" : "";
-            SetStatus($"已导出 {frames.Count} 帧 (30fps){cutNote} → {path}", false);
+            SetStatus($"已导出 {frames.Count} 帧 (30fps){cutNote} → {path}" + (warning.Length > 0 ? "。" + warning : ""), warning.Length > 0);
             _log.Info($"exported {frames.Count} frames to {path}");
         }
         catch(Exception ex)

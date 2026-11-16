@@ -17,6 +17,13 @@ public sealed class CamTrack
     public FollowPathConstraint? FollowPath;
     /// <summary>Target curve resolved from <see cref="CamTimeline.Curves"/> (runtime reference).</summary>
     public CurveObject? FollowCurve;
+    /// <summary>Tracking constraints, evaluated after Follow Path in list order.</summary>
+    public List<TrackConstraint> TrackConstraints = [];
+
+    /// <summary>An enabled tracking constraint drives the rotation (node rotation is locked).</summary>
+    public bool RotationDriven => TrackConstraints.Any(c => c.Enabled);
+    /// <summary>An enabled tracking constraint keeps the framing (node FoV is locked).</summary>
+    public bool FovDriven => TrackConstraints.Any(c => c.DrivesFov);
 
     public CamTrack Clone() => new()
     {
@@ -24,6 +31,7 @@ public sealed class CamTrack
         Keys = Keys.Select(k => k.Clone()).ToList(),
         Shots = Shots.Select(s => s.Clone()).ToList(),
         FollowPath = FollowPath?.Clone(), FollowCurve = FollowCurve,
+        TrackConstraints = TrackConstraints.Select(c => c.Clone()).ToList(),
     };
 }
 

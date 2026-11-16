@@ -58,6 +58,10 @@ public sealed class GraphEditor
         selected.IntersectWith(refs.Select(r => r.Key.Id));
         ImGui.PushID("WholeShot" + shot.Id);
         ImGui.TextDisabled($"整条轨道的连续段 F{shot.Start}–F{shot.End}（切镜为恒定插值，不拆段） · 已选节点 {timeline.SelectedNodes.Count}");
+        if(timeline.Tracks.FirstOrDefault(t => t.Shots.Contains(shot)) is { RotationDriven: true } driven)
+            ImGui.TextColored(new System.Numerics.Vector4(0.6f, 0.9f, 1, 1), driven.FovDriven
+                ? "旋转与 FoV 由追踪约束控制：这里的旋转 / FoV 节奏只影响节点自身的值，最终朝向和 FoV 由约束决定。"
+                : "旋转由追踪约束控制：这里的旋转节奏只影响节点自身的旋转，最终朝向由约束决定。");
         foreach(var c in channels)
         {
             ImGui.PushID((int)c);

@@ -125,7 +125,7 @@ public sealed class Overlay
                     uint col = sel ? 0xFF00FFFF : active ? track.Color : Dim(track.Color);
                     var seq = comp?.SequenceOf(t);
                     var pose = seq == null ? new XcpFrame(k.Pos, k.Rot, k.Fov)
-                        : seq.Segments[seq.SegmentAt(k.Frame)].Curves.NodePose(k);
+                        : seq.Constrain(seq.Segments[seq.SegmentAt(k.Frame)].Curves.NodePose(k), k.Frame);
                     DrawFrustum(dl, ToWorld(pose.Pos), Quaternion.Normalize(baseRot * pose.Rot), pose.Fov, col, sel ? 2.5f : 1.5f);
                     if(_gui.WorldToScreen(ToWorld(pose.Pos), out var eye) && IsSane(eye)) NodeScreens.Add((k, eye));
                     if(ShowLabels && _gui.WorldToScreen(ToWorld(pose.Pos), out var sp) && IsSane(sp))
@@ -153,6 +153,32 @@ public sealed class Overlay
                                 if(ShowLabels && _gui.WorldToScreen(ToWorld(pose.Pos), out var point) && IsSane(point))
                                     dl.AddText(point + new Vector2(7, 5), color, $"{item.text} F{jump.Frame:0.##}");
                             }
+                }
+            }
+        }
+
+        // ---- tracking targets: a marker at every target, a dashed aim line from the playhead camera ----
+        if(comp != null)
+        {
+            float frame = previewFrame ?? tl.Playhead;
+            for(int t = 0; t < comp.TrackCount; t++)
+            {
+                if(comp.SequenceOf(t) is not { Tracking: true } seq) continue;
+                bool shown = comp.IsActive(t) && comp.TrackAt(frame) == t;
+                var eye = shown ? comp.Sample(frame).Pos : (Vector3?)null;
+                foreach(var c in seq.Constraints)
+                {
+                    if(seq.Targets!.Position(c, frame) is not { } bone) continue;
+                    var target = bone + c.TargetOffset;
+                    uint col = shown ? 0xFF40C0FF : Dim(0xFF40C0FF);
+                    if(_gui.WorldToScreen(target, out var sp) && IsSane(sp))
+                    {
+                        dl.AddCircle(sp, 7, col, 16, 2f);
+                        dl.AddLine(sp - new Vector2(10, 0), sp + new Vector2(10, 0), col, 1.5f);
+                        dl.AddLine(sp - new Vector2(0, 10), sp + new Vector2(0, 10), col, 1.5f);
+                        if(ShowLabels) dl.AddText(sp + new Vector2(9, 4), col, $"{TrackConstraint.TypeName(c.Type)} · {c.Bone}");
+                    }
+                    if(eye is { } e) DashedLine(dl, e, target, col);
                 }
             }
         }

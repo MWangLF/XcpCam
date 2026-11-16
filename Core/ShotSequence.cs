@@ -26,6 +26,10 @@ public sealed class ShotSequence
     public int Fps { get; }
     public IEnumerable<int> CutFrames => Segments.SelectMany(s => s.Keys.Where(k => k.CutIn).Select(k => k.Frame));
     public float TotalLength { get; }
+    /// <summary>Enabled tracking constraints of the track (applied by <see cref="Constrain"/>).</summary>
+    public IReadOnlyList<TrackConstraint> Constraints { get; private init; } = [];
+    public ITrackTargetSource? Targets { get; private init; }
+    public bool Tracking => Constraints.Count > 0 && Targets != null;
 
     private ShotSequence(List<ShotSegment> segments, int fps)
     {
@@ -46,13 +50,34 @@ public sealed class ShotSequence
         TotalLength = length;
     }
 
-    public static ShotSequence? Create(CamTrack track, int fps)
+    public static ShotSequence? Create(CamTrack track, int fps, ITrackTargetSource? targets = null)
     {
         CurveModel.Ensure(track, fps);
         if(track.Keys.Count == 0) return null;
         var groups = CurveModel.Groups(track);
         return new ShotSequence(track.Shots.Select((s, i) => new ShotSegment
-        { Keys = groups[i], Curves = s, Fps = fps }).ToList(), fps);
+        { Keys = groups[i], Curves = s, Fps = fps }).ToList(), fps)
+        { Constraints = track.TrackConstraints.Where(c => c.Enabled).ToList(), Targets = targets };
+    }
+
+    /// <summary>Applies the tracking constraints (after Follow Path, which is part of the curves) to a pose at a frame.</summary>
+    public XcpFrame Constrain(XcpFrame pose, float frame)
+    {
+        if(!Tracking) return pose;
+        XcpFrame? first = null;
+        foreach(var c in Constraints)
+        {
+            if(Targets!.Position(c, frame) is not { } bone) continue;
+            float? framing = null;
+            if(c.KeepFraming)
+            {
+                // the target's size on screen at the track's first node is kept
+                first ??= Segments[0].SampleAt(Start);
+                if(Targets.Position(c, Start) is { } bone0) framing = TrackSolver.Framing(first.Value, bone0 + c.TargetOffset);
+            }
+            pose = TrackSolver.Apply(c, pose, bone + c.TargetOffset, Targets.Aspect, framing);
+        }
+        return pose;
     }
 
     // Legacy callers/tests can seed a fresh curve track from captured nodes; old pacing is intentionally ignored.

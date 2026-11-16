@@ -66,13 +66,17 @@ public sealed class ShotComposer
         Runs = runs;
     }
 
-    /// <summary>Builds the composer, or null when no active track has nodes.</summary>
-    public static ShotComposer? Create(CamTimeline tl, PathSettings settings)
+    /// <summary>Any active track has tracking constraints.</summary>
+    public bool Tracking => Enumerable.Range(0, _seq.Length).Any(i => _active[i] && _seq[i]?.Tracking == true);
+
+    /// <summary>Builds the composer, or null when no active track has nodes. Tracking constraints are only
+    /// evaluated with a <paramref name="targets"/> source.</summary>
+    public static ShotComposer? Create(CamTimeline tl, PathSettings settings, ITrackTargetSource? targets = null)
     {
         int n = tl.Tracks.Count;
         tl.ResolveConstraints();
         var seq = new ShotSequence?[n];
-        for(int i = 0; i < n; i++) seq[i] = ShotSequence.Create(tl.Tracks[i], tl.Fps);
+        for(int i = 0; i < n; i++) seq[i] = ShotSequence.Create(tl.Tracks[i], tl.Fps, targets);
 
         bool anySolo = Enumerable.Range(0, n).Any(i => tl.Tracks[i].Solo && seq[i] != null);
         var active = new bool[n];
@@ -96,13 +100,20 @@ public sealed class ShotComposer
 
     private (int track, int segment) ShotAt(float frame)
     {
-        var (_, t, s) = SampleEx(frame);
+        var (_, t, s) = SampleEx(frame, false);
         return (t, s * 100000 + (_seq[t]?.CutFrames.Count(f => f <= frame) ?? 0));
     }
 
     public XcpFrame Sample(float frame) => SampleEx(frame).pose;
 
-    public (XcpFrame pose, int track, int segment) SampleEx(float frame)
+    /// <param name="constrained">Apply tracking constraints (rotation / FoV); positions never depend on them.</param>
+    public (XcpFrame pose, int track, int segment) SampleEx(float frame, bool constrained = true)
+    {
+        var r = SampleRaw(frame);
+        return constrained && _seq[r.track] is { Tracking: true } seq ? (seq.Constrain(r.pose, r.at), r.track, r.segment) : (r.pose, r.track, r.segment);
+    }
+
+    private (XcpFrame pose, int track, int segment, float at) SampleRaw(float frame)
     {
         if(frame < FirstFrame) frame = FirstFrame;
         if(frame > LastFrame) frame = LastFrame;
@@ -117,20 +128,20 @@ public sealed class ShotComposer
                 if(_active[i] && _seq[i] is { } s && s.End < frame && s.End > holdAt) holdAt = s.End;
             if(float.IsNegativeInfinity(holdAt)) holdAt = FirstFrame;
             t = TopTrackAt(holdAt);
-            if(t < 0) return SampleEx(FirstFrame);
+            if(t < 0) return SampleRaw(FirstFrame);
             var (hp, hs) = _seq[t]!.Sample(holdAt);
-            return (hp, t, hs);
+            return (hp, t, hs, holdAt);
         }
         var (pose, seg) = _seq[t]!.Sample(frame);
-        return (pose, t, seg);
+        return (pose, t, seg, frame);
     }
 
     /// <summary>Output speed (yalms/s) at a frame, null across a cut.</summary>
     public float? SpeedAt(float frame)
     {
         float d = Fps / 60f;
-        var a = SampleEx(frame);
-        var b = SampleEx(frame + d);
+        var a = SampleEx(frame, false);
+        var b = SampleEx(frame + d, false);
         if(a.track != b.track || a.segment != b.segment || CutFrames.Any(f => f > frame && f <= frame + d)) return null;
         return Vector3.Distance(a.pose.Pos, b.pose.Pos) / (d / Fps);
     }

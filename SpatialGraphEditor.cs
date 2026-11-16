@@ -38,7 +38,9 @@ public sealed class SpatialGraphEditor
         foreach(var ch in Channels.Where(c => !IsTime(c))) _curves[ch] = shot.Space.Channels[Spatial(ch)];
     }
     /// <summary>Path progress values are the nodes' own positions on the node path; only their timing is edited.</summary>
-    private bool ValueLocked(GraphChannel ch) => ch == GraphChannel.Progress && !_shot.IsFollowing;
+    private bool ValueLocked(GraphChannel ch) => ch == GraphChannel.Progress && !_shot.IsFollowing || _driven.Contains(ch);
+    /// <summary>Channels a tracking constraint drives: values and handles are not editable (keys can still retime nodes).</summary>
+    private readonly HashSet<GraphChannel> _driven = new();
     private double DomainStart(GraphChannel ch) => IsTime(ch) ? _shot.Start : _space.Start;
     private double DomainEnd(GraphChannel ch) => IsTime(ch) ? _shot.End : _space.End;
     private IEnumerable<GraphChannel> DisplayChannels => Channels;
@@ -104,6 +106,12 @@ public sealed class SpatialGraphEditor
         if (!ReferenceEquals(_space, shot.Space)) EndGesture();
         _space = shot.Space;
         BindCurves(shot);
+        _driven.Clear();
+        if(timeline.Tracks.FirstOrDefault(t => t.Shots.Contains(shot)) is { } owner)
+        {
+            if(owner.RotationDriven) _driven.UnionWith([GraphChannel.Yaw, GraphChannel.Pitch, GraphChannel.Roll]);
+            if(owner.FovDriven) _driven.Add(GraphChannel.Fov);
+        }
         if(_selectionRevision != timeline.SelectionRevision)
         {
             _selected.Clear();
@@ -298,7 +306,9 @@ public sealed class SpatialGraphEditor
                         _primary = h.Id;
                         if (!_locked.Contains(h.Id.Channel))
                         {
-                            if (h.Handle)
+                            if (h.Handle && _driven.Contains(h.Id.Channel))
+                                Status = "此通道由追踪约束控制，手柄不能编辑；关键帧仍可横向拖动重定时节点。";
+                            else if (h.Handle)
                             {
                                 _gesture = Gesture.Handle; _handleKey = h.Id; _rightHandle = h.Right;
                                 var effectiveCurve = Curves[h.Id.Channel];
@@ -404,6 +414,10 @@ public sealed class SpatialGraphEditor
         ImGui.TextDisabled("横轴：实际帧。路径进度 = 沿路径的长度比例（0–1，同 Blender 跟随路径的偏移系数）；位置偏移叠加在路径点上（世界坐标米）；旋转/FoV为度。");
         ImGui.TextDisabled(shot.IsFollowing ? "当前轨道跟随曲线：路径进度可上下拖动改变节点在曲线上的位置，手柄调整快慢。"
             : "路径形状在游戏内用曲线手柄编辑；这里的路径进度数值由节点位置决定，只能用手柄调整快慢。");
+        if(_driven.Count > 0)
+            ImGui.TextColored(new Vector4(0.6f, 0.9f, 1, 1), _driven.Contains(GraphChannel.Fov)
+                ? "偏航 / 俯仰 / 滚转与 FoV 由追踪约束控制：数值和手柄不能编辑，曲线显示的是节点自身的值。"
+                : "偏航 / 俯仰 / 滚转由追踪约束控制：数值和手柄不能编辑，曲线显示的是节点自身的值。");
         int cursor = _cursor;
         ImGui.SetNextItemWidth(140);
         if (ImGui.InputInt("帧数游标", ref cursor)) _cursor = Math.Clamp(cursor, shot.Start, shot.End);
@@ -460,7 +474,7 @@ public sealed class SpatialGraphEditor
     {
         if (_primary is not { } id || Resolve(shot, id) is not { } key)
         { ImGui.TextDisabled("选择关键帧编辑所在帧与通道数值；节点锚点横移会重定时。"); return; }
-        bool editable = !_locked.Contains(id.Channel) && Editable(id.Channel, key.Frame) && _gesture == Gesture.None;
+        bool editable = !_locked.Contains(id.Channel) && !_driven.Contains(id.Channel) && Editable(id.Channel, key.Frame) && _gesture == Gesture.None;
         ImGui.BeginDisabled(!editable);
         int frame = (int)Math.Round(ToFrame(id.Channel, key.Frame));
         double value = key.Value;
@@ -504,7 +518,7 @@ public sealed class SpatialGraphEditor
         var targets = (_scope == 0 ? SelectedKeys(shot) : Curves
             .Where(x => _scope == 2 || x.Key == _active)
             .SelectMany(x => x.Value.Keys.Select(k => (id: new KeyId(x.Key, k.Id), key: k))))
-            .Where(x => !_locked.Contains(x.id.Channel) && Editable(x.id.Channel, x.key.Frame)).ToList();
+            .Where(x => !_locked.Contains(x.id.Channel) && !_driven.Contains(x.id.Channel) && Editable(x.id.Channel, x.key.Frame)).ToList();
         string interpolation = ((CurveInterpolation)_preset).ToString();
         string mode = ((HandleMode)_handleMode).ToString();
         targets = targets.Where(x => _applyHandles || x.key.Interpolation.ToString() != interpolation).ToList();

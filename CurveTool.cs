@@ -468,55 +468,6 @@ public sealed class CurveTool
         ImGui.EndDisabled();
     }
 
-    /// <summary>Follow Path constraint of the active track (timeline page).</summary>
-    public void DrawConstraint()
-    {
-        var track = _tl.ActiveTrack;
-        var target = track.FollowPath is { } fp ? _tl.Curves.FirstOrDefault(c => c.Id == fp.CurveId) : null;
-        ImGui.TextUnformatted("约束 · 跟随路径");
-        ImGui.SameLine();
-        ImGui.SetNextItemWidth(220);
-        if(ImGui.BeginCombo("##follow", target?.Name ?? "无（使用节点路径）"))
-        {
-            if(ImGui.Selectable("无（使用节点路径）", target == null) && track.FollowPath != null) { _tl.ClearFollowPath(track); _status("已移除跟随路径约束，节点保持当前位置。", false); }
-            foreach(var curve in _tl.Curves)
-                if(ImGui.Selectable($"{curve.Name}##{curve.Id}", curve == target) && curve != target)
-                {
-                    if(track.FollowPath != null) _tl.ClearFollowPath(track);
-                    _tl.SetFollowPath(track, curve);
-                    _status($"「{track.Name}」已跟随「{curve.Name}」：首节点在曲线 0%、末节点 100%，其余按帧均分；旋转与 FoV 仍由节点控制。", false);
-                }
-            ImGui.EndCombo();
-        }
-        if(ImGui.IsItemHovered()) ImGui.SetTooltip("Blender 跟随路径约束：相机位置沿所选曲线运动，节点决定到达曲线上的位置与时间。\n旋转、FoV 仍由镜头节点控制；高级曲线中的「位置偏移」叠加在路径点上。");
-        if(track.FollowPath is not { } c) return;
-        ImGui.SameLine();
-        bool follow = c.FollowCurve, radius = c.UseRadius;
-        if(ImGui.Checkbox("跟随曲线", ref follow)) { _tl.Snapshot(); c.FollowCurve = follow; _tl.Touch(); }
-        if(ImGui.IsItemHovered()) ImGui.SetTooltip("相机朝向随曲线方向转动（节点旋转作为相对曲线的旋转），曲线倾斜控制滚转。");
-        ImGui.SameLine();
-        if(ImGui.Checkbox("使用半径", ref radius)) { _tl.Snapshot(); c.UseRadius = radius; _tl.Touch(); }
-        ImGui.SameLine();
-        if(ImGui.SmallButton("路径进度按时间均分"))
-        {
-            _tl.Snapshot();
-            foreach(var shot in track.Shots) shot.ResetFactors();
-            CurveModel.Ensure(track, _tl.Fps); _tl.Touch();
-            _status("已恢复：首节点 0%、末节点 100%，其余节点按帧均分在曲线上。", false);
-        }
-        if(ImGui.IsItemHovered()) ImGui.SetTooltip("清除手动设置的节点路径进度。快慢仍可用曲线编辑器的简单曲线调整。");
-        if(c.FollowCurve)
-        {
-            ImGui.SameLine();
-            string axes = "X\0Y\0Z\0-X\0-Y\0-Z\0";
-            int forward = (int)c.Forward, up = (int)c.Up;
-            ImGui.SetNextItemWidth(60);
-            if(ImGui.Combo("前进轴", ref forward, axes)) { _tl.Snapshot(); c.Forward = (PathAxis)forward; _tl.Touch(); }
-            ImGui.SameLine(); ImGui.SetNextItemWidth(60);
-            if(ImGui.Combo("向上轴", ref up, axes)) { _tl.Snapshot(); c.Up = (PathAxis)up; _tl.Touch(); }
-        }
-    }
-
     private static string TypeName(SplineType t) => t switch { SplineType.Bezier => "贝塞尔", SplineType.Nurbs => "NURBS", _ => "多段线" };
     private static string SplineSummary(CurveObject c) => c.Splines.Count == 0 ? "空" :
         string.Join(" + ", c.Splines.Select(s => $"{TypeName(s.Type)}{(s.Cyclic ? "环" : "")} {s.Points.Count} 点"));
