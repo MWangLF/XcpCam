@@ -119,6 +119,22 @@ public sealed class ConstraintPanel
             _status("已恢复：首节点 0%、末节点 100%，其余节点按帧均分在曲线上。", false);
         }
         if(ImGui.IsItemHovered()) ImGui.SetTooltip("清除手动设置的节点路径进度。快慢仍可用曲线编辑器的简单曲线调整。");
+        if(target?.PathSpline != null)
+        {
+            // anchoring is per curve: all of its points follow the camera, or all are fixed on the timeline
+            bool anchored = CamTimeline.CurveAnchoredToTimeline(track);
+            int mode = anchored ? 1 : 0;
+            ImGui.SameLine();
+            if(ImGui.RadioButton("锚定镜头##curveanchor", ref mode, 0) && anchored && _tl.AnchorCurve(track, false))
+                _status("整条曲线已改回锚定镜头：首节点 0%、末节点 100%，节点之间按镜头关键帧的节奏。", false);
+            if(ImGui.IsItemHovered()) ImGui.SetTooltip("曲线节点落在镜头经过它们的帧，随镜头关键帧移动（默认）。\n锚定作用于整条曲线。Alt+C");
+            ImGui.SameLine();
+            if(ImGui.RadioButton("锚定时间轴##curveanchor", ref mode, 1) && !anchored)
+                _status(_tl.AnchorCurve(track, true) ? "整条曲线已按镜头当前经过的帧锚定到时间轴。" + CamTimeline.TimelineAnchorNotice : "镜头没有经过这条曲线的任何节点，无法锚定时间轴。",
+                    !CamTimeline.CurveAnchoredToTimeline(track));
+            if(ImGui.IsItemHovered())
+                ImGui.SetTooltip("把曲线所有节点固定在镜头当前经过它们的帧（闭合曲线另锚定回到起点的帧）。\n之后锚点帧决定节点之间的时间，镜头在每个锚点帧精确经过对应节点；首末锚点即 0% 和 100%。\n可在时间轴上单独拖动某个节点改变它的帧。锚定作用于整条曲线。Alt+T\n" + CamTimeline.TimelineAnchorNotice);
+        }
         if(c.FollowCurve)
         {
             int forward = (int)c.Forward, up = (int)c.Up;

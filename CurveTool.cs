@@ -22,8 +22,14 @@ public sealed class CurveTool
     private readonly Action<Keyframe> _writeNodePosition;
     private readonly Action<string, bool> _status;
 
-    /// <summary>Gizmo target is curves (instead of camera nodes).</summary>
+    /// <summary>Shows the selected curve's full edit cage in game (handles, object mode, node path handles).
+    /// Picking and the gizmo no longer depend on it: they follow whatever was selected last.</summary>
     public bool Active;
+    /// <summary>Track whose followed curve the selected points were picked from (anchor context).</summary>
+    public CamTrack? PointTrack;
+    /// <summary>Control points of the active track's followed curve, always pickable: (point index, screen).</summary>
+    public readonly List<(int point, Vector2 screen)> FollowCandidates = [];
+    public int? HoverFollow;
     /// <summary>Selected user curve; null with <see cref="NodePath"/> edits the active track's node path.</summary>
     public Guid? CurveId;
     public bool NodePath = true;
@@ -74,11 +80,92 @@ public sealed class CurveTool
             if(_overlay.ShowLabels && curve.PathSpline is { } first && first.Points.Count > 0)
                 _overlay.DrawLabel(curve.ToWorld(first.Points[0].Co), curve.Name, color);
         }
+        DrawFollowedPoints();
         if(!Active) return;
         if(Curve is { } c && EditMode) DrawCage(c);
-        else if(Curve is { } o && !EditMode && _overlay.ToScreen(o.Location, out var s))
+        else if(Curve is { } o && !EditMode && _overlay.ToScreen(Pivot(o), out var s))
             Candidates.Add((new CurveSelection(-1, -1), s));
         else if(EditingNodePath) DrawNodePathCage();
+    }
+
+    /// <summary>
+    /// The active track's followed curve: its control points are always drawn and pickable (camera-anchored:
+    /// round, timeline-anchored: square), unless the same curve already shows its full edit cage.
+    /// </summary>
+    private void DrawFollowedPoints()
+    {
+        FollowCandidates.Clear();
+        var track = _tl.ActiveTrack;
+        if(track.FollowPath is not { } follow || track.FollowCurve is not { } curve || curve.PathSpline is not { } spline) return;
+        if(Active && EditMode && CurveId == curve.Id) return;
+        int si = curve.Splines.IndexOf(spline);
+        bool context = CurveId == curve.Id && EditMode;
+        for(int i = 0; i < spline.Points.Count; i++)
+        {
+            var w = curve.ToWorld(spline.Points[i].Co);
+            bool sel = context && Selection.Contains(new CurveSelection(si, i));
+            bool anchored = follow.TimeAnchors.ContainsKey(spline.Points[i].Id);
+            _overlay.DrawMarker(w, sel ? 0xFF33AAFF : anchored ? 0xFFFFCC66 : 0xFFFFFFFF, anchored, sel);
+            if(_overlay.ToScreen(w, out var s)) FollowCandidates.Add((i, s));
+        }
+    }
+
+    /// <summary>Selects a control point of a track's followed curve (timeline lane or game view).</summary>
+    public void SelectFollowedPoint(CamTrack track, int point, bool additive)
+    {
+        if(track.FollowCurve is not { } curve || curve.PathSpline is not { } spline || point < 0 || point >= spline.Points.Count) return;
+        if(CurveId != curve.Id || !EditMode || NodePath && CurveId == null) { Selection.Clear(); additive = false; }
+        CurveId = curve.Id; NodePath = false; EditMode = true; PointTrack = track;
+        var s = new CurveSelection(curve.Splines.IndexOf(spline), point);
+        if(additive) { if(!Selection.Add(s)) Selection.Remove(s); }
+        else { Selection.Clear(); Selection.Add(s); }
+    }
+
+    /// <summary>The following track the selected points belong to (for anchors), if any.</summary>
+    public CamTrack? AnchorTrack
+    {
+        get
+        {
+            if(Curve is not { } curve) return null;
+            bool Follows(CamTrack t) => t.FollowPath?.CurveId == curve.Id;
+            if(PointTrack != null && _tl.Tracks.Contains(PointTrack) && Follows(PointTrack)) return PointTrack;
+            return Follows(_tl.ActiveTrack) ? _tl.ActiveTrack : _tl.Tracks.FirstOrDefault(Follows);
+        }
+    }
+
+    /// <summary>Selected control points of the edited curve (handles excluded), in curve order.</summary>
+    public List<(int spline, int index, CurvePoint point)> SelectedPoints()
+    {
+        if(!EditMode || Curve is not { } curve) return [];
+        return Selection.Where(s => s.Part == CurvePart.Point && s.Spline < curve.Splines.Count && s.Point < curve.Splines[s.Spline].Points.Count)
+            .Select(s => (spline: s.Spline, index: s.Point, point: curve.Splines[s.Spline].Points[s.Point]))
+            .Distinct().OrderBy(x => x.spline).ThenBy(x => x.index).ToList();
+    }
+
+    /// <summary>Tilt / radius of the selected points (curve page and timeline inspector).</summary>
+    public void DrawPointProperties(CurveObject c, List<CurvePoint> selectedPoints)
+    {
+        if(selectedPoints.Count == 0) return;
+        float tilt = selectedPoints.Average(p => p.Tilt) * 180 / MathF.PI, radius = selectedPoints.Average(p => p.Radius);
+        ImGui.SetNextItemWidth(120);
+        if(ImGui.DragFloat("倾斜 (°)", ref tilt, .5f)) { foreach(var p in selectedPoints) p.Tilt = tilt * MathF.PI / 180; c.Touch(); _tl.Touch(); }
+        if(ImGui.IsItemActivated()) _tl.Snapshot();
+        if(ImGui.IsItemHovered()) ImGui.SetTooltip("Blender Ctrl+T：沿曲线的滚转，只在约束开启「跟随曲线」时影响相机。");
+        ImGui.SameLine(); ImGui.SetNextItemWidth(120);
+        if(ImGui.DragFloat("半径", ref radius, .01f, 0f, 100f)) { foreach(var p in selectedPoints) p.Radius = MathF.Max(0, radius); c.Touch(); _tl.Touch(); }
+        if(ImGui.IsItemActivated()) _tl.Snapshot();
+        if(ImGui.IsItemHovered()) ImGui.SetTooltip("Blender Alt+S：约束开启「使用半径」时按半径缩放位置偏移。");
+    }
+
+    /// <summary>Handle type of the selected points (curve page and timeline inspector).</summary>
+    public void DrawHandleTypeControl()
+    {
+        ImGui.SetNextItemWidth(110);
+        ImGui.Combo("##htype", ref _handleType, "自由\0自动\0矢量\0对齐\0");
+        ImGui.SameLine();
+        if(ImGui.Button("设置手柄类型"))
+            Edit("已设置手柄类型。", curve => { foreach(var (s, _, points) in SelectedSplines(curve)) CurveEdit.SetHandleType(s, points, (CurveHandle)_handleType); });
+        if(ImGui.IsItemHovered()) ImGui.SetTooltip("Blender V：自动（黄）、矢量（绿）、对齐（粉）、自由（黑）。拖动自动手柄会变为对齐，拖动矢量手柄会变为自由。");
     }
 
     private void DrawCage(CurveObject curve)
@@ -151,9 +238,12 @@ public sealed class CurveTool
 
     // ---------------------------------------------------------------- gizmo
 
+    /// <summary>Whether the gizmo acts on curves: selected curve points / handles, or a curve in object mode.</summary>
+    public bool OwnsGizmo => Selection.Count > 0 || Active && !EditMode && Curve != null;
+
     public void DrawGizmo()
     {
-        if(!Active) return;
+        if(!OwnsGizmo) return;
         if(Curve is { } curve && !EditMode) { ObjectGizmo(curve); return; }
         if(Selection.Count == 0) return;
         if(EditingNodePath) { NodePathGizmo(); return; }
@@ -163,12 +253,30 @@ public sealed class CurveTool
     private void Started() { if(_gizmo.DragStarted) _tl.Snapshot(); }
     private void LimitNote() { if(_gizmo.IsUsing && _gizmo.Limited) _status($"变换手柄已限制：需保持在目标周围 {GizmoEditor.MaxRange:0} 米内，单帧跳动过大的拖动会被忽略。", true); }
 
+    /// <summary>World median of all control points: the pivot for object-mode transforms. The origin
+    /// (<see cref="CurveObject.Location"/>) stays behind when points are moved in edit mode, so pivoting on it
+    /// would rotate/scale such a curve around an off-centre point.</summary>
+    public static Vector3 Pivot(CurveObject curve)
+    {
+        var points = curve.Splines.SelectMany(s => s.Points).ToList();
+        if(points.Count == 0) return curve.Location;
+        return curve.ToWorld(points.Aggregate(Vector3.Zero, (sum, p) => sum + p.Co) / points.Count);
+    }
+
     private void ObjectGizmo(CurveObject curve)
     {
-        var p = curve.Location; var r = curve.Rotation; var s = curve.Scale;
+        var pivot = Pivot(curve);
+        var local = curve.ToLocal(pivot);
+        var p = pivot; var r = curve.Rotation; var s = curve.Scale;
         bool changed = _gizmo.DrawTransform(ref p, ref r, ref s, _gizmo.Operation);
         Started();
-        if(changed) { curve.Location = p; curve.Rotation = r; curve.Scale = s; curve.Touch(); _tl.Touch(); }
+        if(changed)
+        {
+            // rotate / scale about the pivot: keep the pivot's local point at the gizmo position
+            curve.Rotation = r; curve.Scale = s;
+            curve.Location = p - Vector3.Transform(local * s, r);
+            curve.Touch(); _tl.Touch();
+        }
         LimitNote();
     }
 
@@ -177,6 +285,9 @@ public sealed class CurveTool
         var p = curve.Splines[s.Spline].Points[s.Point];
         return curve.ToWorld(s.Part switch { CurvePart.Left => p.Left, CurvePart.Right => p.Right, _ => p.Co });
     }
+
+    /// <summary>Total scale already applied to the selected points during the current gizmo drag.</summary>
+    private Vector3 _pointScale = Vector3.One;
 
     private void PointGizmo(CurveObject curve)
     {
@@ -188,6 +299,15 @@ public sealed class CurveTool
         var op = _gizmo.Operation;
         bool changed = _gizmo.DrawTransform(ref p, ref r, ref scale, op);
         Started();
+        // ImGuizmo reports scale relative to the drag start, but the points are already scaled by the
+        // previous frames: apply only this frame's ratio so the scale follows the mouse
+        if(_gizmo.DragStarted || !_gizmo.IsUsing) _pointScale = Vector3.One;
+        if(changed && op == GizmoEditor.Op.Scale)
+        {
+            var total = scale;
+            scale /= _pointScale;
+            _pointScale = total;
+        }
         if(changed)
         {
             // Blender transforms points about the selection median: G translates, R rotates, S scales
@@ -289,7 +409,7 @@ public sealed class CurveTool
     /// <summary>Delete key / button in edit mode: removes the selected control points.</summary>
     public bool DeleteSelected()
     {
-        if(!Active || !EditMode || Curve is not { } curve || Selection.Count == 0) return false;
+        if(!EditMode || Curve is not { } curve || Selection.Count == 0 || EditingNodePath) return false;
         _tl.Snapshot();
         foreach(var group in Selection.Where(s => s.Part == CurvePart.Point).GroupBy(s => s.Spline).OrderByDescending(g => g.Key))
             if(!CurveEdit.Delete(curve.Splines[group.Key], group.Select(s => s.Point).ToHashSet())) curve.Splines.RemoveAt(group.Key);
@@ -317,8 +437,8 @@ public sealed class CurveTool
     public void DrawPanel(bool gpose)
     {
         ImGui.TextDisabled("曲线与镜头节点都是世界坐标。参照 Blender：物体模式整体移动/旋转/缩放，编辑模式点选控制点与贝塞尔手柄。");
-        if(ImGui.Checkbox("在游戏内编辑曲线", ref Active)) Selection.Clear();
-        if(ImGui.IsItemHovered()) ImGui.SetTooltip("开启后变换手柄作用于曲线：点选控制点（方块）或手柄（圆点），Ctrl+单击多选，单击空白处取消选择。\n关闭后恢复编辑镜头节点。");
+        if(ImGui.Checkbox("在游戏内显示编辑框", ref Active)) Selection.Clear();
+        if(ImGui.IsItemHovered()) ImGui.SetTooltip("开启后在游戏内显示所选曲线的控制点（方块）和手柄（圆点）、物体模式的整体手柄、节点路径的手柄。\n变换手柄作用于最后选中的对象：点选曲线节点就编辑曲线，点选镜头节点就编辑镜头，Ctrl+单击多选，单击空白处取消选择。\n被当前轨道跟随的曲线，其控制点始终可以点选。");
         ImGui.SameLine();
         ImGui.BeginDisabled(!gpose);
         ImGui.SetNextItemWidth(130);
@@ -423,26 +543,10 @@ public sealed class CurveTool
         if(ImGui.IsItemHovered()) ImGui.SetTooltip("Blender Alt+C：闭合或打开所选样条。");
         ImGui.SameLine();
         if(ImGui.Button("切换方向")) Edit("已反转样条方向。", curve => { foreach(var (s, _, _) in SelectedSplines(curve)) CurveEdit.SwitchDirection(s); Selection.Clear(); });
-        ImGui.SetNextItemWidth(110);
-        ImGui.Combo("##htype", ref _handleType, "自由\0自动\0矢量\0对齐\0");
-        ImGui.SameLine();
-        if(ImGui.Button("设置手柄类型"))
-            Edit("已设置手柄类型。", curve => { foreach(var (s, _, points) in SelectedSplines(curve)) CurveEdit.SetHandleType(s, points, (CurveHandle)_handleType); });
-        if(ImGui.IsItemHovered()) ImGui.SetTooltip("Blender V：自动（黄）、矢量（绿）、对齐（粉）、自由（黑）。拖动自动手柄会变为对齐，拖动矢量手柄会变为自由。");
+        DrawHandleTypeControl();
 
         var selectedPoints = SelectedSplines(c).SelectMany(x => x.points.Where(i => i < x.spline.Points.Count).Select(i => x.spline.Points[i])).Distinct().ToList();
-        if(selectedPoints.Count > 0)
-        {
-            float tilt = selectedPoints.Average(p => p.Tilt) * 180 / MathF.PI, radius = selectedPoints.Average(p => p.Radius);
-            ImGui.SetNextItemWidth(120);
-            if(ImGui.DragFloat("倾斜 (°)", ref tilt, .5f)) { foreach(var p in selectedPoints) p.Tilt = tilt * MathF.PI / 180; c.Touch(); _tl.Touch(); }
-            if(ImGui.IsItemActivated()) _tl.Snapshot();
-            if(ImGui.IsItemHovered()) ImGui.SetTooltip("Blender Ctrl+T：沿曲线的滚转，只在约束开启「跟随曲线」时影响相机。");
-            ImGui.SameLine(); ImGui.SetNextItemWidth(120);
-            if(ImGui.DragFloat("半径", ref radius, .01f, 0f, 100f)) { foreach(var p in selectedPoints) p.Radius = MathF.Max(0, radius); c.Touch(); _tl.Touch(); }
-            if(ImGui.IsItemActivated()) _tl.Snapshot();
-            if(ImGui.IsItemHovered()) ImGui.SetTooltip("Blender Alt+S：约束开启「使用半径」时按半径缩放位置偏移。");
-        }
+        DrawPointProperties(c, selectedPoints);
         ImGui.EndDisabled();
     }
 

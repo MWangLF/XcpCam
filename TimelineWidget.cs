@@ -27,6 +27,27 @@ public sealed class TimelineWidget
     public bool TracksEdited { get; private set; }
     /// <summary>Snapshot request before a track header edit.</summary>
     public Action? BeforeTrackEdit;
+    /// <summary>Curve selection shared with the game view (followed curve points are shown in their track's lane).</summary>
+    public CurveTool? Curves;
+    /// <summary>Set when a curve point was clicked (its selection replaced the camera node selection).</summary>
+    public bool CurvePointsClicked { get; private set; }
+    /// <summary>Set when a camera node was clicked (the curve point selection was cleared).</summary>
+    public bool NodesClicked { get; private set; }
+
+    private (CamTrack track, Guid id, double start, bool loopEnd)? _dragPoint;
+    private bool _pointDragged;
+    private ShotComposer? _timesFor;
+    private readonly Dictionary<CamTrack, List<CurvePointTime>> _times = new();
+
+    /// <summary>Followed curve points of a track on the timeline (cached per composer: any edit rebuilds it).</summary>
+    private List<CurvePointTime> CurveTimes(CamTrack track, ShotComposer? comp)
+    {
+        if(comp == null || track.FollowPath == null || track.FollowCurve == null) return [];
+        if(!ReferenceEquals(_timesFor, comp)) { _times.Clear(); _timesFor = comp; }
+        if(!_times.TryGetValue(track, out var list))
+            _times[track] = list = track.Shots.FirstOrDefault()?.CurvePointTimes() ?? [];
+        return list;
+    }
 
     private Keyframe? _dragKey;
     private bool _scrubbing;
@@ -43,6 +64,7 @@ public sealed class TimelineWidget
     public void Draw(CamTimeline tl, ShotComposer? comp)
     {
         PlayheadChanged = false; KeysChanged = false; DragStarted = false; TracksEdited = false;
+        CurvePointsClicked = false; NodesClicked = false;
         if(Selected != null && tl.SelectedNodes.Count > 0 && !tl.SelectedNodes.Contains(Selected.Id))
             Selected = tl.AllKeys.FirstOrDefault(k => tl.SelectedNodes.Contains(k.Id));
 
@@ -154,12 +176,15 @@ public sealed class TimelineWidget
 
         // lanes: segments, speed tint, holds, nodes
         Keyframe? hoveredKey = null;
+        (int lane, CurvePointTime point)? hoveredPoint = null;
         dl.PushClipRect(new Vector2(origin.X, origin.Y + RulerH + OutputH + 4), origin + size, true);
         for(int ti = 0; ti < lanes; ti++)
         {
             if(LaneTop(ti) + LaneH <= origin.Y + RulerH + OutputH + 4 || LaneTop(ti) >= origin.Y + height) continue;
             var track = tl.Tracks[ti];
-            float midY = LaneTop(ti) + LaneH / 2;
+            var curveTimes = CurveTimes(track, comp);
+            // a following track also shows its curve points: camera nodes move up, curve points go below
+            float midY = curveTimes.Count > 0 ? LaneTop(ti) + LaneH * 0.36f : LaneTop(ti) + LaneH / 2;
             var seq = comp?.SequenceOf(ti);
             bool active = comp?.IsActive(ti) ?? !track.Muted;
 
@@ -205,7 +230,34 @@ public sealed class TimelineWidget
                 if(!active) fill = (fill & 0x00FFFFFF) | 0x70000000;
                 DrawDiamond(dl, new Vector2(x, midY), NodeR + (sel ? 2 : 0), sel ? 0xFF00FFFF : fill, over || sel ? 0xFFFFFFFF : 0xFF000000);
                 int idx = track.Keys.IndexOf(k) + 1;
-                dl.AddText(new Vector2(x - 4, midY + NodeR - 1), 0xFFDDDDDD, $"{idx}");
+                if(curveTimes.Count > 0) dl.AddText(new Vector2(x + NodeR + 1, midY - 7), 0xFFDDDDDD, $"{idx}");
+                else dl.AddText(new Vector2(x - 4, midY + NodeR - 1), 0xFFDDDDDD, $"{idx}");
+            }
+
+            if(curveTimes.Count > 0 && track.FollowCurve is { PathSpline: { } spline } curve)
+            {
+                // followed curve points: round = anchored to the camera, square = anchored to the timeline
+                float py = LaneTop(ti) + LaneH - 7;
+                int si = curve.Splines.IndexOf(spline);
+                bool context = Curves != null && Curves.CurveId == curve.Id && Curves.EditMode;
+                foreach(var pt in curveTimes)
+                {
+                    if(pt.Frame is not double f) continue;
+                    float x = X((float)f);
+                    bool sel = context && Curves!.Selection.Contains(new CurveSelection(si, pt.Index));
+                    bool over = hovered && Vector2.Distance(mouse, new Vector2(x, py)) <= 6;
+                    if(over) hoveredPoint = (ti, pt);
+                    // grey ring: the camera passes the point again (e.g. a closed loop's start point at 100 %)
+                    uint col = sel ? 0xFF00FFFF : pt.Repeat && !pt.Anchored ? 0xFF888888 : pt.Anchored ? 0xFFFFCC66 : 0xFFDDDDDD;
+                    if(pt.Repeat && !pt.Anchored) dl.AddCircle(new Vector2(x, py), over || sel ? 5f : 4f, col, 12, 1.2f);
+                    else if(pt.Anchored)
+                    {
+                        dl.AddRectFilled(new Vector2(x - 4, py - 4), new Vector2(x + 4, py + 4), col);
+                        if(over || sel) dl.AddRect(new Vector2(x - 5, py - 5), new Vector2(x + 5, py + 5), 0xFFFFFFFF);
+                    }
+                    else dl.AddCircle(new Vector2(x, py), over || sel ? 5.5f : 4.5f, col, 12, 2f);
+                    dl.AddText(new Vector2(x + 6, py - 8), 0xFF999999, $"P{pt.Index + 1}");
+                }
             }
         }
 
@@ -217,10 +269,27 @@ public sealed class TimelineWidget
         dl.PopClipRect();
 
         // ---- interaction ----
+        if(hoveredPoint != null) hoveredKey = null; // the curve point strip has its own row
         if(ImGui.IsItemActivated() && ImGui.IsMouseClicked(ImGuiMouseButton.Left))
         {
-            if(hoveredKey != null)
+            if(hoveredPoint is { } hp && Curves != null)
             {
+                bool additive = ImGui.GetIO().KeyCtrl || ImGui.GetIO().KeyShift;
+                var track = tl.Tracks[hp.lane];
+                Curves.SelectFollowedPoint(track, hp.point.Index, additive);
+                Selected = null; tl.SelectNodes([]);
+                tl.ActiveTrackIndex = hp.lane;
+                CurvePointsClicked = true;
+                // a camera pass repeat is not draggable; a closed loop's anchored return to the start point is
+                _dragPoint = additive || hp.point.Repeat && !hp.point.Anchored || hp.point.Frame is not double f0
+                    ? null : (track, hp.point.Id, f0, hp.point.Repeat);
+                _pointDragged = false;
+                _dragStartFrame = FrameAt(mouse.X);
+            }
+            else if(hoveredKey != null)
+            {
+                Curves?.ClearSelection();
+                NodesClicked = true;
                 bool additive = ImGui.GetIO().KeyCtrl || ImGui.GetIO().KeyShift;
                 if(additive) tl.ToggleNode(hoveredKey.Id);
                 else if(!tl.SelectedNodes.Contains(hoveredKey.Id)) tl.SelectNodes([hoveredKey.Id]);
@@ -243,14 +312,26 @@ public sealed class TimelineWidget
                 {
                     int lane = (int)(laneY / LaneH);
                     if(lane >= 0 && lane < lanes) tl.ActiveTrackIndex = lane;
-                    if(!box) { Selected = null; tl.SelectNodes([]); }
+                    if(!box) { Selected = null; tl.SelectNodes([]); Curves?.ClearSelection(); }
                 }
             }
         }
 
         if(ImGui.IsItemActive() && ImGui.IsMouseDown(ImGuiMouseButton.Left))
         {
-            if(_dragKey != null)
+            if(_dragPoint is { } dp)
+            {
+                // dragging a curve point anchors it to the timeline at the dropped frame
+                int frame = (int)MathF.Round((float)dp.start + FrameAt(mouse.X) - _dragStartFrame);
+                if(_pointDragged || frame != (int)Math.Round(dp.start))
+                {
+                    tl.SetCurvePointAnchor(dp.track, dp.id, frame, snapshot: !_pointDragged, loopEnd: dp.loopEnd);
+                    _pointDragged = true;
+                    KeysChanged = true;
+                }
+                ImGui.SetTooltip($"锚定时间轴：第 {Math.Clamp(frame, 0, tl.Length)} 帧  ({Math.Clamp(frame, 0, tl.Length) / (float)tl.Fps:0.00}s)");
+            }
+            else if(_dragKey != null)
             {
                 int delta = (int)MathF.Round(FrameAt(mouse.X) - _dragStartFrame);
                 var targets = _dragFrames.ToDictionary(p => p.Key, p => p.Value + delta);
@@ -281,10 +362,27 @@ public sealed class TimelineWidget
             _boxStart = null;
             _panning = false;
             _dragKey = null;
+            _dragPoint = null;
             _scrubbing = false;
         }
 
-        if(hovered && hoveredKey != null && _dragKey == null)
+        if(hovered && hoveredPoint is { } hpt && _dragPoint == null && tl.Tracks[hpt.lane].FollowCurve is { } hc)
+        {
+            var p = hpt.point;
+            ImGui.SetTooltip(p.Repeat && p.Anchored
+                ? $"{hc.Name} · P{p.Index + 1}（闭合曲线回到起点，100%）：锚定时间轴  第 {p.Frame:0.###} 帧\n拖动改变绕完一圈回到起点的帧，双击跳转"
+                : p.Repeat
+                ? $"{hc.Name} · P{p.Index + 1}：镜头在第 {p.Frame:0.###} 帧再次经过它（闭合曲线的起点在 100% 处也是它）\n单击选中，双击跳转"
+                : $"{hc.Name} · P{p.Index + 1}：{(p.Anchored ? "锚定时间轴" : "锚定镜头")}  第 {p.Frame:0.###} 帧  路径进度 {p.Factor * 100:0.0}%\n" +
+                  (p.Anchored ? "拖动改变这个节点锚定的帧（镜头会在这一帧精确经过它）" : "镜头在这一帧经过它；拖动会把整条曲线改为锚定时间轴") +
+                  "，双击跳转。\n锚定作用于整条曲线：Alt+T 锚定时间轴，Alt+C 锚定镜头");
+            if(ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left) && p.Frame is double jump)
+            {
+                tl.Playhead = Math.Clamp((float)Math.Round(jump), 0, tl.Length);
+                PlayheadChanged = true;
+            }
+        }
+        else if(hovered && hoveredKey != null && _dragKey == null)
         {
             var k = hoveredKey;
             var owner = tl.TrackOf(k);

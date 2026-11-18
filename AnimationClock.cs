@@ -1,4 +1,4 @@
-using Dalamud.Plugin.Services;
+using Dalamud.Game.ClientState.Objects.Types;
 using FFXIVClientStructs.FFXIV.Client.Graphics.Scene;
 using System;
 using XcpCam.Core;
@@ -14,7 +14,8 @@ namespace XcpCam;
 /// </summary>
 public sealed unsafe class AnimationClock
 {
-    private readonly ITargetManager _targets;
+    /// <summary>The bound character (default: the GPose target), resolved again for every read.</summary>
+    private readonly Func<IGameObject?> _actor;
     private readonly TransportState _transport = new();
     public bool Available { get; private set; }
     public float Time => (float)Sample.Time;
@@ -29,13 +30,13 @@ public sealed unsafe class AnimationClock
     public bool IdentityChanged { get; private set; }
     public string Status { get; private set; } = "";
 
-    public AnimationClock(ITargetManager targets) { _targets = targets; }
+    public AnimationClock(Func<IGameObject?> actor) { _actor = actor; }
 
     private AnimationControl* GetControl(out AnimationSample sample, out string error)
     {
         sample = default; error = "";
-        var go = _targets.GPoseTarget;
-        if(go == null) { error = "没有 GPose 目标"; return null; }
+        var go = _actor();
+        if(go == null) { error = "找不到绑定的角色（没有 GPose 目标，或所选角色已不在场景中）"; return null; }
         var native = (GameObjectStruct*)go.Address;
         if(native == null || native->DrawObject == null) { error = "目标没有模型"; return null; }
         if(native->DrawObject->Object.GetObjectType() != ObjectType.CharacterBase) { error = "目标不是角色"; return null; }

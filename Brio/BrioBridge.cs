@@ -285,6 +285,17 @@ public sealed class BrioBridge
         return float.IsFinite(effective);
     }
 
+    /// <summary>
+    /// Whether Brio has an animation applied to the actor (ActionTimelineCapability.HasBaseOverride): set by
+    /// "Play" / "Play all Animations", cleared by "Stop" / "Stop all Animations". Null when unreadable.
+    /// </summary>
+    public bool? HasBaseOverride(AnimationActor actor)
+    {
+        var live = GetAnimationActor(actor.Address);
+        if(live == null || !ReferenceEquals(live.Capability, actor.Capability)) return null;
+        return Get(live.Capability, "HasBaseOverride") is bool b ? b : null;
+    }
+
     public bool WriteAnimationSpeed(AnimationActor actor, float? speedOverride, float nativeSpeed)
     {
         if(!TryAnimationSpeed(actor, out _, out _)) return false;

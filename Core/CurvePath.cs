@@ -119,6 +119,20 @@ public sealed class CurvePath
         return Factor((a + b) / 2);
     }
 
+    /// <summary>
+    /// Length factor of every control point. Bezier / poly points lie on the curve at parameter i; NURBS
+    /// control points do not, so the nearest point on the curve is used. A cyclic curve's point 0 is at 0.
+    /// </summary>
+    public double[] PointFactors()
+    {
+        var points = _spline.Points;
+        var result = new double[points.Count];
+        for(int i = 0; i < points.Count; i++)
+            result[i] = _spline.Type == SplineType.Nurbs ? Project(Vector3.Transform(points[i].Co, _matrix)) : Factor(i);
+        if(Cyclic && result.Length > 0 && _spline.Type != SplineType.Nurbs) result[0] = 0;
+        return result;
+    }
+
     /// <summary>Polyline for drawing, in world space.</summary>
     public List<Vector3> Polyline(int maxPoints = 512)
     {

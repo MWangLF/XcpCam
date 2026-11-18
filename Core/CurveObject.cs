@@ -16,6 +16,8 @@ public enum SplineType { Bezier, Nurbs, Poly }
 /// <summary>A Bezier triple (Co + absolute handles) or a NURBS/poly control point (Co + weight).</summary>
 public sealed class CurvePoint
 {
+    /// <summary>Identity kept through clones and topology edits (time anchors refer to it).</summary>
+    public Guid Id = Guid.NewGuid();
     public Vector3 Co, Left, Right;
     public CurveHandle LeftType = CurveHandle.Auto, RightType = CurveHandle.Auto;
     public float W = 1, Tilt, Radius = 1;

@@ -64,6 +64,13 @@ public sealed class MainWindow : Window, IDisposable
     private long _clockEpoch;
     private bool _wasGpose;
     private AnimationIdentity _lastAnimationIdentity;
+    /// <summary>Character whose animation bar drives the timeline; empty = the current GPose target.</summary>
+    private string _animActorName = "";
+    private int _animActorIndex = -1;
+    /// <summary>Brio's "animation applied" state of the bound character in the previous tick.</summary>
+    private bool? _lastBaseOverride;
+
+    private Dalamud.Game.ClientState.Objects.Types.IGameObject? BoundActor() => _bones.Resolve(_animActorName, ref _animActorIndex);
 
     private static readonly string[] SourceNames = ["灵动时间轴", "动画进度条"];
 
@@ -86,7 +93,7 @@ public sealed class MainWindow : Window, IDisposable
         _log = log;
         _brio = brio;
         _overlay = overlay;
-        _anim = new AnimationClock(targets);
+        _anim = new AnimationClock(BoundActor);
         _animationSpeed = new AnimationSpeedLease(brio);
         _sync = new TimelineSync(brio, log)
         {
@@ -102,6 +109,7 @@ public sealed class MainWindow : Window, IDisposable
         overlay.ShowLabels = config.ShowLabels; overlay.SpeedColors = config.SpeedColors; overlay.FrustumSize = config.FrustumSize;
         _tlw.BeforeTrackEdit = _tl.Snapshot;
         _curveTool = new CurveTool(_tl, overlay, _gizmo, ShotFor, n => WriteNodePose(n, true, false, false), SetStatus);
+        _tlw.Curves = _curveTool;
         _constraints = new ConstraintPanel(_tl, bones, SetStatus, StartRecording, () => _recording != null, StopRecording);
         Size = new Vector2(900, 600);
         SizeCondition = ImGuiCond.FirstUseEver;
@@ -255,6 +263,39 @@ public sealed class MainWindow : Window, IDisposable
         else _animationLoop = loop;
     }
 
+    /// <summary>Which character's animation bar drives the timeline. Brio's "all actors" play / freeze / stop
+    /// act on every character; the timeline follows this one only.</summary>
+    private void DrawAnimationActorPicker()
+    {
+        string label = string.IsNullOrEmpty(_animActorName)
+            ? $"当前 GPose 目标{(_targets.GPoseTarget is { } t ? $"（{t.Name.TextValue}）" : "")}" : _animActorName;
+        ImGui.SetNextItemWidth(260);
+        if(ImGui.BeginCombo("绑定角色", label))
+        {
+            if(ImGui.Selectable("当前 GPose 目标", string.IsNullOrEmpty(_animActorName))) SetAnimationActor("", -1);
+            foreach(var (index, name) in _bones.Characters())
+                if(ImGui.Selectable($"{name}##{index}", _animActorName == name && _animActorIndex == index)) SetAnimationActor(name, index);
+            ImGui.EndCombo();
+        }
+        if(ImGui.IsItemHovered())
+            ImGui.SetTooltip("相机时间轴跟随这个角色的动画进度。\nBrio 的「播放 / 冻结 / 解冻 / 停止所有动画」作用于所有角色时，以这个角色为准。");
+    }
+
+    private void SetAnimationActor(string name, int index)
+    {
+        if(name == _animActorName && index == _animActorIndex) return;
+        if(_sync.Bound) _sync.Unbind();
+        ReleaseAnimFreeze();
+        _anim.Reset();
+        _lastAnimationIdentity = default;
+        _lastBaseOverride = null;
+        _transportOwned = false;
+        _playing = false;
+        _clockEpoch++;
+        _animActorName = name; _animActorIndex = index;
+        SetStatus($"动画进度条已改为绑定「{(name.Length > 0 ? name : "当前 GPose 目标")}」", false);
+    }
+
     private void SetSource(BindSource s)
     {
         if(s == _source) return;
@@ -262,6 +303,7 @@ public sealed class MainWindow : Window, IDisposable
         ReleaseAnimFreeze();
         _anim.Reset();
         _lastAnimationIdentity = default;
+        _lastBaseOverride = null;
         _transportOwned = false;
         _playing = false;
         _clockEpoch++;
@@ -299,6 +341,7 @@ public sealed class MainWindow : Window, IDisposable
                 ReleaseAnimFreeze();
                 _anim.Reset();
                 _lastAnimationIdentity = default;
+                _lastBaseOverride = null;
                 _transportOwned = false;
                 _clockEpoch++;
                 if(_sync.Bound) _sync.Unbind();
@@ -311,20 +354,45 @@ public sealed class MainWindow : Window, IDisposable
 
         if(_source == BindSource.Animation)
         {
-            bool owned = _animationSpeed.Active;
-            bool stillOwned = owned && _animationSpeed.OwnsCurrentValue();
-            if(owned && !stillOwned) _transportOwned = false;
+            // An external speed edit (Brio freeze / un-freeze, also "all actors") ends only our speed lease; the
+            // timeline keeps following the animation, so it pauses and resumes with it.
+            if(_animationSpeed.Active) _animationSpeed.OwnsCurrentValue();
             bool mayAdvance = true;
-            var actor = _targets.GPoseTarget == null ? null : _brio.GetAnimationActor(_targets.GPoseTarget.Address);
-            if(actor != null && _brio.TryAnimationSpeed(actor, out _, out float speed)) mayAdvance = speed > 0;
+            bool? baseOverride = null;
+            var bound = BoundActor();
+            var actor = bound == null ? null : _brio.GetAnimationActor(bound.Address);
+            if(actor != null)
+            {
+                if(_brio.TryAnimationSpeed(actor, out _, out float speed)) mayAdvance = speed > 0;
+                baseOverride = _brio.HasBaseOverride(actor);
+            }
             _anim.Update(dt, _animationLoop, mayAdvance);
             if(_lastAnimationIdentity != default && (!_anim.Available || _lastAnimationIdentity != _anim.Sample.Identity))
             {
                 ReleaseAnimFreeze();
-                _transportOwned = false;
                 _clockEpoch++;
+                if(_anim.Available && baseOverride == true)
+                {
+                    // Brio "Play all Animations" / Play restarted the bound character's animation: follow it from its start
+                    _transportOwned = true;
+                }
+                else
+                {
+                    _transportOwned = false;
+                    if(baseOverride == false && _lastBaseOverride == true)
+                    {
+                        // Brio "Stop all Animations" / Stop: back to the start, ready to play again
+                        _playing = false;
+                        _tl.Playhead = 0;
+                        SetStatus("Brio 已停止动画，相机时间轴回到第 0 帧。", false);
+                    }
+                }
             }
+            // the bound character's animation started moving (Brio play / un-freeze): the timeline follows it
+            else if(!_transportOwned && baseOverride == true && _anim.IsPlaying)
+                _transportOwned = true;
             _lastAnimationIdentity = _anim.Available ? _anim.Sample.Identity : default;
+            if(baseOverride != null) _lastBaseOverride = baseOverride;
             if(_anim.MustFreeze)
             {
                 if(_animationSpeed.Pause(_anim.Sample.Identity.Actor) && _anim.FreezeAtEnd())
@@ -396,10 +464,10 @@ public sealed class MainWindow : Window, IDisposable
 
     // ------------------------------------------------------------------ overlay (drawn in OverlayWindow)
 
-    private bool GizmoBusy => _gizmo.Enabled && (_curveTool.Active ? _curveTool.HasGizmoTarget : Selected != null || _tl.SelectedNodes.Count > 1)
+    private bool GizmoBusy => _gizmo.Enabled && (_curveTool.OwnsGizmo ? _curveTool.HasGizmoTarget : Selected != null || _tl.SelectedNodes.Count > 1)
         && (_gizmo.IsOver || _gizmo.IsUsing);
     // the overlay only takes the mouse over the gizmo or a pickable node / curve point, so the game camera keeps working elsewhere
-    public bool OverlayWantsInput => GizmoBusy || _hoverNode != null || _curveTool.Hover != null;
+    public bool OverlayWantsInput => GizmoBusy || _hoverNode != null || _curveTool.Hover != null || _curveTool.HoverFollow != null;
     private Keyframe? _hoverNode;
     private bool _overlayFocused;
 
@@ -419,14 +487,123 @@ public sealed class MainWindow : Window, IDisposable
         if(frame == _deleteFrame) return;
         _deleteFrame = frame;
         bool foreground = Win32.GameIsForeground();
-        bool down = foreground && (Win32.GetAsyncKeyState(0x2E) & 0x8000) != 0; // VK_DELETE
-        if(down && !_deleteWasDown)
+        static bool Down(int vk) => (Win32.GetAsyncKeyState(vk) & 0x8000) != 0;
+        bool down = foreground && Down(0x2E); // VK_DELETE
+        bool alt = foreground && Down(0x12);  // VK_MENU
+        bool altT = alt && Down(0x54), altC = alt && Down(0x43);
+        bool accepted = !(ImGui.IsWindowFocused(ImGuiFocusedFlags.AnyWindow) && !_mainFocused && !_overlayFocused)
+            && !ImGui.GetIO().WantTextInput;
+        // Delete removes the selected curve points when they were the last selection, otherwise camera nodes
+        if(down && !_deleteWasDown && accepted && !_curveTool.DeleteSelected()) DeleteSelectedNodes();
+        // Alt+T / Alt+C anchor the selected points' curve (always the whole curve) to the timeline / the camera
+        if(altT && !_altTWasDown && accepted && _curveTool.SelectedPoints().Count > 0) AnchorSelectedCurve(true);
+        if(altC && !_altCWasDown && accepted && _curveTool.SelectedPoints().Count > 0) AnchorSelectedCurve(false);
+        _deleteWasDown = down; _altTWasDown = altT; _altCWasDown = altC;
+    }
+    private bool _altTWasDown, _altCWasDown;
+
+    private void AnchorSelectedCurve(bool timeline)
+    {
+        if(_curveTool.AnchorTrack is not { } track) { SetStatus("所选曲线没有被镜头轨道跟随，无法锚定。", true); return; }
+        if(_tl.AnchorCurve(track, timeline))
+            SetStatus($"已将「{track.FollowCurve?.Name}」整条曲线锚定到{(timeline ? "时间轴（按镜头当前经过的帧）" : "镜头")}。" + (timeline ? CamTimeline.TimelineAnchorNotice : ""), false);
+        else if(timeline && !CamTimeline.CurveAnchoredToTimeline(track)) SetStatus("镜头没有经过这条曲线的任何节点，无法锚定时间轴。", true);
+        else SetStatus($"这条曲线已经是锚定{(timeline ? "时间轴" : "镜头")}。", false);
+    }
+
+    /// <summary>Anchor mode of the whole followed curve (anchoring is per curve, never per point).</summary>
+    private void DrawCurveAnchorMode(CamTrack track)
+    {
+        bool anchored = CamTimeline.CurveAnchoredToTimeline(track);
+        int mode = anchored ? 1 : 0;
+        const string note = "锚定作用于整条曲线的全部节点。快捷键：Alt+T 锚定时间轴（按镜头当前经过的帧），Alt+C 锚定镜头。";
+        if(ImGui.RadioButton("整条曲线锚定镜头", ref mode, 0) && anchored) AnchorSelectedCurve(false);
+        if(ImGui.IsItemHovered()) ImGui.SetTooltip("曲线节点落在镜头经过它们的帧，随镜头关键帧移动。\n" + note);
+        ImGui.SameLine();
+        if(ImGui.RadioButton("整条曲线锚定时间轴", ref mode, 1) && !anchored) AnchorSelectedCurve(true);
+        if(ImGui.IsItemHovered())
+            ImGui.SetTooltip("曲线节点固定在时间轴的帧上，镜头在每个锚点帧精确经过对应节点；\n锚点帧决定节点之间的时间（首末锚点即 0% 和 100%），可以单独修改某个节点的帧。\n" + CamTimeline.TimelineAnchorNotice + "\n" + note);
+    }
+
+    /// <summary>Inspector for curve points selected on a following track's lane or in the game view.</summary>
+    private void DrawCurvePointInspector(CurveObject curve, System.Collections.Generic.List<(int spline, int index, CurvePoint point)> points)
+    {
+        var track = _curveTool.AnchorTrack;
+        var times = (track?.Shots.FirstOrDefault()?.CurvePointTimes() ?? []).GroupBy(t => t.Id).ToDictionary(g => g.Key, g => g.First());
+        double? FrameOf(Guid id) => track?.FollowPath?.TimeAnchors.TryGetValue(id, out double f) == true ? f
+            : times.TryGetValue(id, out var t) ? t.Frame : null;
+
+        if(points.Count == 1)
         {
-            bool otherFocused = ImGui.IsWindowFocused(ImGuiFocusedFlags.AnyWindow) && !_mainFocused && !_overlayFocused;
-            // in curve edit mode Delete removes the selected control points instead of camera nodes
-            if(!otherFocused && !ImGui.GetIO().WantTextInput && !_curveTool.DeleteSelected()) DeleteSelectedNodes();
+            var (si, index, point) = points[0];
+            ImGui.Text($"{curve.Name} · P{index + 1}");
+            if(track?.FollowPath == null)
+                ImGui.TextDisabled("这条曲线没有被镜头轨道跟随，无法锚定。");
+            else
+            {
+                bool anchored = CamTimeline.CurveAnchoredToTimeline(track);
+                ImGui.SameLine();
+                DrawCurveAnchorMode(track);
+                if(FrameOf(point.Id) is double frame)
+                {
+                    double f = frame;
+                    ImGui.SetNextItemWidth(110);
+                    if(ImGui.InputDouble("所在帧##curvepoint", ref f, 1, 10, "%.3f")) _tl.SetCurvePointAnchor(track, point.Id, f);
+                    if(ImGui.IsItemHovered()) ImGui.SetTooltip(anchored ? "锚定时间轴的帧：镜头在这一帧精确经过这个节点。" : "镜头经过这个节点的帧。修改它会把整条曲线改为锚定时间轴。");
+                    if(times.TryGetValue(point.Id, out var t))
+                    {
+                        ImGui.SameLine();
+                        ImGui.TextDisabled($"路径进度 {t.Factor * 100:0.00}%");
+                    }
+                    ImGui.SameLine();
+                    if(ImGui.Button("跳到此帧##curvepoint")) SeekPlayhead((float)f);
+                    if(track.FollowPath!.LoopEndFrame is double loopEnd && index == 0 && anchored)
+                    {
+                        // a closed loop's start point is reached again at 100 %
+                        double e = loopEnd;
+                        ImGui.SetNextItemWidth(110);
+                        if(ImGui.InputDouble("回到起点帧 (100%)##curvepoint", ref e, 1, 10, "%.3f")) _tl.SetCurvePointAnchor(track, point.Id, e, loopEnd: true);
+                        if(ImGui.IsItemHovered()) ImGui.SetTooltip("闭合曲线绕完一圈回到起点 P1 的帧。");
+                        ImGui.SameLine();
+                        if(ImGui.Button("跳到此帧##loopend")) SeekPlayhead((float)loopEnd);
+                    }
+                }
+                else ImGui.TextColored(new Vector4(1, 0.7f, 0.3f, 1), "镜头从未经过这个曲线节点（在跟随范围之外，或镜头节点不足 2 个）。");
+            }
+
+            var world = curve.ToWorld(point.Co);
+            ImGui.SetNextItemWidth(260);
+            bool moved = ImGui.DragFloat3("位置 (世界坐标, 米)##curvepoint", ref world, 0.01f);
+            if(ImGui.IsItemActivated()) _tl.Snapshot();
+            if(moved) { CurveEdit.MovePoint(curve.Splines[si], index, curve.ToLocal(world)); curve.Touch(); _tl.Touch(); }
+            if(curve.Splines[si].Type == SplineType.Bezier) _curveTool.DrawHandleTypeControl();
+            _curveTool.DrawPointProperties(curve, [point]);
+            if(ImGui.Button("取消选择##curvepoint")) _curveTool.ClearSelection();
+            return;
         }
-        _deleteWasDown = down;
+
+        ImGui.Text($"{curve.Name} · 曲线节点组合 · {points.Count} 个节点");
+        var frames = points.Select(p => FrameOf(p.point.Id)).OfType<double>().ToList();
+        if(frames.Count > 0)
+        {
+            ImGui.SameLine();
+            ImGui.TextDisabled($"F{Math.Round(frames.Min())}–F{Math.Round(frames.Max())}" + (frames.Count < points.Count ? $"（{points.Count - frames.Count} 个镜头未经过）" : ""));
+        }
+        var center = points.Aggregate(Vector3.Zero, (sum, p) => sum + curve.ToWorld(p.point.Co)) / points.Count;
+        var pos = center;
+        ImGui.SetNextItemWidth(260);
+        bool changed = ImGui.DragFloat3("组合中心位置 (米)##curvepoints", ref pos, 0.01f);
+        if(ImGui.IsItemActivated()) _tl.Snapshot();
+        if(changed)
+        {
+            var delta = pos - center;
+            foreach(var (si, index, point) in points) CurveEdit.MovePoint(curve.Splines[si], index, curve.ToLocal(curve.ToWorld(point.Co) + delta));
+            curve.Touch(); _tl.Touch();
+        }
+        _curveTool.DrawPointProperties(curve, points.Select(p => p.point).ToList());
+        if(track != null) { DrawCurveAnchorMode(track); ImGui.SameLine(); }
+        else { ImGui.TextDisabled("这条曲线没有被镜头轨道跟随，无法锚定。"); ImGui.SameLine(); }
+        if(ImGui.Button("取消选择##curvepoints")) _curveTool.ClearSelection();
     }
 
     private void PickNodeInOverlay()
@@ -434,22 +611,43 @@ public sealed class MainWindow : Window, IDisposable
         // picking a node focuses the overlay window; that still counts as "the game view has focus" for Delete
         _overlayFocused = ImGui.IsWindowFocused();
         HandleDeleteKey();
-        _hoverNode = null; _curveTool.Hover = null;
+        _hoverNode = null; _curveTool.Hover = null; _curveTool.HoverFollow = null;
         bool blank = PickNodeUnderMouse(out var at);
         TrackBlankClick(blank);
+        // act only once the overlay actually owns the mouse, so the click never also reaches the game
+        bool clicked = ImGui.IsWindowHovered() && ImGui.IsMouseClicked(ImGuiMouseButton.Left);
         if(_curveTool.Hover is { } part)
         {
             ImGui.GetBackgroundDrawList().AddCircle(at, 10, 0xFFFFFFFF, 16, 2f);
             ImGui.SetTooltip(part.Spline < 0 ? "物体模式：用变换手柄整体移动/旋转/缩放曲线"
                 : part.Part == CurvePart.Point ? "单击选中控制点，Ctrl+单击加选 / 取消" : "单击选中手柄，Ctrl+单击加选 / 取消");
-            if(ImGui.IsWindowHovered() && ImGui.IsMouseClicked(ImGuiMouseButton.Left)) _curveTool.Click(part, ImGui.GetIO().KeyCtrl);
+            if(clicked)
+            {
+                _curveTool.Click(part, ImGui.GetIO().KeyCtrl);
+                // a user curve's points replace the camera node selection (node path points are camera nodes)
+                if(_curveTool.Curve != null) { _tl.SelectNodes([]); Selected = null; }
+            }
+            return;
+        }
+        if(_curveTool.HoverFollow is int point)
+        {
+            ImGui.GetBackgroundDrawList().AddCircle(at, 10, 0xFFFFFFFF, 16, 2f);
+            var track = _tl.ActiveTrack;
+            bool anchored = track.FollowCurve?.PathSpline is { } spline && point < spline.Points.Count
+                && track.FollowPath!.TimeAnchors.ContainsKey(spline.Points[point].Id);
+            ImGui.SetTooltip($"{track.FollowCurve?.Name} · P{point + 1}（{(anchored ? "锚定时间轴" : "锚定镜头")}）\n单击选中曲线节点，Ctrl+单击加选 / 取消");
+            if(clicked)
+            {
+                _curveTool.SelectFollowedPoint(track, point, ImGui.GetIO().KeyCtrl);
+                _tl.SelectNodes([]); Selected = null;
+            }
             return;
         }
         if(_hoverNode is not { } k) return;
         ImGui.GetBackgroundDrawList().AddCircle(at, 10, 0xFFFFFFFF, 16, 2f);
         ImGui.SetTooltip("单击选中镜头节点，Ctrl+单击加选 / 取消");
-        // act only once the overlay actually owns the mouse, so the click never also reaches the game
-        if(!ImGui.IsWindowHovered() || !ImGui.IsMouseClicked(ImGuiMouseButton.Left)) return;
+        if(!clicked) return;
+        _curveTool.ClearSelection(); // camera nodes replace the curve point selection
         if(ImGui.GetIO().KeyCtrl)
         {
             if(_tl.SelectedNodes.Count == 0 && Selected is { } primary) _tl.SelectNodes([primary.Id]);
@@ -470,22 +668,23 @@ public sealed class MainWindow : Window, IDisposable
         if(ImGui.IsWindowHovered(ImGuiHoveredFlags.AnyWindow) && !ImGui.IsWindowHovered()) return false;
         var mouse = ImGui.GetIO().MousePos;
         float best = 12f * 12f;
-        if(_curveTool.Active)
+        // camera nodes, the followed curve's points and the curve edit cage are picked together: nearest wins
+        foreach(var (part, screen) in _curveTool.Candidates)
         {
-            // curve editing: control points and handles are picked instead of camera nodes
-            foreach(var (part, screen) in _curveTool.Candidates)
-            {
-                float d = Vector2.DistanceSquared(screen, mouse);
-                if(d <= best) { best = d; _curveTool.Hover = part; at = screen; }
-            }
-            return _curveTool.Hover == null;
+            float d = Vector2.DistanceSquared(screen, mouse);
+            if(d <= best) { best = d; _curveTool.Hover = part; at = screen; }
+        }
+        foreach(var (point, screen) in _curveTool.FollowCandidates)
+        {
+            float d = Vector2.DistanceSquared(screen, mouse);
+            if(d < best) { best = d; _curveTool.Hover = null; _curveTool.HoverFollow = point; at = screen; }
         }
         foreach(var (key, screen) in _overlay.NodeScreens)
         {
             float d = Vector2.DistanceSquared(screen, mouse);
-            if(d <= best) { best = d; _hoverNode = key; at = screen; }
+            if(d < best) { best = d; _curveTool.Hover = null; _curveTool.HoverFollow = null; _hoverNode = key; at = screen; }
         }
-        return _hoverNode == null;
+        return _hoverNode == null && _curveTool.Hover == null && _curveTool.HoverFollow == null;
     }
 
     private bool _lmbWasDown;
@@ -505,8 +704,8 @@ public sealed class MainWindow : Window, IDisposable
             if(dx * dx + dy * dy > 16) _blankPress = null;
             else if(!down)
             {
-                if(_curveTool.Active) _curveTool.ClearSelection();
-                else { _tl.SelectNodes([]); Selected = null; }
+                _curveTool.ClearSelection();
+                _tl.SelectNodes([]); Selected = null;
                 _blankPress = null;
             }
         }
@@ -535,9 +734,9 @@ public sealed class MainWindow : Window, IDisposable
         _overlay.Draw(_comp, _tl, previewFrame, syncFrame, Selected);
         if(_clientState.IsGPosing) _curveTool.DrawScene();
         PickNodeInOverlay();
-        if(_curveTool.Active)
+        if(_curveTool.OwnsGizmo)
         {
-            // the gizmo edits curves (points / handles / whole curve) instead of camera nodes
+            // the last selection was curve points / handles (or a curve in object mode): the gizmo edits the curve
             if(_clientState.IsGPosing) _curveTool.DrawGizmo();
             return;
         }
@@ -811,9 +1010,24 @@ public sealed class MainWindow : Window, IDisposable
         try
         {
             shot.WritePose(node, new XcpFrame(node.Pos, node.Rot, node.Fov), position, rotation, fov, _tl.PathInfluence);
+            // timeline-anchored curve: moving a node along the curve changes its frame instead of its progress
+            if(shot.RequestedFrame is int requested) MoveNodeToFrame(node, requested);
             _tl.Touch();
         }
         catch(InvalidOperationException ex) { RefreshNodePose(node); SetStatus(ex.Message, true); }
+    }
+
+    /// <summary>Moves a node towards <paramref name="frame"/>, staying strictly between its neighbours and on a free frame.</summary>
+    private void MoveNodeToFrame(Keyframe node, int frame)
+    {
+        if(_tl.TrackOf(node) is not { } owner || frame == node.Frame) return;
+        int previous = owner.Keys.Where(n => n.Frame < node.Frame).Select(n => n.Frame).DefaultIfEmpty(-1).Max();
+        int next = owner.Keys.Where(n => n.Frame > node.Frame).Select(n => n.Frame).DefaultIfEmpty(_tl.Length + 1).Min();
+        if(next - previous < 2) return;
+        frame = Math.Clamp(frame, previous + 1, next - 1);
+        frame = _tl.NearestFreeFrame(frame, node, owner);
+        if(frame > previous && frame < next) _tl.MoveKey(node, frame);
+        RefreshNodePose(node);
     }
 
     private void DrawGraphTab()
@@ -1001,6 +1215,12 @@ public sealed class MainWindow : Window, IDisposable
 
     private void DrawInspector(bool gpose)
     {
+        // curve points were the last selection: show their values instead of a camera node's
+        if(_curveTool.OwnsGizmo && _curveTool.Curve is { } curve && _curveTool.SelectedPoints() is { Count: > 0 } points)
+        {
+            DrawCurvePointInspector(curve, points);
+            return;
+        }
         var k = Selected;
         if(k == null)
         {
@@ -1062,9 +1282,19 @@ public sealed class MainWindow : Window, IDisposable
             ImGui.SetNextItemWidth(160);
             bool factorChanged = ImGui.DragFloat("路径进度 (%)", ref percent, 0.1f, 0f, 100f, "%.2f");
             if(ImGui.IsItemActivated()) _tl.Snapshot();
-            if(factorChanged && followShot.SetNodeFactor(k, percent / 100.0)) { RefreshNodePose(k); _tl.Touch(); }
+            if(factorChanged)
+            {
+                if(followShot.UsesTimeAnchors)
+                {
+                    // progress follows the timeline anchors: a new progress means a new frame
+                    if(followShot.SetAnchoredNodeFactor(k, percent / 100.0) is double target) { MoveNodeToFrame(k, (int)Math.Round(target)); _tl.Touch(); }
+                }
+                else if(followShot.SetNodeFactor(k, percent / 100.0)) { RefreshNodePose(k); _tl.Touch(); }
+            }
             if(ImGui.IsItemHovered())
-                ImGui.SetTooltip("跟随路径：位置由节点在曲线上的进度决定，不受抓取时相机位置影响。\n默认首节点 0%、末节点 100%，其余按帧均分；手动修改或在游戏内沿曲线拖动后保持手动值。");
+                ImGui.SetTooltip(followShot.UsesTimeAnchors
+                    ? "跟随路径（锚定时间轴）：速度曲线与曲线节点的锚定帧同步。\n在曲线编辑器中调整速度会同步曲线节点帧；这里修改进度或在游戏内沿曲线拖动会改变镜头节点所在的帧。"
+                    : "跟随路径：位置由节点在曲线上的进度决定，不受抓取时相机位置影响。\n默认首节点 0%、末节点 100%，其余按帧均分；手动修改或在游戏内沿曲线拖动后保持手动值。");
         }
         var pos = k.Pos;
         bool positionChanged = false;
@@ -1172,20 +1402,20 @@ public sealed class MainWindow : Window, IDisposable
         if(ImGui.IsItemHovered()) ImGui.SetTooltip("选中一个镜头节点后，在游戏画面中该镜头处显示手柄，可直接拖动移动/旋转。");
         ImGui.BeginDisabled(!_gizmo.Enabled);
         ImGui.SameLine();
-        int target = _curveTool.Active ? 1 : 0;
-        ImGui.SetNextItemWidth(70);
-        if(ImGui.Combo("##gizmotarget", ref target, "节点\0曲线\0")) { _curveTool.Active = target == 1; _curveTool.ClearSelection(); }
-        if(ImGui.IsItemHovered()) ImGui.SetTooltip("变换手柄作用对象：镜头节点，或曲线（控制点、贝塞尔曲率手柄、整条曲线；详见「曲线」页）。");
+        bool curveTarget = _curveTool.OwnsGizmo;
+        ImGui.TextDisabled(curveTarget ? "作用于：曲线" : "作用于：镜头节点");
+        if(ImGui.IsItemHovered())
+            ImGui.SetTooltip("变换手柄作用于最后选择的对象：镜头节点，或曲线节点 / 贝塞尔手柄 / 整条曲线（物体模式）。\n在游戏内或时间轴上点选即可切换，无需手动切换模式。");
         ImGui.SameLine();
         int op = (int)_gizmo.Operation;
         if(ImGui.RadioButton("移动", ref op, 0)) _gizmo.Operation = GizmoEditor.Op.Translate;
         ImGui.SameLine();
-        bool rotateLocked = !_curveTool.Active && Selected is { } locked && RotationLocked(locked);
+        bool rotateLocked = !curveTarget && Selected is { } locked && RotationLocked(locked);
         ImGui.BeginDisabled(rotateLocked);
         if(ImGui.RadioButton("旋转", ref op, 1)) _gizmo.Operation = GizmoEditor.Op.Rotate;
         ImGui.EndDisabled();
         if(rotateLocked && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled)) ImGui.SetTooltip("所选节点的旋转由追踪约束控制。");
-        if(_curveTool.Active)
+        if(curveTarget)
         {
             ImGui.SameLine();
             if(ImGui.RadioButton("缩放", ref op, 2)) _gizmo.Operation = GizmoEditor.Op.Scale;
@@ -1297,12 +1527,13 @@ public sealed class MainWindow : Window, IDisposable
         if(ImGui.IsItemHovered()) ImGui.SetTooltip("Brio 的灵动时间轴（Vivacity）。帧率可跟随 Brio。");
         ImGui.SameLine();
         if(ImGui.RadioButton("动画进度条", ref src, (int)BindSource.Animation)) SetSource(BindSource.Animation);
-        if(ImGui.IsItemHovered()) ImGui.SetTooltip("GPose 目标当前动画的进度（即 Brio 动画面板里的 Animation Scruber）。\n相机时间轴第 0 帧 = 动画第 0 秒。");
+        if(ImGui.IsItemHovered()) ImGui.SetTooltip("所选角色（默认 GPose 目标）当前动画的进度（即 Brio 动画面板里的 Animation Scruber）。\n相机时间轴第 0 帧 = 动画第 0 秒。Brio 播放 / 冻结 / 解冻 / 停止动画时，相机时间轴跟着播放、暂停、回到开头。");
 
+        if(_source == BindSource.Animation) DrawAnimationActorPicker();
         if(_source == BindSource.Vivacity)
             ImGui.TextDisabled($"Brio 灵动时间轴：{(_brio.TimelineIsPlaying ? "播放中" : "已停止")}  第 {_brio.TimelineTime:0} 帧 / {_brio.FrameMax}  @ {_brio.TimelineFps}fps");
         else if(_anim.Available)
-            ImGui.TextDisabled($"目标「{_targets.GPoseTarget?.Name.TextValue}」动画：{(_anim.IsPlaying ? "播放中" : "已暂停")}  {_anim.Time:0.00}s / {_anim.Duration:0.00}s  ≈ 第 {_anim.Time * _tl.Fps:0} 帧 / {_anim.Duration * _tl.Fps:0}（{_tl.Fps}fps）");
+            ImGui.TextDisabled($"「{BoundActor()?.Name.TextValue}」动画：{(_anim.IsPlaying ? "播放中" : "已暂停")}  {_anim.Time:0.00}s / {_anim.Duration:0.00}s  ≈ 第 {_anim.Time * _tl.Fps:0} 帧 / {_anim.Duration * _tl.Fps:0}（{_tl.Fps}fps）");
         else
             ImGui.TextColored(new Vector4(1, 0.7f, 0.3f, 1), $"动画进度条不可用：{_anim.Status}");
 
@@ -1471,7 +1702,7 @@ public sealed class MainWindow : Window, IDisposable
         }
         k.Frame = frame;
         EnsureLength(k.Frame);
-        _tl.Keys.Add(k);
+        _tl.AddCapturedNode(k, snapshot: false);
         if(_tl.ActiveTrack.FollowPath != null) ApplyCapture(k);
         Selected = k;
         SetStatus($"已在「{_tl.ActiveTrack.Name}」第 {frame} 帧添加节点 {_tl.Keys.Count}", false);
@@ -1515,7 +1746,7 @@ public sealed class MainWindow : Window, IDisposable
         _tl.Snapshot();
         k.Frame = _tl.Keys.Count == 0 ? (int)MathF.Round(_tl.Playhead) : CamTimeline.TrackLastFrame(_tl.ActiveTrack) + _defaultGapFrames;
         EnsureLength(k.Frame);
-        _tl.Keys.Add(k);
+        _tl.AddCapturedNode(k, snapshot: false);
         if(_tl.ActiveTrack.FollowPath != null) ApplyCapture(k);
         Selected = k;
         _tl.Playhead = k.Frame;
@@ -1568,8 +1799,8 @@ public sealed class MainWindow : Window, IDisposable
 
     /// <summary>
     /// Writes a captured camera into a node. On a track with a Follow Path constraint only rotation and FoV come
-    /// from the camera: the position is the node's factor along the curve (first node 0 %, last 100 %, the rest
-    /// spread by frame), so the player camera position is ignored. Values driven by tracking constraints
+    /// from the camera: inserted nodes inherit the current path progress and offset; nodes outside the shot
+    /// use the automatic endpoint rules. The player camera position is ignored. Values driven by tracking constraints
     /// (rotation, and FoV with Keep Framing) are not written either.
     /// </summary>
     private void ApplyCapture(Keyframe node)

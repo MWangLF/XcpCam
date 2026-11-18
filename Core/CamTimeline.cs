@@ -202,6 +202,68 @@ public sealed class CamTimeline
     public bool IsFrameFree(int frame, Keyframe? except = null, CamTrack? track = null)
         => !TrackFor(except, track).Keys.Any(k => k != except && k.Frame == frame);
 
+    public const string TimelineAnchorNotice = "锚点保留小数帧。编辑速度曲线会同步曲线节点的经过帧；拖动曲线节点则按新锚点重新定时。切换锚定或编辑时间会改变速度，部分镜头位置可能变化；可撤销。";
+
+    /// <summary>Whether the followed curve of a track is anchored to the timeline (otherwise to the camera).</summary>
+    public static bool CurveAnchoredToTimeline(CamTrack track) => track.FollowPath is { } follow && (follow.EditorTiming || follow.TimeAnchors.Count > 0);
+
+    /// <summary>
+    /// Anchors the whole followed curve of a track: to the timeline (every point at the frame the camera
+    /// currently reaches it, plus a closed loop's return to its start point; points it never reaches stay
+    /// unanchored) or back to the camera. Anchoring is per curve, never per point. Returns false when nothing
+    /// changed; undoable.
+    /// </summary>
+    public bool AnchorCurve(CamTrack track, bool timeline, bool snapshot = true)
+    {
+        if(track.FollowPath is not { } follow || track.FollowCurve?.PathSpline is not { } spline) return false;
+        if(CurveAnchoredToTimeline(track) == timeline) return false;
+        var anchors = new Dictionary<Guid, double>();
+        double? loopEnd = null;
+        double Clamp(double frame) => Math.Clamp(frame, 0, Math.Max(0, Length));
+        if(timeline)
+        {
+            var times = track.Shots.FirstOrDefault()?.CurvePointTimes() ?? [];
+            foreach(var t in times)
+                if(!t.Repeat && t.Frame is double frame) anchors[t.Id] = Clamp(frame);
+            if(anchors.Count == 0) return false;
+            if(spline.Cyclic && times.FirstOrDefault(t => t.Repeat && t.Index == 0) is { Frame: double end })
+                loopEnd = Clamp(end);
+        }
+        if(snapshot) Snapshot();
+        follow.EditorTiming = false;
+        follow.TimeAnchors = anchors;
+        follow.LoopEndFrame = loopEnd;
+        Touch();
+        return true;
+    }
+
+    /// <summary>Sets one curve point's anchor frame (<paramref name="loopEnd"/>: a closed curve's return to
+    /// its start point); a camera-anchored curve is anchored to the timeline as a whole first.</summary>
+    public void SetCurvePointAnchor(CamTrack track, Guid point, double frame, bool snapshot = true, bool loopEnd = false)
+    {
+        if(track.FollowPath is not { } follow || !double.IsFinite(frame)) return;
+        frame = Math.Clamp(frame, 0, Math.Max(0, Length));
+        if(loopEnd ? follow.LoopEndFrame == frame : follow.TimeAnchors.TryGetValue(point, out double old) && old == frame) return;
+        if(snapshot) Snapshot();
+        if(!CurveAnchoredToTimeline(track)) AnchorCurve(track, true, snapshot: false);
+        follow.EditorTiming = false;
+        if(loopEnd) follow.LoopEndFrame = frame; else follow.TimeAnchors[point] = frame;
+        Touch();
+    }
+
+    /// <summary>Commits a graph edit in the caller's existing undo snapshot. Keep the curve timeline-anchored,
+    /// but let the edited timing drive its crossing frames instead of feeding old anchors back into it.</summary>
+    public bool SyncCurveAnchorsFromEditor(ShotCurves shot)
+    {
+        var track = Tracks.FirstOrDefault(t => t.Shots.Contains(shot));
+        if(track?.FollowPath is not { } follow || !CurveAnchoredToTimeline(track)) return false;
+        follow.EditorTiming = true;
+        foreach(var key in shot.PathProgress.Keys) if(key.NodeId is Guid id) shot.MarkFactorManual(id);
+        CurveModel.Ensure(track, Fps);
+        Touch();
+        return true;
+    }
+
     /// <summary>Nearest free frame to <paramref name="frame"/> in the track (searching outwards), within [0, Length].</summary>
     public int NearestFreeFrame(int frame, Keyframe? except = null, CamTrack? track = null)
     {
@@ -277,6 +339,26 @@ public sealed class CamTimeline
             foreach(var node in nodes) shot.Space.MarkTangentsDirty(node.Id, PathInfluence);
         Touch();
         return true;
+    }
+
+    /// <summary>Adds a captured camera. Inside a followed shot, split the existing motion first so the new
+    /// node inherits its current path progress and offset; the capture still supplies rotation and FoV.</summary>
+    public void AddCapturedNode(Keyframe node, bool snapshot = true)
+    {
+        var track = ActiveTrack;
+        if(track.Keys.Any(k => k.Frame == node.Frame)) throw new InvalidOperationException("这一帧已经有镜头节点。");
+        CurveModel.Ensure(track, Fps);
+        if(snapshot) Snapshot();
+        if(track.FollowPath != null && !node.CutIn && track.Shots.FirstOrDefault(s =>
+            s.Intervals.Any(i => node.Frame > i.Start && node.Frame < i.End)) is { } shot)
+        {
+            var rotation = node.Rot; float fov = node.Fov;
+            shot.InsertNode(node);
+            node.Rot = rotation; node.Fov = fov;
+        }
+        track.Keys.Add(node);
+        CurveModel.Ensure(track, Fps);
+        Touch();
     }
 
     public Keyframe AddSampledNode(ShotCurves shot, int frame)

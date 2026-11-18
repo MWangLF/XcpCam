@@ -59,12 +59,14 @@ public static class FollowPathTests
         tl.ActiveTrack.FollowPath!.FollowCurve = false;
         CurveModel.Ensure(tl.ActiveTrack, 30); shot = tl.ActiveTrack.Shots[0];
 
-        // moving a following node slides it along the curve
+        // moving a following node slides it along the curve; what the curve cannot reach becomes its offset
         var mid = tl.Keys[1];
         shot.WritePose(mid, new XcpFrame(new Vector3(10.5f, 3, 0), mid.Rot, mid.Fov), true, false, false);
         CurveModel.Ensure(tl.ActiveTrack, 30); shot = tl.ActiveTrack.Shots[0];
-        check(Math.Abs((shot.NodeFactor(mid) ?? 0) - .625) < 2e-3 && Vector3.Distance(shot.NodePose(mid).Pos, new Vector3(10.5f, 0, 0)) < 2e-3f,
-            "Follow Path: dragging a node projects it onto the curve");
+        check(Math.Abs((shot.NodeFactor(mid) ?? 0) - .625) < 2e-3 && Vector3.Distance(shot.NodePose(mid).Pos, new Vector3(10.5f, 3, 0)) < 2e-3f
+            && Math.Abs(shot.Offset[1].Keys.First(k => k.NodeId == mid.Id).Value - 3) < 2e-3,
+            "Follow Path: dragging a node slides it along the curve and keeps the height as its location offset");
+        shot.Offset[1].Keys.First(k => k.NodeId == mid.Id).Value = 0;
         var late = new Keyframe { Frame = 180, Pos = Vector3.Zero, Rot = yaw, Fov = .8f };
         tl.Keys.Add(late); CurveModel.Ensure(tl.ActiveTrack, 30); shot = tl.ActiveTrack.Shots[0];
         double kept = shot.NodeFactor(mid)!.Value;

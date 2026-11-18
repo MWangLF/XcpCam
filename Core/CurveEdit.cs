@@ -98,6 +98,7 @@ public static class CurveEdit
             if(dir.LengthSquared() < 1e-10f) dir = new Vector3(1, 0, 0);
         }
         var p = tip.Clone();
+        p.Id = Guid.NewGuid();
         p.Co = tip.Co + dir; p.Left = tip.Left + dir; p.Right = tip.Right + dir;
         int index = end == 0 ? 0 : s.Points.Count;
         s.Points.Insert(index, p);

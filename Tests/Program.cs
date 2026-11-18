@@ -22,6 +22,8 @@ XcpCam.Tests.PathInfluenceTests.Run(Check);
 XcpCam.Tests.NodeRangeTests.Run(Check);
 XcpCam.Tests.CurveObjectTests.Run(Check);
 XcpCam.Tests.FollowPathTests.Run(Check);
+XcpCam.Tests.CurveAnchorTests.Run(Check);
+XcpCam.Tests.AnchoredEditorTimingTests.Run(Check);
 XcpCam.Tests.TrackConstraintTests.Run(Check);
 
 var rng = new Random(1);

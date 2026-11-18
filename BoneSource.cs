@@ -79,13 +79,16 @@ public sealed unsafe class BoneSource : ITrackTargetSource
     }
 
     /// <summary>The character of a constraint: the GPose target for an empty name, else by index hint, else by name.</summary>
-    public IGameObject? Resolve(TrackConstraint c)
+    public IGameObject? Resolve(TrackConstraint c) => Resolve(c.TargetName, ref c.TargetIndex);
+
+    /// <summary>A character by name with an object-index hint (updated when it moved); empty name = the GPose target.</summary>
+    public IGameObject? Resolve(string name, ref int index)
     {
-        if(string.IsNullOrEmpty(c.TargetName)) return _targets.GPoseTarget;
-        if(c.TargetIndex >= 0 && c.TargetIndex < _objects.Length && _objects[c.TargetIndex] is ICharacter hinted && hinted.Name.TextValue == c.TargetName)
+        if(string.IsNullOrEmpty(name)) return _targets.GPoseTarget;
+        if(index >= 0 && index < _objects.Length && _objects[index] is ICharacter hinted && hinted.Name.TextValue == name)
             return hinted;
-        var match = Characters().Where(x => x.Name == c.TargetName).Select(x => (int?)x.Index).FirstOrDefault();
-        if(match is int index) { c.TargetIndex = index; return _objects[index]; }
+        var match = Characters().Where(x => x.Name == name).Select(x => (int?)x.Index).FirstOrDefault();
+        if(match is int found) { index = found; return _objects[found]; }
         return null;
     }
 

@@ -286,6 +286,8 @@ public sealed class ShotCurves
     /// <summary>Length factor along the Follow Path target at a frame.</summary>
     private double FollowFactor(MotionInterval interval, double frame)
     {
+        // a curve anchored to the timeline owns the timing: the camera is on every anchored point at its frame
+        if(Follow?.Constraint.EditorTiming != true && TimeAnchorPoints() is { Count: >= 2 } anchors) return AnchorFactorAt(anchors, frame);
         double a = ProgressKey(interval.StartNodeId)?.Value ?? 0, b = ProgressKey(interval.EndNodeId)?.Value ?? a;
         if(EditorMode == CurveEditorMode.Advanced || neutralSimple) return PathProgress.Evaluate(TimingFrame(interval, frame));
         return a + (b - a) * interval.Evaluate(CameraChannel.Position, frame);
@@ -338,25 +340,363 @@ public sealed class ShotCurves
     /// typed in) keep their value, the others are spread by frame between their neighbouring fixed nodes.
     /// Speed between nodes is then shaped by the timing curves (simple editor) as usual.
     /// </summary>
+    /// <remarks>
+    /// Curve points anchored to the timeline add (frame, factor) references: with two or more of them every
+    /// node's factor comes from them (extrapolated outside, the first/last node are no longer 0 % / 100 %);
+    /// a single one acts like a hand-set node.
+    /// </remarks>
     private double[] AutoFactors()
     {
         int n = nodes.Count;
         var result = new double[n];
         if(n == 0) return result;
-        var fixedAt = new SortedDictionary<int, double>();
-        for(int i = 0; i < n; i++)
-            if(ManualFactors.Contains(nodes[i].Id) && ProgressKey(nodes[i].Id) is { } key) fixedAt[i] = key.Value;
-        if(!fixedAt.ContainsKey(0)) fixedAt[0] = 0;
-        if(n > 1 && !fixedAt.ContainsKey(n - 1)) fixedAt[n - 1] = 1;
-        var anchors = fixedAt.ToList();
-        for(int a = 0; a < anchors.Count; a++)
+        var timeAnchors = Follow?.Constraint.EditorTiming == true ? [] : TimeAnchorPoints();
+        if(timeAnchors.Count >= 2)
         {
-            result[anchors[a].Key] = anchors[a].Value;
-            if(a + 1 >= anchors.Count) break;
-            var (i0, v0) = anchors[a]; var (i1, v1) = anchors[a + 1];
-            double f0 = nodes[i0].Frame, f1 = nodes[i1].Frame;
-            for(int i = i0 + 1; i < i1; i++)
-                result[i] = f1 > f0 ? v0 + (v1 - v0) * (nodes[i].Frame - f0) / (f1 - f0) : v0;
+            for(int i = 0; i < n; i++) result[i] = AnchorFactorAt(timeAnchors, nodes[i].Frame);
+            return result;
+        }
+        var fixedAt = new SortedDictionary<double, double>();
+        for(int i = 0; i < n; i++)
+            if(ManualFactors.Contains(nodes[i].Id) && ProgressKey(nodes[i].Id) is { } key) fixedAt[nodes[i].Frame] = key.Value;
+        if(!fixedAt.ContainsKey(nodes[0].Frame)) fixedAt[nodes[0].Frame] = 0;
+        if(n > 1 && !fixedAt.ContainsKey(nodes[^1].Frame)) fixedAt[nodes[^1].Frame] = 1;
+        foreach(var (frame, factor) in timeAnchors)
+        {
+            // a closed curve passes the point once per turn: take the turn the default spread is on at that frame
+            double value = factor;
+            if(Follow!.Path.Cyclic)
+                value += Math.Round(Interpolate(fixedAt.Select(p => (p.Key, p.Value)).ToList(), frame, false) - factor);
+            fixedAt[frame] = value;
+        }
+        var points = fixedAt.Select(p => (p.Key, p.Value)).ToList();
+        for(int i = 0; i < n; i++) result[i] = Interpolate(points, nodes[i].Frame, false);
+        return result;
+    }
+
+    /// <summary>Piecewise linear through (frame, value) points sorted by frame; outside: extrapolate or hold.</summary>
+    private static double Interpolate(List<(double frame, double value)> points, double frame, bool extrapolate)
+    {
+        if(points.Count == 1) return points[0].value;
+        int seg = 0;
+        while(seg < points.Count - 2 && frame > points[seg + 1].frame) seg++;
+        var (f0, v0) = points[seg]; var (f1, v1) = points[seg + 1];
+        if(!extrapolate && frame <= f0) return v0;
+        if(!extrapolate && frame >= points[^1].frame) return points[^1].value;
+        return f1 > f0 ? v0 + (v1 - v0) * (frame - f0) / (f1 - f0) : v0;
+    }
+
+    /// <summary>
+    /// Curve points anchored to the timeline as (frame, length factor), sorted by frame, one per frame. On a
+    /// closed curve the camera travels forward (as the default 0 → 100 % does): each later anchor is the next
+    /// forward continuation of the previous one, and the loop's return to the start point
+    /// (<see cref="FollowPathConstraint.LoopEndFrame"/>) is one more anchor, at 100 %.
+    /// </summary>
+    internal List<(double frame, double factor)> TimeAnchorPoints() => Anchors().points;
+
+    private (List<(double frame, double factor)> points, double[] tangents) Anchors()
+    {
+        if(Follow == null || Follow.Constraint.TimeAnchors.Count == 0) return ([], []);
+        // cached: the composer samples this for every frame
+        var c = Follow.Constraint;
+        int signature = HashCode.Combine(c.TimeAnchors.Count, c.LoopEndFrame, Follow.Path,
+            nodes.Count > 0 ? nodes[0].Frame : 0, nodes.Count > 0 ? nodes[^1].Frame : 0);
+        foreach(var (id, f) in c.TimeAnchors) signature = HashCode.Combine(signature, id, f);
+        if(anchorCache is { } hit && hit.signature == signature && ReferenceEquals(hit.follow, Follow)) return (hit.points, hit.tangents);
+
+        var result = new List<(double frame, double factor)>();
+        var points = Follow.Path.Spline.Points;
+        var factors = Follow.Path.PointFactors();
+        for(int i = 0; i < points.Count; i++)
+            if(c.TimeAnchors.TryGetValue(points[i].Id, out double frame)) result.Add((frame, factors[i]));
+        if(Follow.Path.Cyclic && c.LoopEndFrame is double end && points.Count > 0 && c.TimeAnchors.ContainsKey(points[0].Id))
+            result.Add((end, factors[0]));
+        result.Sort((a, b) => a.frame.CompareTo(b.frame));
+        // two points dragged onto one frame: the first one keeps it
+        for(int i = result.Count - 1; i > 0; i--) if(result[i].frame <= result[i - 1].frame) result.RemoveAt(i);
+        if(Follow.Path.Cyclic)
+        {
+            for(int i = 1; i < result.Count; i++)
+            {
+                double f = result[i].factor, prev = result[i - 1].factor;
+                double step = f - prev - Math.Floor(f - prev); // forward distance, 0..1
+                if(step < 1e-9) step = 1; // the same point again (P1 and the loop end): one full turn
+                result[i] = (result[i].frame, prev + step);
+            }
+            if(result.Count >= 2) result = ExtendLoop(result, factors);
+        }
+        var tangents = MonotoneTangents(result);
+        anchorCache = (Follow, signature, result, tangents);
+        return (result, tangents);
+    }
+    private (FollowBinding follow, int signature, List<(double frame, double factor)> points, double[] tangents)? anchorCache;
+
+    /// <summary>
+    /// Closed curve: beyond the anchored frames the camera keeps looping with the anchored rhythm. Every arc of
+    /// the loop (Pk → Pk+1) takes the duration it has between the anchors (the latest occurrence ahead, the
+    /// earliest one behind; arcs never anchored use the average speed), and those durations repeat turn after
+    /// turn as extra anchors until the camera nodes' range is covered. Retiming P2 / P3 therefore also retimes
+    /// P2 / P3 in every later turn.
+    /// </summary>
+    private List<(double frame, double factor)> ExtendLoop(List<(double frame, double factor)> anchors, double[] u)
+    {
+        int n = u.Length;
+        if(n < 2 || nodes.Count == 0) return anchors;
+        static double Frac(double x) => x - Math.Floor(x);
+        var length = new double[n];
+        for(int k = 0; k < n; k++) length[k] = Frac(u[(k + 1) % n] - u[k]);
+        if(length.Any(l => l < 1e-9) || Math.Abs(length.Sum() - 1) > 1e-6) return anchors; // points not in loop order
+        int PointAt(double factor)
+        {
+            for(int k = 0; k < n; k++) { double d = Frac(factor - u[k]); if(d < 1e-6 || d > 1 - 1e-6) return k; }
+            return -1;
+        }
+
+        // arc durations from consecutive anchors (each pair spans whole arcs: anchors sit on control points)
+        var ahead = new double?[n]; var behind = new double?[n];
+        double totalFrames = 0, totalFactor = 0;
+        for(int i = 0; i + 1 < anchors.Count; i++)
+        {
+            var (fa, va) = anchors[i]; var (fb, vb) = anchors[i + 1];
+            int k = PointAt(va);
+            if(k < 0 || vb <= va) return anchors;
+            double speed = (vb - va) / (fb - fa);
+            totalFrames += fb - fa; totalFactor += vb - va;
+            for(double v = va; v < vb - 1e-9; v += length[k], k = (k + 1) % n)
+            {
+                ahead[k] = length[k] / speed; // later pairs win ahead
+                behind[k] ??= length[k] / speed; // the first pair wins behind
+            }
+        }
+        double average = totalFrames / totalFactor;
+        double Duration(double?[] d, int k) => d[k] ?? length[k] * average;
+
+        double lo = nodes[0].Frame, hi = nodes[^1].Frame;
+        var result = new List<(double frame, double factor)>(anchors);
+        var (frame, factor) = anchors[^1];
+        for(int k = PointAt(factor), guard = 0; k >= 0 && guard < 4096; guard++)
+        {
+            bool covered = frame > hi; // one extra arc supplies the tangent beyond the sampled range
+            frame += Duration(ahead, k); factor += length[k]; k = (k + 1) % n;
+            result.Add((frame, factor));
+            if(covered) break;
+        }
+        (frame, factor) = anchors[0];
+        var before = new List<(double frame, double factor)>();
+        for(int k = PointAt(factor), guard = 0; k >= 0 && guard < 4096; guard++)
+        {
+            bool covered = frame < lo;
+            k = (k + n - 1) % n;
+            frame -= Duration(behind, k); factor -= length[k];
+            before.Add((frame, factor));
+            if(covered) break;
+        }
+        before.Reverse();
+        before.AddRange(result);
+        return before;
+    }
+
+    /// <summary>Fritsch–Carlson tangents: a C1 cubic through every anchor that never overshoots between them.</summary>
+    private static double[] MonotoneTangents(List<(double frame, double factor)> p)
+    {
+        int n = p.Count;
+        var m = new double[n];
+        if(n < 2) return m;
+        var d = new double[n - 1];
+        for(int i = 0; i + 1 < n; i++) d[i] = (p[i + 1].factor - p[i].factor) / (p[i + 1].frame - p[i].frame);
+        m[0] = d[0]; m[n - 1] = d[n - 2];
+        for(int i = 1; i + 1 < n; i++)
+        {
+            if(d[i - 1] * d[i] <= 0) { m[i] = 0; continue; }
+            double h0 = p[i].frame - p[i - 1].frame, h1 = p[i + 1].frame - p[i].frame;
+            m[i] = 3 * (h0 + h1) / ((2 * h1 + h0) / d[i - 1] + (h1 + 2 * h0) / d[i]);
+        }
+        return m;
+    }
+
+    private static double Hermite((double frame, double factor) a, (double frame, double factor) b, double ma, double mb, double x)
+    {
+        double h = b.frame - a.frame, t = (x - a.frame) / h, t2 = t * t, t3 = t2 * t;
+        return (2 * t3 - 3 * t2 + 1) * a.factor + (t3 - 2 * t2 + t) * h * ma + (-2 * t3 + 3 * t2) * b.factor + (t3 - t2) * h * mb;
+    }
+
+    /// <summary>True when two or more curve points anchored to the timeline drive the path progress.</summary>
+    public bool UsesTimeAnchors => Follow?.Constraint.EditorTiming == true || TimeAnchorPoints().Count >= 2;
+
+    /// <summary>
+    /// Path progress of a timeline-anchored curve at a frame: exactly each anchor's factor at its frame, smooth
+    /// and without overshoot in between. Closed curves repeat the anchored arc durations outside; open curves
+    /// continue at the end slopes and stop at their ends.
+    /// </summary>
+    private double AnchorFactorAt(List<(double frame, double factor)> anchors, double frame)
+    {
+        var m = Anchors().tangents;
+        if(m.Length != anchors.Count) m = MonotoneTangents(anchors);
+        double f;
+        if(frame <= anchors[0].frame) f = anchors[0].factor + m[0] * (frame - anchors[0].frame);
+        else if(frame >= anchors[^1].frame) f = anchors[^1].factor + m[^1] * (frame - anchors[^1].frame);
+        else
+        {
+            int k = 0;
+            while(frame > anchors[k + 1].frame) k++;
+            f = Hermite(anchors[k], anchors[k + 1], m[k], m[k + 1], frame);
+        }
+        return Follow!.Path.Cyclic ? f : Math.Clamp(f, 0, 1);
+    }
+
+    /// <summary>Frame at which the timeline anchors reach a length factor (inverse of the anchor mapping).
+    /// On a closed curve the factor is reached once per turn: the frame closest to <paramref name="near"/> wins
+    /// (without it, the turn closest to the anchored range).</summary>
+    public double? AnchorFrameOf(double factor, double? near = null)
+    {
+        if(Follow?.Constraint.EditorTiming == true) return EditorFrameOf(factor, near);
+        var (anchors, m) = Anchors();
+        if(anchors.Count < 2 || !double.IsFinite(factor)) return null;
+        if(!Follow!.Path.Cyclic) return AnchorFrameOf(anchors, m, factor);
+        var frames = Follow.Constraint.TimeAnchors.Values.Select(f => (double)f).ToList();
+        if(Follow.Constraint.LoopEndFrame is double end) frames.Add(end);
+        double mid = near is double at && double.IsFinite(at) ? AnchorFactorAt(anchors, at) :
+            (AnchorFactorAt(anchors, frames.Min()) + AnchorFactorAt(anchors, frames.Max())) / 2;
+        double centre = factor + Math.Round(mid - factor);
+        if(near is not double target || !double.IsFinite(target)) return AnchorFrameOf(anchors, m, centre);
+        double? best = null;
+        for(int k = -2; k <= 2; k++)
+            if(AnchorFrameOf(anchors, m, centre + k) is double f && (best == null || Math.Abs(f - target) < Math.Abs(best.Value - target))) best = f;
+        return best;
+    }
+
+    /// <summary>Finds the requested node position on the current timing before editing that node's value.
+    /// Editor timing must retain the requested factor after the node moves; anchor timing derives it anew.</summary>
+    public double? SetAnchoredNodeFactor(Keyframe node, double factor)
+    {
+        if(!UsesTimeAnchors) return null;
+        double? frame = AnchorFrameOf(factor, node.Frame);
+        if(frame != null && Follow?.Constraint.EditorTiming == true) SetNodeFactor(node, factor);
+        return frame;
+    }
+
+    private static double? AnchorFrameOf(List<(double frame, double factor)> anchors, double[] m, double factor)
+    {
+        // the first anchor segment containing the factor (each segment is monotone), else extrapolate beyond the end
+        for(int i = 0; i + 1 < anchors.Count; i++)
+        {
+            var a = anchors[i]; var b = anchors[i + 1];
+            if(Math.Abs(b.factor - a.factor) < 1e-12 || (factor - a.factor) * (factor - b.factor) > 0) continue;
+            double lo = a.frame, hi = b.frame; bool rising = b.factor > a.factor;
+            for(int it = 0; it < 60; it++)
+            {
+                double x = (lo + hi) / 2;
+                if(Hermite(a, b, m[i], m[i + 1], x) < factor == rising) lo = x; else hi = x;
+            }
+            return (lo + hi) / 2;
+        }
+        double direction = Math.Sign(anchors[^1].factor - anchors[0].factor);
+        bool beforeStart = (factor - anchors[0].factor) * direction < 0;
+        var (end, slope) = beforeStart ? (anchors[0], m[0]) : (anchors[^1], m[^1]);
+        if(Math.Abs(slope) < 1e-12) return end.frame;
+        return end.frame + (factor - end.factor) / slope;
+    }
+
+    private double CrossingFrame(double t0, double v0, double t1, double v1, double factor)
+    {
+        if(Math.Abs(factor - v0) < 1e-12 || Math.Abs(v1 - v0) < 1e-12) return t0;
+        if(Math.Abs(factor - v1) < 1e-12) return t1;
+        double left = t0, right = t1;
+        for(int it = 0; it < 40; it++)
+        {
+            double mid = (left + right) / 2;
+            if((FollowFactorAt(mid)!.Value < factor) == (v1 > v0)) left = mid; else right = mid;
+        }
+        return (left + right) / 2;
+    }
+
+    private double? EditorFrameOf(double factor, double? near)
+    {
+        if(!double.IsFinite(factor) || nodes.Count < 2 || Follow == null) return null;
+        double target = near is double n && double.IsFinite(n) ? n : Follow.Constraint.TimeAnchors.Count > 0
+            ? (Follow.Constraint.TimeAnchors.Values.Min() + Follow.Constraint.TimeAnchors.Values.Max()) / 2 : nodes[0].Frame;
+        double? best = null;
+        int start = nodes[0].Frame, end = nodes[^1].Frame, step = Math.Max(1, (end - start) / 2000);
+        double t0 = start, v0 = FollowFactorAt(start)!.Value;
+        for(long time = (long)start + step; t0 < end; time += step)
+        {
+            double t1 = Math.Min(time, end), v1 = FollowFactorAt(t1)!.Value;
+            double lo = Math.Min(v0, v1), hi = Math.Max(v0, v1);
+            double k0 = Follow.Path.Cyclic ? Math.Ceiling(lo - factor - 1e-9) : 0;
+            double k1 = Follow.Path.Cyclic ? Math.Floor(hi - factor + 1e-9) : 0;
+            for(double k = k0; k <= k1; k++)
+            {
+                double value = factor + k;
+                if(value < lo - 1e-9 || value > hi + 1e-9) continue;
+                double frame = CrossingFrame(t0, v0, t1, v1, value);
+                if(Math.Abs(FollowFactorAt(frame)!.Value - value) > 1e-6) continue;
+                if(best == null || Math.Abs(frame - target) < Math.Abs(best.Value - target)) best = frame;
+            }
+            t0 = t1; v0 = v1;
+        }
+        return best;
+    }
+
+    /// <summary>Follow Path length factor at a frame (null when not following or without nodes).</summary>
+    public double? FollowFactorAt(double frame)
+    {
+        if(Follow == null || nodes.Count == 0) return null;
+        EnsureGeometry();
+        var interval = At(frame);
+        if(interval == null) return ProgressKey(nodes[0].Id)?.Value;
+        return FollowFactor(interval, frame);
+    }
+
+    /// <summary>
+    /// When every curve control point is on the timeline: timeline-anchored points at their anchor frame,
+    /// camera-anchored points at the first frame the camera reaches them (null when it never does).
+    /// Needs a followed curve and at least two camera nodes.
+    /// </summary>
+    public List<CurvePointTime> CurvePointTimes(bool useAnchors = true)
+    {
+        var result = new List<CurvePointTime>();
+        if(Follow == null || nodes.Count < 2) return result;
+        var points = Follow.Path.Spline.Points;
+        var factors = Follow.Path.PointFactors();
+        int a = nodes[0].Frame, b = nodes[^1].Frame;
+        int step = Math.Max(1, (b - a) / 2000);
+        var samples = new List<(double frame, double factor)>();
+        for(long t = a; t < b; t += step) samples.Add((t, FollowFactorAt(t) ?? 0));
+        samples.Add((b, FollowFactorAt(b) ?? 0));
+        bool cyclic = Follow.Path.Cyclic;
+        for(int i = 0; i < points.Count; i++)
+        {
+            // every frame the camera passes the point (a closed curve passes its start at 0 % and 100 %)
+            var passes = new List<double>();
+            for(int s = 0; s + 1 < samples.Count; s++)
+            {
+                var (t0, v0) = samples[s]; var (t1, v1) = samples[s + 1];
+                double lo = Math.Min(v0, v1), hi = Math.Max(v0, v1);
+                // a cyclic curve passes the point at every whole turn: factor + k
+                double k0 = cyclic ? Math.Ceiling(lo - factors[i] - 1e-9) : 0, k1 = cyclic ? Math.Floor(hi - factors[i] + 1e-9) : 0;
+                for(double k = k0; k <= k1; k++)
+                {
+                    double x = factors[i] + k;
+                    if(x < lo - 1e-9 || x > hi + 1e-9) continue;
+                    if(s > 0 && Math.Abs(x - v0) < 1e-9 && Math.Abs(samples[s - 1].factor - x) < 1e-9) continue;
+                    double frame = CrossingFrame(t0, v0, t1, v1, x);
+                    // A constant segment or cut can jump over a point without actually visiting it.
+                    if(Math.Abs(FollowFactorAt(frame)!.Value - x) > 1e-6) continue;
+                    if(passes.Count == 0 || frame - passes[^1] > 1e-6) passes.Add(frame);
+                }
+            }
+            if(useAnchors && Follow.Constraint.TimeAnchors.TryGetValue(points[i].Id, out double anchored))
+            {
+                result.Add(new CurvePointTime(i, points[i].Id, factors[i], anchored, true));
+                double? loopEnd = i == 0 && cyclic ? Follow.Constraint.LoopEndFrame : null;
+                if(loopEnd is double end) result.Add(new CurvePointTime(i, points[i].Id, factors[i], end, true, true));
+                foreach(double pass in passes.Where(p => Math.Abs(p - anchored) > 1 && (loopEnd is not double e || Math.Abs(p - e) > 1)))
+                    result.Add(new CurvePointTime(i, points[i].Id, factors[i], pass, false, true));
+                continue;
+            }
+            result.Add(new CurvePointTime(i, points[i].Id, factors[i], passes.Count > 0 ? passes[0] : null, false));
+            foreach(double pass in passes.Skip(1))
+                result.Add(new CurvePointTime(i, points[i].Id, factors[i], pass, false, true));
         }
         return result;
     }
@@ -377,6 +717,61 @@ public sealed class ShotCurves
     /// <summary>Marks a factor edited elsewhere (advanced editor) as hand-set.</summary>
     public void MarkFactorManual(Guid node) { if(Follow != null) ManualFactors.Add(node); }
 
+    /// <summary>Only active path timing participates: selection, view changes, rotation and offsets do not
+    /// switch an anchored path to editor timing. Linked channels naturally share the position curve.</summary>
+    internal int FollowTimingSignature()
+    {
+        var hash = new HashCode();
+        hash.Add(EditorMode); hash.Add(neutralSimple);
+        foreach(var node in nodes) { hash.Add(node.Id); hash.Add(node.Frame); hash.Add(node.HoldFrames); }
+        bool direct = EditorMode == CurveEditorMode.Advanced || neutralSimple;
+        void Add(FCurve curve)
+        {
+            foreach(var key in curve.Keys)
+            {
+                hash.Add(key.Frame); hash.Add(key.Value); hash.Add(key.Interpolation);
+                hash.Add(key.Left); hash.Add(key.Right); hash.Add(key.Mode);
+            }
+        }
+        if(direct) Add(PathProgress);
+        else
+        {
+            foreach(var key in PathProgress.Keys) { hash.Add(key.Frame); hash.Add(key.Value); }
+            foreach(var interval in Intervals)
+            {
+                hash.Add(interval.Start); hash.Add(interval.End); hash.Add(interval.HoldFrames);
+                Add(interval.Curve(CameraChannel.Position));
+            }
+        }
+        return hash.ToHashCode();
+    }
+
+    private int? editorAnchorSignature;
+    internal void UpdateEditorAnchors()
+    {
+        if(Follow?.Constraint is not { EditorTiming: true } constraint) { editorAnchorSignature = null; return; }
+        var hash = new HashCode(); hash.Add(FollowTimingSignature());
+        foreach(double factor in Follow.Path.PointFactors()) hash.Add(factor);
+        int signature = hash.ToHashCode();
+        if(editorAnchorSignature == signature) return;
+        var old = constraint.TimeAnchors;
+        var times = CurvePointTimes(useAnchors: false).Where(t => t.Frame.HasValue).ToList();
+        var anchors = new Dictionary<Guid, double>();
+        foreach(var group in times.GroupBy(t => t.Id))
+        {
+            double near = old.TryGetValue(group.Key, out double frame) ? frame : nodes[0].Frame;
+            anchors[group.Key] = group.OrderBy(t => Math.Abs(t.Frame!.Value - near)).First().Frame!.Value;
+        }
+        double? loopEnd = null;
+        if(Follow.Path.Cyclic && Follow.Path.Spline.Points.Count > 0 &&
+            anchors.TryGetValue(Follow.Path.Spline.Points[0].Id, out double start))
+            loopEnd = times.Where(t => t.Index == 0 && t.Frame > start + 1e-6)
+                .OrderBy(t => Math.Abs(t.Frame!.Value - (constraint.LoopEndFrame ?? start)))
+                .Select(t => t.Frame).FirstOrDefault();
+        constraint.TimeAnchors = anchors; constraint.LoopEndFrame = loopEnd;
+        editorAnchorSignature = signature;
+    }
+
     /// <summary>Returns every following node to the automatic 0–100 % time distribution.</summary>
     public void ResetFactors() { ManualFactors.Clear(); Space.Touch(); }
 
@@ -387,6 +782,7 @@ public sealed class ShotCurves
         // A new Follow Path target resets every factor to the automatic time distribution.
         if(Follow != null && followCurve != Follow.CurveId) ManualFactors.Clear();
         var factors = Follow != null ? AutoFactors() : null;
+        bool anchored = Follow != null && !Follow.Constraint.EditorTiming && UsesTimeAnchors;
         foreach(var (curve, progress) in Offset.Select(c => (c, false)).Prepend((PathProgress, true)))
         {
             var old = curve.Clone();
@@ -400,7 +796,8 @@ public sealed class ShotCurves
                 if(progress && factors != null)
                 {
                     // following a curve: the player camera position is ignored; the node is a factor on the curve
-                    if(!ManualFactors.Contains(node.Id)) key.Value = factors[i];
+                    // (with timeline anchors every factor comes from them, hand-set values do not apply)
+                    if(anchored || !ManualFactors.Contains(node.Id)) key.Value = factors[i];
                 }
                 else if(progress)
                     key.Value = path != null && total > 1e-12 && Space.Anchors.TryGetValue(node.Id, out var anchor)
@@ -579,8 +976,15 @@ public sealed class ShotCurves
         return spatialPath!.HasJump(interval.Parameter(CameraChannel.Position, from), interval.Parameter(CameraChannel.Position, to));
     }
 
+    /// <summary>
+    /// Set by <see cref="WritePose"/> when timeline anchors drive the path progress: the node was moved along
+    /// the curve, and the progress there belongs to this frame. The caller moves the node in time.
+    /// </summary>
+    public int? RequestedFrame { get; private set; }
+
     public void WritePose(Keyframe node, XcpFrame pose, bool position = true, bool rotation = true, bool fov = true, int influence = 0)
     {
+        RequestedFrame = null;
         if(Follow != null && ProgressKey(node.Id) is { } key)
         {
             // Following a curve: the node slides along it (nearest point to the requested position);
@@ -591,9 +995,21 @@ public sealed class ShotCurves
             {
                 var offset = OffsetAt(node.Frame);
                 if(Follow.Constraint.UseRadius) offset *= point.Radius;
-                key.Value = Follow.Path.Project(pose.Pos - Vector3.Transform(offset, q));
-                ManualFactors.Add(node.Id); // dragged along the curve by hand
-                q = Follow.Constraint.Orientation(Follow.Path.Sample(key.Value));
+                double old = key.Value;
+                double factor = Follow.Path.Project(pose.Pos - Vector3.Transform(offset, q));
+                // a closed curve: stay on the same turn (no jump across the start point)
+                if(Follow.Path.Cyclic) factor += Math.Round(old - factor);
+                // Invert the existing timing before changing the node's progress key.
+                if(SetAnchoredNodeFactor(node, factor) is double frame) RequestedFrame = (int)Math.Round(frame);
+                else ManualFactors.Add(node.Id); // dragged along the curve by hand
+                key.Value = factor;
+                point = Follow.Path.Sample(key.Value);
+                q = Follow.Constraint.Orientation(point);
+                // what the curve cannot reach (e.g. height above a flat circle) becomes the node's location offset,
+                // so the node ends up exactly where it was put
+                var residual = Vector3.Transform(pose.Pos - point.Position, Quaternion.Inverse(q));
+                if(Follow.Constraint.UseRadius && MathF.Abs(point.Radius) > 1e-6f) residual /= point.Radius;
+                SetOffsetKey(node, residual);
             }
             var own = pose with { Rot = Quaternion.Normalize(Quaternion.Inverse(q) * pose.Rot) };
             if(rotation || fov) Space.WritePose(node, own, false, rotation, fov, null, influence);
@@ -604,6 +1020,22 @@ public sealed class ShotCurves
         if(position) node.Pos = Follow != null ? NodePose(node).Pos : pose.Pos;
         if(rotation) node.Rot = pose.Rot;
         if(fov) node.Fov = pose.Fov;
+    }
+
+    /// <summary>Sets the location offset keys of one node (one key per node on each offset curve).</summary>
+    private void SetOffsetKey(Keyframe node, Vector3 offset)
+    {
+        for(int i = 0; i < 3; i++)
+        {
+            var curve = Offset[i];
+            var key = curve.Keys.FirstOrDefault(k => k.NodeId == node.Id);
+            if(key == null) continue;
+            key.Value = i == 0 ? offset.X : i == 1 ? offset.Y : offset.Z;
+            curve.RecalculateHandles();
+            var keys = curve.Keys;
+            foreach(var end in new[] { keys[0], keys[^1] })
+                if(end.Mode == HandleMode.AutoClamped && keys.Count > 1) { end.Left = new Vector2(end.Left.X, 0); end.Right = new Vector2(end.Right.X, 0); }
+        }
     }
 
     internal void Bind(List<Keyframe> current)
@@ -709,6 +1141,9 @@ public sealed class ShotCurves
         if(followFactor is double factor && followed is XcpFrame f)
         {
             node.Pos = f.Pos; node.Rot = f.Rot;
+            // Keep existing nodes at their sampled factors too: pinning only the inserted node would
+            // re-spread its automatic neighbours between the new fixed points on the next synchronization.
+            foreach(var key in PathProgress.Keys) if(key.NodeId is Guid id) ManualFactors.Add(id);
             PathProgress.Keys.Add(new CurveKey { NodeId = node.Id, Frame = node.Frame, Value = factor, Mode = HandleMode.AutoClamped });
             PathProgress.Sort();
             ManualFactors.Add(node.Id); // keep the sampled position so inserting does not change the motion
@@ -783,6 +1218,12 @@ public static class CurveModel
 
     public static void Ensure(CamTrack track, int fps = 30)
     {
+        // anchors of deleted curve points are dropped
+        if(track.FollowPath is { TimeAnchors.Count: > 0 } follow && track.FollowCurve?.PathSpline is { } spline)
+            foreach(var id in follow.TimeAnchors.Keys.Where(id => !spline.Points.Any(p => p.Id == id)).ToList())
+                follow.TimeAnchors.Remove(id);
+        if(track.FollowPath is { } fp && (fp.TimeAnchors.Count == 0 || track.FollowCurve?.PathSpline is not { Cyclic: true }))
+            fp.LoopEndFrame = null;
         var groups = Groups(track);
         var old = track.Shots;
         var snapshots = old.Select(s => s.Clone()).ToList();
@@ -846,6 +1287,7 @@ public static class CurveModel
             SpatialTangents.Apply(shot.Space, nodes);
             shot.Bind(nodes);
             SmoothTiming.Apply(shot);
+            shot.UpdateEditorAnchors();
             result.Add(shot);
         }
         track.Shots = result;

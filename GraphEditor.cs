@@ -35,6 +35,14 @@ public sealed class GraphEditor
 
     public void Draw(ShotCurves shot, CamTimeline timeline)
     {
+        int timing = shot.FollowTimingSignature(), count = shot.SeededNodes.Count;
+        DrawGraph(shot, timeline);
+        if(count == shot.SeededNodes.Count && timing != shot.FollowTimingSignature() && timeline.SyncCurveAnchorsFromEditor(shot))
+            Status = "速度曲线已生效，曲线节点的时间轴位置已按实际经过帧同步。";
+    }
+
+    private void DrawGraph(ShotCurves shot, CamTimeline timeline)
+    {
         PlayheadChanged = false;
         if(ImGui.Button(shot.EditorMode == CurveEditorMode.Advanced ? "高级曲线 · 当前" : "使用高级曲线"))
         { End(); spatial.EndGesture(); if(shot.EditorMode != CurveEditorMode.Advanced) { timeline.Snapshot(); shot.SetEditorMode(CurveEditorMode.Advanced); timeline.Touch(); } }
@@ -42,6 +50,8 @@ public sealed class GraphEditor
         if(ImGui.Button(shot.EditorMode == CurveEditorMode.Simple ? "简单曲线 · 当前" : "使用简单曲线"))
         { End(); spatial.EndGesture(); if(shot.EditorMode != CurveEditorMode.Simple) { timeline.Snapshot(); shot.SetEditorMode(CurveEditorMode.Simple); timeline.Touch(); } }
         ImGui.TextDisabled(shot.EditorMode == CurveEditorMode.Advanced ? "高级曲线生效：直接控制数值、速度和节点帧；简单曲线锁定。" : "简单曲线生效：高级曲线锁定且保留。切换不会重建高级数据。");
+        if(shot.UsesTimeAnchors)
+            ImGui.TextDisabled("曲线已锚定时间轴：编辑速度会同步曲线节点的经过帧；拖动曲线节点则按新锚点重新定时。");
         if(shot.EditorMode == CurveEditorMode.Advanced) { spatial.Draw(shot, timeline); Status = spatial.Status; return; }
         if(shotId != shot.Id) { shotId = shot.Id; selected.Clear(); fit = true; End(); selectionRevision = -1; }
         if(shot.Intervals.Count == 0) { ImGui.TextDisabled("此连续段只有一个节点，没有运动曲线。"); return; }
