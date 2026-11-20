@@ -68,6 +68,7 @@ public sealed class CurveTool
     public void DrawScene()
     {
         Candidates.Clear();
+        FollowCandidates.Clear();
         if(!_overlay.Enabled) return;
         foreach(var curve in _tl.Curves)
         {
@@ -94,7 +95,6 @@ public sealed class CurveTool
     /// </summary>
     private void DrawFollowedPoints()
     {
-        FollowCandidates.Clear();
         var track = _tl.ActiveTrack;
         if(track.FollowPath is not { } follow || track.FollowCurve is not { } curve || curve.PathSpline is not { } spline) return;
         if(Active && EditMode && CurveId == curve.Id) return;
@@ -121,6 +121,17 @@ public sealed class CurveTool
         else { Selection.Clear(); Selection.Add(s); }
     }
 
+    /// <summary>Box selection adds all hit control points without toggling previously selected points.</summary>
+    public void SelectFollowedPoints(CamTrack track, IEnumerable<int> points, bool additive)
+    {
+        if(track.FollowCurve is not { } curve || curve.PathSpline is not { } spline) return;
+        if(!additive || CurveId != curve.Id || !EditMode) Selection.Clear();
+        CurveId = curve.Id; NodePath = false; EditMode = true; PointTrack = track;
+        int si = curve.Splines.IndexOf(spline);
+        foreach(int point in points)
+            if(point >= 0 && point < spline.Points.Count) Selection.Add(new CurveSelection(si, point));
+    }
+
     /// <summary>The following track the selected points belong to (for anchors), if any.</summary>
     public CamTrack? AnchorTrack
     {
@@ -137,7 +148,7 @@ public sealed class CurveTool
     public List<(int spline, int index, CurvePoint point)> SelectedPoints()
     {
         if(!EditMode || Curve is not { } curve) return [];
-        return Selection.Where(s => s.Part == CurvePart.Point && s.Spline < curve.Splines.Count && s.Point < curve.Splines[s.Spline].Points.Count)
+        return Selection.Where(s => s.Part == CurvePart.Point && ValidPart(curve, s))
             .Select(s => (spline: s.Spline, index: s.Point, point: curve.Splines[s.Spline].Points[s.Point]))
             .Distinct().OrderBy(x => x.spline).ThenBy(x => x.index).ToList();
     }
@@ -150,11 +161,11 @@ public sealed class CurveTool
         ImGui.SetNextItemWidth(120);
         if(ImGui.DragFloat("倾斜 (°)", ref tilt, .5f)) { foreach(var p in selectedPoints) p.Tilt = tilt * MathF.PI / 180; c.Touch(); _tl.Touch(); }
         if(ImGui.IsItemActivated()) _tl.Snapshot();
-        if(ImGui.IsItemHovered()) ImGui.SetTooltip("Blender Ctrl+T：沿曲线的滚转，只在约束开启「跟随曲线」时影响相机。");
+        if(ImGui.IsItemHovered()) ImGui.SetTooltip("沿曲线的滚转，只在约束开启「跟随曲线」时影响相机。");
         ImGui.SameLine(); ImGui.SetNextItemWidth(120);
         if(ImGui.DragFloat("半径", ref radius, .01f, 0f, 100f)) { foreach(var p in selectedPoints) p.Radius = MathF.Max(0, radius); c.Touch(); _tl.Touch(); }
         if(ImGui.IsItemActivated()) _tl.Snapshot();
-        if(ImGui.IsItemHovered()) ImGui.SetTooltip("Blender Alt+S：约束开启「使用半径」时按半径缩放位置偏移。");
+        if(ImGui.IsItemHovered()) ImGui.SetTooltip("约束开启「使用半径」时按半径缩放位置偏移。");
     }
 
     /// <summary>Handle type of the selected points (curve page and timeline inspector).</summary>
@@ -165,7 +176,7 @@ public sealed class CurveTool
         ImGui.SameLine();
         if(ImGui.Button("设置手柄类型"))
             Edit("已设置手柄类型。", curve => { foreach(var (s, _, points) in SelectedSplines(curve)) CurveEdit.SetHandleType(s, points, (CurveHandle)_handleType); });
-        if(ImGui.IsItemHovered()) ImGui.SetTooltip("Blender V：自动（黄）、矢量（绿）、对齐（粉）、自由（黑）。拖动自动手柄会变为对齐，拖动矢量手柄会变为自由。");
+        if(ImGui.IsItemHovered()) ImGui.SetTooltip("自动（黄）、矢量（绿）、对齐（粉）、自由（黑）。拖动自动手柄会变为对齐，拖动矢量手柄会变为自由。");
     }
 
     private void DrawCage(CurveObject curve)
@@ -291,8 +302,7 @@ public sealed class CurveTool
 
     private void PointGizmo(CurveObject curve)
     {
-        Selection.RemoveWhere(s => s.Spline >= curve.Splines.Count || s.Point >= curve.Splines[s.Spline].Points.Count
-            || s.Part != CurvePart.Point && curve.Splines[s.Spline].Type != SplineType.Bezier);
+        Selection.RemoveWhere(s => !ValidPart(curve, s));
         if(Selection.Count == 0) return;
         var center = Selection.Aggregate(Vector3.Zero, (sum, s) => sum + PartWorld(curve, s)) / Selection.Count;
         var p = center; var r = Quaternion.Identity; var scale = Vector3.One;
@@ -409,18 +419,40 @@ public sealed class CurveTool
     /// <summary>Delete key / button in edit mode: removes the selected control points.</summary>
     public bool DeleteSelected()
     {
-        if(!EditMode || Curve is not { } curve || Selection.Count == 0 || EditingNodePath) return false;
-        _tl.Snapshot();
-        foreach(var group in Selection.Where(s => s.Part == CurvePart.Point).GroupBy(s => s.Spline).OrderByDescending(g => g.Key))
-            if(!CurveEdit.Delete(curve.Splines[group.Key], group.Select(s => s.Point).ToHashSet())) curve.Splines.RemoveAt(group.Key);
+        if(!EditMode || NodePath || Curve is not { } curve) return false;
+        var groups = SelectedSplines(curve, pointsOnly: true).OrderByDescending(g => g.index).ToList();
+        if(groups.Count == 0) return false;
+        if(groups.Sum(g => g.points.Count) == curve.Splines.Sum(s => s.Points.Count))
+        {
+            // RemoveCurve takes the undo snapshot and detaches tracks using the intact path.
+            _tl.RemoveCurve(curve);
+            CurveId = null;
+            _status("曲线已没有控制点，已删除。", false);
+        }
+        else
+        {
+            _tl.Snapshot();
+            foreach(var (spline, index, points) in groups)
+                if(!CurveEdit.Delete(spline, points)) curve.Splines.RemoveAt(index);
+            curve.Touch(); _tl.Touch();
+        }
         Selection.Clear();
-        if(curve.Splines.Count == 0) { _tl.RemoveCurve(curve); CurveId = null; _status("曲线已没有控制点，已删除。", false); }
-        else { curve.Touch(); _tl.Touch(); }
+        ClearPickCache();
         return true;
     }
 
-    private IEnumerable<(Spline spline, int index, HashSet<int> points)> SelectedSplines(CurveObject curve) =>
-        Selection.Where(s => s.Spline < curve.Splines.Count).GroupBy(s => s.Spline)
+    private void ClearPickCache()
+    {
+        Candidates.Clear(); FollowCandidates.Clear();
+        Hover = null; HoverFollow = null;
+    }
+
+    private static bool ValidPart(CurveObject curve, CurveSelection s) =>
+        s.Spline >= 0 && s.Spline < curve.Splines.Count && s.Point >= 0 && s.Point < curve.Splines[s.Spline].Points.Count
+        && (s.Part == CurvePart.Point || (s.Part is CurvePart.Left or CurvePart.Right) && curve.Splines[s.Spline].Type == SplineType.Bezier);
+
+    private IEnumerable<(Spline spline, int index, HashSet<int> points)> SelectedSplines(CurveObject curve, bool pointsOnly = false) =>
+        Selection.Where(s => (!pointsOnly || s.Part == CurvePart.Point) && ValidPart(curve, s)).GroupBy(s => s.Spline)
             .Select(g => (curve.Splines[g.Key], g.Key, g.Select(s => s.Point).ToHashSet()));
 
     private void Edit(string what, Action<CurveObject> action)
@@ -438,7 +470,7 @@ public sealed class CurveTool
     {
         ImGui.TextDisabled("曲线与镜头节点都是世界坐标。参照 Blender：物体模式整体移动/旋转/缩放，编辑模式点选控制点与贝塞尔手柄。");
         if(ImGui.Checkbox("在游戏内显示编辑框", ref Active)) Selection.Clear();
-        if(ImGui.IsItemHovered()) ImGui.SetTooltip("开启后在游戏内显示所选曲线的控制点（方块）和手柄（圆点）、物体模式的整体手柄、节点路径的手柄。\n变换手柄作用于最后选中的对象：点选曲线节点就编辑曲线，点选镜头节点就编辑镜头，Ctrl+单击多选，单击空白处取消选择。\n被当前轨道跟随的曲线，其控制点始终可以点选。");
+        if(ImGui.IsItemHovered()) ImGui.SetTooltip("开启后在游戏内显示所选曲线的控制点（方块）和手柄（圆点）、物体模式的整体手柄、节点路径的手柄。\n变换手柄作用于最后选中的对象：点选曲线节点就编辑曲线，点选镜头节点就编辑镜头，单击空白处取消选择。\n被当前轨道跟随的曲线，其控制点始终可以点选。");
         ImGui.SameLine();
         ImGui.BeginDisabled(!gpose);
         ImGui.SetNextItemWidth(130);
@@ -514,40 +546,61 @@ public sealed class CurveTool
         ImGui.Separator();
         ImGui.TextUnformatted($"编辑模式 · 已选 {Selection.Count}");
         ImGui.BeginDisabled(Selection.Count == 0);
-        if(ImGui.Button("挤出"))
-            Edit("已挤出新控制点并选中，可直接拖动。", curve =>
-            {
-                var created = new List<CurveSelection>();
-                foreach(var (s, si, points) in SelectedSplines(curve).ToList())
-                    foreach(int end in points.Where(p => p == 0 || p == s.Points.Count - 1).OrderByDescending(p => p).ToList())
-                        if(CurveEdit.Extrude(s, end) is int added and >= 0) created.Add(new CurveSelection(si, added));
-                Selection.Clear(); Selection.UnionWith(created);
-                if(created.Count == 0) _status("挤出只能用于未闭合样条的端点。", true);
-            });
-        if(ImGui.IsItemHovered()) ImGui.SetTooltip("Blender E：从所选端点延伸出新的控制点。");
-        ImGui.SameLine();
-        if(ImGui.Button("细分"))
-            Edit("已细分所选相邻控制点之间的线段（保持形状）。", curve =>
-            {
-                var created = new List<CurveSelection>();
-                foreach(var (s, si, points) in SelectedSplines(curve).ToList())
-                    created.AddRange(CurveEdit.Subdivide(s, points).Select(i => new CurveSelection(si, i)));
-                Selection.Clear(); Selection.UnionWith(created);
-            });
-        if(ImGui.IsItemHovered()) ImGui.SetTooltip("在每对相邻的已选控制点之间插入一个点。");
-        ImGui.SameLine();
-        if(ImGui.Button("删除点")) DeleteSelected();
-        if(ImGui.IsItemHovered()) ImGui.SetTooltip("删除所选控制点（游戏内按 Delete 也可）。");
-        ImGui.SameLine();
-        if(ImGui.Button("切换闭合")) Edit("已切换闭合。", curve => { foreach(var (s, _, _) in SelectedSplines(curve)) CurveEdit.ToggleCyclic(s); });
-        if(ImGui.IsItemHovered()) ImGui.SetTooltip("Blender Alt+C：闭合或打开所选样条。");
-        ImGui.SameLine();
-        if(ImGui.Button("切换方向")) Edit("已反转样条方向。", curve => { foreach(var (s, _, _) in SelectedSplines(curve)) CurveEdit.SwitchDirection(s); Selection.Clear(); });
+        DrawPointCommands(false);
         DrawHandleTypeControl();
 
         var selectedPoints = SelectedSplines(c).SelectMany(x => x.points.Where(i => i < x.spline.Points.Count).Select(i => x.spline.Points[i])).Distinct().ToList();
         DrawPointProperties(c, selectedPoints);
         ImGui.EndDisabled();
+    }
+
+    public void DrawPointContextCommands() => DrawPointCommands(true);
+
+    private void DrawPointCommands(bool menu)
+    {
+        if(!EditMode || NodePath || Curve is not { } curve) return;
+        var groups = SelectedSplines(curve, pointsOnly: true).ToList();
+        int count = groups.Sum(g => g.points.Count);
+        if(menu && count == 0) return;
+        if(menu) ImGui.Separator();
+        bool Item(string label, bool enabled, string help)
+        {
+            ImGui.BeginDisabled(!enabled);
+            bool clicked = menu ? ImGui.MenuItem(label) : ImGui.Button(label);
+            ImGui.EndDisabled();
+            if(ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled)) ImGui.SetTooltip(help);
+            return clicked;
+        }
+        bool canExtrude = groups.Any(g => !g.spline.Cyclic && (g.points.Contains(0) || g.points.Contains(g.spline.Points.Count - 1)));
+        if(Item("挤出", canExtrude, "从所选开放样条的端点延伸出新的控制点。"))
+            Edit("已挤出并选中新控制点。", _ =>
+            {
+                Selection.Clear();
+                foreach(var (s, si, points) in groups.Where(g => !g.spline.Cyclic))
+                {
+                    var ends = points.Where(p => p == 0 || p == s.Points.Count - 1).OrderDescending().ToArray();
+                    var added = new List<CurvePoint>();
+                    foreach(int end in ends) added.Add(s.Points[CurveEdit.Extrude(s, end)]);
+                    foreach(var point in added) Selection.Add(new CurveSelection(si, s.Points.IndexOf(point)));
+                }
+            });
+        if(!menu) ImGui.SameLine();
+        bool adjacent = groups.Any(g => g.spline.Points.Count > 1 && g.points.Any(i => i < g.spline.SegmentCount && g.points.Contains((i + 1) % g.spline.Points.Count)));
+        if(Item("细分", adjacent, "请选择同一样条上相邻的两个控制点。"))
+            Edit("已细分所选相邻控制点之间的线段。", _ =>
+            {
+                Selection.Clear();
+                foreach(var (s, si, points) in groups)
+                    foreach(int i in CurveEdit.Subdivide(s, points)) Selection.Add(new CurveSelection(si, i));
+            });
+        if(!menu) ImGui.SameLine();
+        if(Item("切换闭合", groups.Any(g => g.spline.Points.Count >= 2), "闭合或打开所选控制点所属的样条。"))
+            Edit("已切换闭合。", _ => { foreach(var g in groups) CurveEdit.ToggleCyclic(g.spline); });
+        if(!menu) ImGui.SameLine();
+        if(Item("切换方向", count > 0, "反转所选控制点所属样条的方向。"))
+            Edit("已反转样条方向。", _ => { foreach(var g in groups) CurveEdit.SwitchDirection(g.spline); Selection.Clear(); });
+        if(!menu) ImGui.SameLine();
+        if(Item(count > 1 ? $"删除所选 {count} 个节点" : "删除节点", count > 0, "删除所选控制点。")) DeleteSelected();
     }
 
     private void DrawNodePathPanel()

@@ -11,7 +11,7 @@ namespace XcpCam;
 public sealed class GraphEditor
 {
     public bool PlayheadChanged { get; private set; }
-    public string Status { get; private set; } = "Ctrl/Shift单击多选；Ctrl+左键框选；Ctrl滚轮缩放横轴，Ctrl+Alt缩放纵轴，Alt滚轮纵移；空白左键/中键拖视图。";
+    public string Status { get; private set; } = "";
     private readonly SpatialGraphEditor spatial = new();
     private bool fit = true, snapshot;
     private Guid shotId;
@@ -33,15 +33,15 @@ public sealed class GraphEditor
     private readonly record struct Hit(Ref Item, bool Handle, bool Right, Vector2 Point);
     private static readonly uint[] Colors = [0xFF6666EF, 0xFF70CE70, 0xFFEF9870];
 
-    public void Draw(ShotCurves shot, CamTimeline timeline)
+    public void Draw(ShotCurves shot, CamTimeline timeline, ShortcutBindings shortcuts)
     {
         int timing = shot.FollowTimingSignature(), count = shot.SeededNodes.Count;
-        DrawGraph(shot, timeline);
+        DrawGraph(shot, timeline, shortcuts);
         if(count == shot.SeededNodes.Count && timing != shot.FollowTimingSignature() && timeline.SyncCurveAnchorsFromEditor(shot))
             Status = "速度曲线已生效，曲线节点的时间轴位置已按实际经过帧同步。";
     }
 
-    private void DrawGraph(ShotCurves shot, CamTimeline timeline)
+    private void DrawGraph(ShotCurves shot, CamTimeline timeline, ShortcutBindings shortcuts)
     {
         PlayheadChanged = false;
         if(ImGui.Button(shot.EditorMode == CurveEditorMode.Advanced ? "高级曲线 · 当前" : "使用高级曲线"))
@@ -52,7 +52,7 @@ public sealed class GraphEditor
         ImGui.TextDisabled(shot.EditorMode == CurveEditorMode.Advanced ? "高级曲线生效：直接控制数值、速度和节点帧；简单曲线锁定。" : "简单曲线生效：高级曲线锁定且保留。切换不会重建高级数据。");
         if(shot.UsesTimeAnchors)
             ImGui.TextDisabled("曲线已锚定时间轴：编辑速度会同步曲线节点的经过帧；拖动曲线节点则按新锚点重新定时。");
-        if(shot.EditorMode == CurveEditorMode.Advanced) { spatial.Draw(shot, timeline); Status = spatial.Status; return; }
+        if(shot.EditorMode == CurveEditorMode.Advanced) { spatial.Draw(shot, timeline, shortcuts); Status = spatial.Status; return; }
         if(shotId != shot.Id) { shotId = shot.Id; selected.Clear(); fit = true; End(); selectionRevision = -1; }
         if(shot.Intervals.Count == 0) { ImGui.TextDisabled("此连续段只有一个节点，没有运动曲线。"); return; }
         bool linked = shot.Intervals.All(i => i.Linked);
@@ -141,7 +141,8 @@ public sealed class GraphEditor
         if(hovered && io.MouseWheel != 0)
         {
             ViewportMath.Wheel(ref left, ref span, ref bottom, ref height, io.MouseWheel,
-                io.KeyCtrl, io.KeyAlt, (mouse.X - origin.X) / width, (end.Y - mouse.Y) / (h - 24));
+                shortcuts.Held(Shortcut.ZoomX) || shortcuts.Held(Shortcut.ZoomY),
+                shortcuts.Held(Shortcut.ScrollY) || shortcuts.Held(Shortcut.ZoomY), (mouse.X - origin.X) / width, (end.Y - mouse.Y) / (h - 24));
         }
         var dl = ImGui.GetWindowDrawList(); dl.PushClipRect(origin, end, true); dl.AddRectFilled(origin, end, 0xFF202020);
         double step = Math.Max(1, Math.Pow(10, Math.Floor(Math.Log10(span / 10))));
@@ -202,7 +203,7 @@ public sealed class GraphEditor
                 drag = target.Item; dragHandle = target.Handle; dragRight = target.Right;
                 if(!target.Handle)
                 {
-                    bool add = io.KeyCtrl || io.KeyShift;
+                    bool add = shortcuts.Held(Shortcut.Select) || shortcuts.Held(Shortcut.ExtendSelection);
                     if(!add && !selected.Contains(target.Item.Key.Id)) { selected.Clear(); timeline.SelectNodes([]); }
                     if(add && !selected.Add(target.Item.Key.Id)) selected.Remove(target.Item.Key.Id); else selected.Add(target.Item.Key.Id);
                     if(target.Item.Key.NodeId is Guid id)
@@ -216,7 +217,7 @@ public sealed class GraphEditor
                 originalFrame = target.Item.Key.Frame; originalValue = target.Item.Key.Value;
                 originalHandle = target.Item.Leg.Curve(target.Item.Channel).Handle(target.Item.Key, target.Right);
             }
-            else if(io.KeyCtrl) box = mouse;
+            else if(shortcuts.Held(Shortcut.Box)) box = mouse;
             else if(mouse.Y < plot.Y) { scrubbing = true; timeline.Playhead = (float)Math.Clamp(Math.Round(F(mouse.X)), 0, timeline.Length); PlayheadChanged = true; }
             else { panning = true; blankClick = true; lastMouse = mouse; }
         }

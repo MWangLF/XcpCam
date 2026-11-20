@@ -10,7 +10,7 @@ namespace XcpCam;
 /// <summary>Shot-local graph editor. Selection and locks are editor state, not timeline mutations.</summary>
 public sealed class SpatialGraphEditor
 {
-    public string Status { get; private set; } = "Shift单击多选；Ctrl+左键拖空白框选；Ctrl滚轮：横轴缩放；Ctrl+Alt滚轮：纵轴缩放；Alt滚轮：纵移；空白左键/中键拖动：平移。";
+    public string Status { get; private set; } = "";
 
     /// <summary>
     /// Editor channels, following Blender's Follow Path layering: the path shape is the 3D curve edited in the
@@ -87,7 +87,7 @@ public sealed class SpatialGraphEditor
     private double FrozenFrame(GraphChannel channel, double parameter) => IsTime(channel) ? parameter : SpatialFrameMap.Frame(_dragMap ?? _shot, Spatial(channel), parameter);
     private readonly record struct Hit(KeyId Id, bool Handle, bool Right, Vector2 Position);
 
-    public void Draw(ShotCurves shot, CamTimeline timeline)
+    public void Draw(ShotCurves shot, CamTimeline timeline, ShortcutBindings shortcuts)
     {
         if(shot.EditorMode != CurveEditorMode.Advanced) { EndGesture(); ImGui.TextDisabled("高级曲线已锁定，请先切换模式。"); return; }
         _shot = shot;
@@ -133,7 +133,7 @@ public sealed class SpatialGraphEditor
         var start = ImGui.GetCursorScreenPos();
         float width = MathF.Max(210, ImGui.GetContentRegionAvail().X - HeaderWidth);
         const float graphHeight = 340;
-        DrawChannels(start);
+        DrawChannels(start, shortcuts);
         var origin = start + new Vector2(HeaderWidth, 0);
         var plot = origin + new Vector2(0, RulerHeight);
         var end = origin + new Vector2(width, graphHeight);
@@ -156,7 +156,8 @@ public sealed class SpatialGraphEditor
         if (hovered && _gesture == Gesture.None && io.MouseWheel != 0)
         {
             ViewportMath.Wheel(ref _left, ref _span, ref _bottom, ref _height, io.MouseWheel,
-                io.KeyCtrl, io.KeyAlt, (mouse.X - origin.X) / width, (end.Y - mouse.Y) / plotHeight);
+                shortcuts.Held(Shortcut.ZoomX) || shortcuts.Held(Shortcut.ZoomY),
+                shortcuts.Held(Shortcut.ScrollY) || shortcuts.Held(Shortcut.ZoomY), (mouse.X - origin.X) / width, (end.Y - mouse.Y) / plotHeight);
         }
 
         var dl = ImGui.GetWindowDrawList();
@@ -294,7 +295,7 @@ public sealed class SpatialGraphEditor
                 else if (hit is { } h)
                 {
                     _active = h.Id.Channel;
-                    if (io.KeyShift && !h.Handle)
+                    if (shortcuts.Held(Shortcut.ExtendSelection) && !h.Handle)
                     {
                         if (!_selected.Add(h.Id)) _selected.Remove(h.Id);
                         _primary = _selected.Contains(h.Id) ? h.Id : null;
@@ -326,7 +327,7 @@ public sealed class SpatialGraphEditor
                         else Status = "通道已锁定。";
                     }
                 }
-                else if (io.KeyCtrl) { _gesture = Gesture.Box; _boxEnd = mouse; }
+                else if (shortcuts.Held(Shortcut.Box)) { _gesture = Gesture.Box; _boxEnd = mouse; }
                 else { _gesture = Gesture.Pan; _blankClick = true; }
             }
         }
@@ -438,7 +439,7 @@ public sealed class SpatialGraphEditor
         ImGui.TextDisabled("插值作用于关键帧到下一关键帧的出段；贝塞尔手柄模式同时影响该关键帧两侧。锁定通道不修改。");
     }
 
-    private void DrawChannels(Vector2 start)
+    private void DrawChannels(Vector2 start, ShortcutBindings shortcuts)
     {
         ImGui.SetCursorScreenPos(start);
         ImGui.TextDisabled("通道  显示 / 锁定");
@@ -459,15 +460,13 @@ public sealed class SpatialGraphEditor
             if (ImGui.Selectable(ChannelLabel(ch), _active == ch, ImGuiSelectableFlags.None, new Vector2(88, 0)))
             {
                 _active = ch;
-                if (!ImGui.GetIO().KeyShift) _visible.Clear();
+                if (!shortcuts.Held(Shortcut.ExtendSelection)) _visible.Clear();
                 _visible.Add(ch); EndGesture(); _fit = true;
             }
             ImGui.PopID();
         }
         ImGui.SetCursorScreenPos(start + new Vector2(0, 295));
         if (ImGui.SmallButton("显示全部")) { foreach (var ch in Channels) _visible.Add(ch); EndGesture(); }
-        ImGui.SetCursorScreenPos(start + new Vector2(0, 318));
-        ImGui.TextDisabled("Shift：多通道叠加");
     }
 
     private void DrawInspector(ShotCurves shot, CamTimeline timeline)

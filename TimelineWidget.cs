@@ -61,7 +61,7 @@ public sealed class TimelineWidget
     private bool _panning;
     private const float ViewHeight = 260f;
 
-    public void Draw(CamTimeline tl, ShotComposer? comp)
+    public void Draw(CamTimeline tl, ShotComposer? comp, ShortcutBindings shortcuts)
     {
         PlayheadChanged = false; KeysChanged = false; DragStarted = false; TracksEdited = false;
         CurvePointsClicked = false; NodesClicked = false;
@@ -97,14 +97,14 @@ public sealed class TimelineWidget
         float visibleFrames = width / PixelsPerFrame;
         if(hovered && io.MouseWheel != 0)
         {
-            if(io.KeyCtrl && io.KeyAlt)
+            if(shortcuts.Held(Shortcut.ZoomY))
             {
                 float at = (trackScroll + mouse.Y - origin.Y - RulerH - OutputH - 4) / LaneH;
                 LaneH = Math.Clamp(LaneH * MathF.Pow(1.2f, io.MouseWheel), 26, 90);
                 trackScroll = at * LaneH - (mouse.Y - origin.Y - RulerH - OutputH - 4);
             }
-            else if(io.KeyAlt) trackScroll -= io.MouseWheel * LaneH * 2;
-            else if(io.KeyCtrl)
+            else if(shortcuts.Held(Shortcut.ScrollY)) trackScroll -= io.MouseWheel * LaneH * 2;
+            else if(shortcuts.Held(Shortcut.ZoomX))
             {
                 float fAtMouse = ScrollFrame + (mouse.X - origin.X) / PixelsPerFrame;
                 PixelsPerFrame = Math.Clamp(PixelsPerFrame * (io.MouseWheel > 0 ? 1.2f : 1f / 1.2f), 0.5f, 60f);
@@ -274,7 +274,7 @@ public sealed class TimelineWidget
         {
             if(hoveredPoint is { } hp && Curves != null)
             {
-                bool additive = ImGui.GetIO().KeyCtrl || ImGui.GetIO().KeyShift;
+                bool additive = shortcuts.Held(Shortcut.Select) || shortcuts.Held(Shortcut.ExtendSelection);
                 var track = tl.Tracks[hp.lane];
                 Curves.SelectFollowedPoint(track, hp.point.Index, additive);
                 Selected = null; tl.SelectNodes([]);
@@ -290,7 +290,7 @@ public sealed class TimelineWidget
             {
                 Curves?.ClearSelection();
                 NodesClicked = true;
-                bool additive = ImGui.GetIO().KeyCtrl || ImGui.GetIO().KeyShift;
+                bool additive = shortcuts.Held(Shortcut.Select) || shortcuts.Held(Shortcut.ExtendSelection);
                 if(additive) tl.ToggleNode(hoveredKey.Id);
                 else if(!tl.SelectedNodes.Contains(hoveredKey.Id)) tl.SelectNodes([hoveredKey.Id]);
                 Selected = hoveredKey;
@@ -303,7 +303,7 @@ public sealed class TimelineWidget
             }
             else
             {
-                bool box = ImGui.GetIO().KeyCtrl;
+                bool box = shortcuts.Held(Shortcut.Box);
                 _boxStart = box ? mouse : null; _boxAdd = box;
                 _scrubbing = !box && mouse.Y < origin.Y + RulerH;
                 _panning = !box && !_scrubbing;
@@ -352,12 +352,46 @@ public sealed class TimelineWidget
         {
             if(_boxStart is Vector2 boxStart)
             {
-                var a = Vector2.Min(boxStart, mouse); var b = Vector2.Max(boxStart, mouse);
-                var ids = tl.Tracks.SelectMany((track, lane) => track.Keys.Where(k =>
-                    X(k.Frame) >= a.X && X(k.Frame) <= b.X &&
-                    LaneTop(lane) + LaneH * 0.5f >= a.Y && LaneTop(lane) + LaneH * 0.5f <= b.Y).Select(k => k.Id));
-                tl.SelectNodes(ids, _boxAdd);
-                Selected ??= tl.AllKeys.FirstOrDefault(k => tl.SelectedNodes.Contains(k.Id));
+                var a = Vector2.Max(Vector2.Min(boxStart, mouse), new Vector2(origin.X, origin.Y + RulerH + OutputH + 4));
+                var b = Vector2.Min(Vector2.Max(boxStart, mouse), origin + size);
+                bool Inside(float x, float y) => x >= a.X && x <= b.X && y >= a.Y && y <= b.Y;
+                var ids = new List<Guid>();
+                var points = new List<int>();
+                int pointLane = -1;
+                float nearestRow = float.PositiveInfinity;
+                float nearestCameraRow = float.PositiveInfinity;
+                for(int lane = 0; lane < lanes; lane++)
+                {
+                    var track = tl.Tracks[lane];
+                    var times = CurveTimes(track, comp);
+                    float cameraY = LaneTop(lane) + LaneH * (times.Count > 0 ? .36f : .5f);
+                    foreach(var key in track.Keys)
+                        if(Inside(X(key.Frame), cameraY))
+                        {
+                            ids.Add(key.Id);
+                            nearestCameraRow = Math.Min(nearestCameraRow, Math.Abs(boxStart.Y - cameraY));
+                        }
+                    float pointY = LaneTop(lane) + LaneH - 7;
+                    float distance = Math.Abs(boxStart.Y - pointY);
+                    if(Curves == null || distance >= nearestRow || pointY < a.Y || pointY > b.Y) continue;
+                    var hits = times.Where(p => p.Frame is double f && Inside(X((float)f), pointY)).Select(p => p.Index).Distinct().ToList();
+                    if(hits.Count == 0) continue;
+                    pointLane = lane; points = hits; nearestRow = distance;
+                }
+                // The inspector and gizmo edit one kind of node at a time. A mixed box uses the row nearest its start.
+                if(pointLane >= 0 && nearestRow <= nearestCameraRow && Curves != null)
+                {
+                    tl.ActiveTrackIndex = pointLane;
+                    var track = tl.Tracks[pointLane];
+                    Curves.SelectFollowedPoints(track, points, _boxAdd);
+                    Selected = null; tl.SelectNodes([]); CurvePointsClicked = true;
+                }
+                else if(ids.Count > 0)
+                {
+                    Curves?.ClearSelection(); NodesClicked = true;
+                    tl.SelectNodes(ids, _boxAdd);
+                    Selected ??= tl.AllKeys.FirstOrDefault(k => tl.SelectedNodes.Contains(k.Id));
+                }
             }
             _boxStart = null;
             _panning = false;
@@ -375,7 +409,7 @@ public sealed class TimelineWidget
                 ? $"{hc.Name} · P{p.Index + 1}：镜头在第 {p.Frame:0.###} 帧再次经过它（闭合曲线的起点在 100% 处也是它）\n单击选中，双击跳转"
                 : $"{hc.Name} · P{p.Index + 1}：{(p.Anchored ? "锚定时间轴" : "锚定镜头")}  第 {p.Frame:0.###} 帧  路径进度 {p.Factor * 100:0.0}%\n" +
                   (p.Anchored ? "拖动改变这个节点锚定的帧（镜头会在这一帧精确经过它）" : "镜头在这一帧经过它；拖动会把整条曲线改为锚定时间轴") +
-                  "，双击跳转。\n锚定作用于整条曲线：Alt+T 锚定时间轴，Alt+C 锚定镜头");
+                  "，双击跳转。\n锚定作用于整条曲线");
             if(ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left) && p.Frame is double jump)
             {
                 tl.Playhead = Math.Clamp((float)Math.Round(jump), 0, tl.Length);
