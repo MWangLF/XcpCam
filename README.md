@@ -1,8 +1,17 @@
 # XcpCam - FFXIV GPose 可视化运镜编辑插件
 
-[![Latest Release](https://img.shields.io/github/v/release/MWangLF/XcpCam?include_prereleases&label=Release)](https://github.com/MWangLF/XcpCam/releases)
-[![Downloads](https://img.shields.io/github/downloads/MWangLF/XcpCam/total?label=Downloads)](https://github.com/MWangLF/XcpCam/releases)
-[![License](https://img.shields.io/github/license/MWangLF/XcpCam?label=License)](LICENSE)
+<p>
+  <a href="https://github.com/MWangLF/XcpCam/releases"><img alt="Release" src="https://img.shields.io/github/v/release/MWangLF/XcpCam?include_prereleases&style=flat-square&label=Release&color=blue"></a>
+  <a href="https://github.com/MWangLF/XcpCam/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/MWangLF/XcpCam/total?style=flat-square&label=Downloads&color=blue"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/MWangLF/XcpCam?style=flat-square&label=License&color=blue"></a>
+</p>
+
+<p>
+  <a href="README.md"><img alt="中文" src="https://img.shields.io/badge/%E4%B8%AD%E6%96%87-blue?style=flat-square"></a>
+  <a href="README.en.md"><img alt="English" src="https://img.shields.io/badge/English-lightgrey?style=flat-square"></a>
+  <a href="README.ja.md"><img alt="日本語" src="https://img.shields.io/badge/%E6%97%A5%E6%9C%AC%E8%AA%9E-lightgrey?style=flat-square"></a>
+  <a href="README.ko.md"><img alt="한국어" src="https://img.shields.io/badge/%ED%95%9C%EA%B5%AD%EC%96%B4-lightgrey?style=flat-square"></a>
+</p>
 
 > **当前版本：0.0.6.4（Pre-release）**。插件仍在持续迭代中，欢迎通过 [GitHub Issues](https://github.com/MWangLF/XcpCam/issues) 反馈问题或建议。
 
