@@ -12,6 +12,14 @@ public class CurveKey
     public Guid Id = Guid.NewGuid();
     public Guid? NodeId;
     public int Frame;
+    // Only free time-domain keys need a fractional frame. Bound nodes and spatial keys stay integral.
+    public double? Subframe;
+    public double Time => Subframe ?? Frame;
+    internal void SetTime(double time)
+    {
+        Frame = checked((int)System.Math.Round(time, System.MidpointRounding.AwayFromZero));
+        Subframe = time == Frame ? null : time;
+    }
     public double Value;
     public CurveInterpolation Interpolation = CurveInterpolation.Bezier;
     public HandleMode Mode = HandleMode.AutoClamped;

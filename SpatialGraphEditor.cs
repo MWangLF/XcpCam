@@ -38,7 +38,7 @@ public sealed class SpatialGraphEditor
         foreach(var ch in Channels.Where(c => !IsTime(c))) _curves[ch] = shot.Space.Channels[Spatial(ch)];
     }
     /// <summary>Path progress values are the nodes' own positions on the node path; only their timing is edited.</summary>
-    private bool ValueLocked(GraphChannel ch) => ch == GraphChannel.Progress && !_shot.IsFollowing || _driven.Contains(ch);
+    private bool ValueLocked(KeyId id) => id.Channel == GraphChannel.Progress && !_shot.IsFollowing && Resolve(_shot, id)?.NodeId != null || _driven.Contains(id.Channel);
     /// <summary>Channels a tracking constraint drives: values and handles are not editable (keys can still retime nodes).</summary>
     private readonly HashSet<GraphChannel> _driven = new();
     private double DomainStart(GraphChannel ch) => IsTime(ch) ? _shot.Start : _space.Start;
@@ -80,7 +80,7 @@ public sealed class SpatialGraphEditor
     private const float HeaderWidth = 150, RulerHeight = 24;
     private enum Gesture { None, Keys, Handle, Box, Scrub, Pan }
     private readonly record struct KeyId(GraphChannel Channel, Guid Id);
-    private readonly record struct Anchor(KeyId Id, int Frame, double Value, double DisplayFrame);
+    private readonly record struct Anchor(KeyId Id, double Value, double DisplayFrame);
     private ShotCurves? _dragMap;
     private double _handleDisplayFrame;
     private double FrozenParameter(GraphChannel channel, double frame) => IsTime(channel) ? frame : SpatialFrameMap.Parameter(_dragMap ?? _shot, Spatial(channel), frame);
@@ -106,6 +106,12 @@ public sealed class SpatialGraphEditor
         if (!ReferenceEquals(_space, shot.Space)) EndGesture();
         _space = shot.Space;
         BindCurves(shot);
+        if(_fit && shot.Space.PreserveIntermediateKeys && _visible.SetEquals([GraphChannel.Progress]) && !shot.PathProgress.Keys.Any(k => k.NodeId == null))
+        {
+            _active = Channels.FirstOrDefault(ch => ch != GraphChannel.Progress && Curves[ch].Keys.Any(k => k.NodeId == null), GraphChannel.OffsetX);
+            _visible.Clear();
+            _visible.Add(_active);
+        }
         _driven.Clear();
         if(timeline.Tracks.FirstOrDefault(t => t.Shots.Contains(shot)) is { } owner)
         {
@@ -206,34 +212,41 @@ public sealed class SpatialGraphEditor
             {
                 if (!Curves.TryGetValue(ch, out var storedCurve)) continue;
                 var curve = storedCurve;
+                curve.Sort();
                 uint color = Color(ch);
                 double from = ToParameter(ch, Math.Max(shot.Start, _left)), to = ToParameter(ch, Math.Min(shot.End, _left + _span));
                 if (to >= from)
                 {
-                    // Include every key frame explicitly so Constant segments retain their vertical discontinuities.
+                    // Preserve vertical jumps explicitly even when their neighbours share a screen pixel.
                     var times = new SortedSet<double> { from, to };
                     int samples = Math.Clamp((int)width, 2, 2400);
                     for (int i = 1; i < samples; i++) times.Add(from + (to - from) * i / samples);
-                    foreach (var key in curve.Keys.Where(k => k.Frame >= from && k.Frame <= to))
-                    { times.Add(key.Frame); if (key.Frame > from) times.Add(Math.Max(from, key.Frame - .00001)); }
+                    for(int i = 1; i < curve.Keys.Count; i++)
+                    {
+                        var key = curve.Keys[i];
+                        if(key.Time <= from || key.Time > to || curve.Keys[i - 1].Interpolation != CurveInterpolation.Constant) continue;
+                        times.Add(key.Time);
+                        times.Add(Math.Max(from, Math.BitDecrement(key.Time)));
+                    }
                     Vector2? previous = null;
                     foreach (double f in times)
                     {
-                        double value = curve.Evaluate(f);
+                        double value = curve.EvaluateOrdered(f);
                         if (!double.IsFinite(value)) { previous = null; continue; }
                         var pt = Point(ch, f, value);
                         if (previous is { } prev) dl.AddLine(prev, pt, color, ch == _active ? 2 : 1.3f);
                         previous = pt;
                     }
                 }
-                var ordered = curve.Keys.OrderBy(k => k.Frame).ToList();
+                var ordered = curve.Keys;
                 for (int i = 0; i < ordered.Count; i++)
                 {
                     var key = ordered[i];
-                    if (key.Frame < DomainStart(ch) || key.Frame > DomainEnd(ch)) continue;
+                    if (key.Time < DomainStart(ch) || key.Time > DomainEnd(ch)) continue;
                     var id = new KeyId(ch, key.Id);
-                    var pt = Point(ch, key.Frame, key.Value);
                     bool selected = _selected.Contains(id);
+                    if(!selected && (key.Time < from || key.Time > to)) continue;
+                    var pt = Point(ch, key.Time, key.Value);
                     if (selected)
                     {
                         // Interpolation belongs to the outgoing segment, including for the next key's left handle.
@@ -320,8 +333,8 @@ public sealed class SpatialGraphEditor
                             {
                                 _gesture = Gesture.Keys;
                                 _anchors = SelectedKeys(shot).Where(x => _visible.Contains(x.id.Channel) && !_locked.Contains(x.id.Channel)
-                                        && Editable(x.id.Channel, x.key.Frame))
-                                    .Select(x => new Anchor(x.id, x.key.Frame, x.key.Value, ToFrame(x.id.Channel, x.key.Frame))).ToList();
+                                        && Editable(x.id.Channel, x.key.Time))
+                                    .Select(x => new Anchor(x.id, x.key.Value, ToFrame(x.id.Channel, x.key.Time))).ToList();
                             }
                         }
                         else Status = "通道已锁定。";
@@ -359,7 +372,7 @@ public sealed class SpatialGraphEditor
                     if (_gesture == Gesture.Keys)
                     {
                         int dt = (int)Math.Clamp(Math.Round(delta.X / width * _dragSpan), int.MinValue / 2, int.MaxValue / 2);
-                        var moves = _anchors.Select(a => (a.Id, frame: (long)Math.Round(FrozenParameter(a.Id.Channel, a.DisplayFrame + dt)), 
+                        var moves = _anchors.Select(a => (a.Id, frame: EditTime(a.Id, FrozenParameter(a.Id.Channel, a.DisplayFrame + dt)),
                             value: a.Value - delta.Y / plotHeight * _dragHeight * Scale(a.Id.Channel))).ToList();
                         ApplyMoves(shot, timeline, moves, true);
                     }
@@ -390,14 +403,14 @@ public sealed class SpatialGraphEditor
                     foreach (var ch in _visible)
                         if (Curves.TryGetValue(ch, out var curve))
                             foreach (var key in curve.Keys)
-                                if (key.Frame >= DomainStart(ch) && key.Frame <= DomainEnd(ch) && Inside(Point(ch, key.Frame, key.Value), a, b))
+                                if (key.Time >= DomainStart(ch) && key.Time <= DomainEnd(ch) && Inside(Point(ch, key.Time, key.Value), a, b))
                                 { var id = new KeyId(ch, key.Id); _selected.Add(id); _primary = id; }
                 }
                 EndGesture();
             }
         }
         if (hovered && hit is { } hover && Resolve(shot, hover.Id) is { } hoveredKey)
-            ImGui.SetTooltip($"{ChannelLabel(hover.Id.Channel)} | 帧 {ToFrame(hover.Id.Channel, hoveredKey.Frame):0.###} | 数值 {hoveredKey.Value:G8}" +
+            ImGui.SetTooltip($"{ChannelLabel(hover.Id.Channel)} | 帧 {ToFrame(hover.Id.Channel, hoveredKey.Time):0.###} | 数值 {hoveredKey.Value:G8}" +
                 (_locked.Contains(hover.Id.Channel) ? " | 已锁定" : ""));
         ImGui.SetCursorScreenPos(new Vector2(start.X, end.Y + 4));
         ImGui.TextDisabled(Status);
@@ -422,7 +435,9 @@ public sealed class SpatialGraphEditor
         int cursor = _cursor;
         ImGui.SetNextItemWidth(140);
         if (ImGui.InputInt("帧数游标", ref cursor)) _cursor = Math.Clamp(cursor, shot.Start, shot.End);
-        if (ImGui.Button("在游标帧添加可见通道关键帧")) Add(shot, timeline);
+        if (ImGui.Button("在游标帧添加镜头节点")) Add(shot, timeline);
+        ImGui.SameLine();
+        if (ImGui.Button("插入可见通道键")) InsertChannelKeys(shot, timeline);
         ImGui.SameLine();
         if (ImGui.Button("删除所选")) Delete(shot, timeline);
         if (ImGui.IsItemHovered()) ImGui.SetTooltip("跳过锁定通道；空间端点与中间关键帧均可编辑。");
@@ -473,15 +488,15 @@ public sealed class SpatialGraphEditor
     {
         if (_primary is not { } id || Resolve(shot, id) is not { } key)
         { ImGui.TextDisabled("选择关键帧编辑所在帧与通道数值；节点锚点横移会重定时。"); return; }
-        bool editable = !_locked.Contains(id.Channel) && !_driven.Contains(id.Channel) && Editable(id.Channel, key.Frame) && _gesture == Gesture.None;
+        bool editable = !_locked.Contains(id.Channel) && !_driven.Contains(id.Channel) && Editable(id.Channel, key.Time) && _gesture == Gesture.None;
         ImGui.BeginDisabled(!editable);
-        int frame = (int)Math.Round(ToFrame(id.Channel, key.Frame));
+        double frame = ToFrame(id.Channel, key.Time);
         double value = key.Value;
         ImGui.SetNextItemWidth(110);
-        bool changed = ImGui.InputInt("帧数", ref frame, 1, 10, "%d", ImGuiInputTextFlags.EnterReturnsTrue);
+        bool moved = ImGui.InputDouble("帧数", ref frame, 0, 0, "%.6g", ImGuiInputTextFlags.EnterReturnsTrue);
         ImGui.SameLine(); ImGui.SetNextItemWidth(155);
-        changed |= ImGui.InputDouble("原始值", ref value, 0, 0, "%.3f", ImGuiInputTextFlags.EnterReturnsTrue);
-        if (changed && editable) ApplyMoves(shot, timeline, new List<(KeyId, long, double)> { (id, (long)Math.Round(ToParameter(id.Channel, frame)), value) }, false);
+        bool changed = ImGui.InputDouble("原始值", ref value, 0, 0, "%.3f", ImGuiInputTextFlags.EnterReturnsTrue);
+        if ((moved || changed) && editable) ApplyMoves(shot, timeline, [(id, moved ? EditTime(id, ToParameter(id.Channel, frame)) : key.Time, value)], false);
         ImGui.EndDisabled();
         ImGui.SameLine(); ImGui.TextDisabled(ChannelLabel(id.Channel));
     }
@@ -499,16 +514,42 @@ public sealed class SpatialGraphEditor
         catch(InvalidOperationException ex) { Status = ex.Message; }
     }
 
+    private void InsertChannelKeys(ShotCurves shot, CamTimeline timeline)
+    {
+        EndGesture();
+        var additions = _visible.Where(ch => (ch != GraphChannel.Progress || shot.Space.PreserveIntermediateKeys && !shot.IsFollowing) && !_locked.Contains(ch) && !_driven.Contains(ch))
+            .Select(ch => (ch, time: IsTime(ch) ? _cursor : Math.Round(ToParameter(ch, _cursor))))
+            .Where(x => Editable(x.ch, x.time) && Curves[x.ch].Keys.All(k => k.Time != x.time)).ToArray();
+        if(additions.Length == 0) { Status = "当前游标帧没有可插入的可见通道。"; return; }
+        timeline.Snapshot();
+        shot.Space.PreserveIntermediateKeys = true;
+        _selected.Clear();
+        foreach(var (ch, time) in additions)
+        {
+            var key = Curves[ch].InsertPreserving(time);
+            _selected.Add(new KeyId(ch, key.Id));
+        }
+        _primary = _selected.First(); PushSelection(shot, timeline);
+        shot.Space.Touch(); timeline.Touch();
+        Status = $"已保形插入 {additions.Length} 个通道键。";
+    }
+
     private void Delete(ShotCurves shot, CamTimeline timeline)
     {
         EndGesture();
-        var targets = SelectedKeys(shot).Where(x => !_locked.Contains(x.id.Channel) && Editable(x.id.Channel, x.key.Frame)).ToList();
-        if(_locked.Count > 0) { Status = "删除节点会同步全部通道，请先解除通道锁定。"; return; }
+        var targets = SelectedKeys(shot).Where(x => !_locked.Contains(x.id.Channel) && !_driven.Contains(x.id.Channel) && Editable(x.id.Channel, x.key.Time)).ToList();
         var ids = targets.Where(x => x.key.NodeId.HasValue).Select(x => x.key.NodeId!.Value)
             .Concat(timeline.SelectedNodes.Where(shot.SeededNodes.Contains)).Distinct().ToArray();
-        if(ids.Length == 0) { Status = "没有选中的相机节点。"; return; }
-        timeline.DeleteNodes(ids); _selected.Clear(); _primary = null;
-        Status = $"已同步删除 {ids.Length} 个相机节点及其所有通道关键帧。";
+        if(ids.Length > 0 && _locked.Count > 0) { Status = "删除节点会同步全部通道，请先解除通道锁定。"; return; }
+        var independent = targets.Where(x => !x.key.NodeId.HasValue).ToArray();
+        if(ids.Length == 0 && independent.Length == 0) return;
+        timeline.Snapshot();
+        foreach(var (id, key) in independent) Curves[id.Channel].Keys.Remove(key);
+        foreach(var ch in independent.Select(x => x.id.Channel).Distinct()) Curves[ch].RecalculateHandles();
+        if(ids.Length > 0) timeline.DeleteNodes(ids, snapshot: false);
+        else { shot.Space.Touch(); timeline.Touch(); }
+        _selected.Clear(); _primary = null;
+        Status = $"已删除 {ids.Length} 个镜头节点、{independent.Length} 个中间通道键。";
     }
 
     private void ApplyPreset(ShotCurves shot, CamTimeline timeline)
@@ -517,23 +558,23 @@ public sealed class SpatialGraphEditor
         var targets = (_scope == 0 ? SelectedKeys(shot) : Curves
             .Where(x => _scope == 2 || x.Key == _active)
             .SelectMany(x => x.Value.Keys.Select(k => (id: new KeyId(x.Key, k.Id), key: k))))
-            .Where(x => !_locked.Contains(x.id.Channel) && !_driven.Contains(x.id.Channel) && Editable(x.id.Channel, x.key.Frame)).ToList();
-        string interpolation = ((CurveInterpolation)_preset).ToString();
-        string mode = ((HandleMode)_handleMode).ToString();
-        targets = targets.Where(x => _applyHandles || x.key.Interpolation.ToString() != interpolation).ToList();
+            .Where(x => !_locked.Contains(x.id.Channel) && !_driven.Contains(x.id.Channel) && Editable(x.id.Channel, x.key.Time)).ToList();
+        var interpolation = (CurveInterpolation)_preset;
+        var mode = (HandleMode)_handleMode;
+        targets = targets.Where(x => _applyHandles || x.key.Interpolation != interpolation).ToList();
         if (targets.Count == 0) { Status = "预设：指定范围内没有可修改的关键帧。"; return; }
         timeline.Snapshot();
         foreach (var x in targets)
         {
-            x.key.Interpolation = Named(x.key.Interpolation, interpolation);
+            if(!_applyHandles) Curves[x.id.Channel].SetInterpolation(x.key, interpolation);
             if (_applyHandles)
             {
-                x.key.Mode = Named(x.key.Mode, mode);
+                x.key.Mode = mode;
                 if(x.key.Mode == HandleMode.Aligned)
                 {
                     var curve = Curves[x.id.Channel];
                     bool right = x.key.Right.LengthSquared() > 0;
-                    curve.SetHandle(x.key, right, new Vector2(x.key.Frame, (float)x.key.Value) + (right ? x.key.Right : x.key.Left));
+                    curve.SetHandle(x.key, right, new Vector2((float)x.key.Time, (float)x.key.Value) + (right ? x.key.Right : x.key.Left));
                 }
             }
         }
@@ -542,7 +583,8 @@ public sealed class SpatialGraphEditor
             foreach(var ch in targets.Select(x => x.id.Channel).Distinct())
             {
                 // time channels are ordinary frame-domain F-curves; spatial channels use the node-run tangents
-                if(IsTime(ch)) { Curves[ch].RecalculateHandles(); continue; }
+                var selected = targets.Where(x => x.id.Channel == ch).Select(x => x.key.Id).ToHashSet();
+                if(IsTime(ch) || shot.Space.PreserveIntermediateKeys) { Curves[ch].RecalculateHandles(selected); continue; }
                 var ids = targets.Where(x => x.id.Channel == ch && x.key.NodeId.HasValue).Select(x => x.key.NodeId!.Value).ToHashSet();
                 SpatialTangents.Apply(shot.Space, owner.Keys.OrderBy(n => n.Frame).ToList(), Spatial(ch), ids, true);
             }
@@ -553,10 +595,10 @@ public sealed class SpatialGraphEditor
         shot.Space.Touch(); timeline.Touch(); Status = $"已对 {targets.Count} 个关键帧应用预设；自动手柄只考虑所选连续节点组，选区外不修改。";
     }
 
-    private bool ApplyMoves(ShotCurves shot, CamTimeline timeline, List<(KeyId id, long frame, double value)> moves, bool gesture)
+    private bool ApplyMoves(ShotCurves shot, CamTimeline timeline, List<(KeyId id, double frame, double value)> moves, bool gesture)
     {
         if (moves.Count == 0 || shot.EditorMode != CurveEditorMode.Advanced) return false;
-        if(moves.Any(m => Resolve(shot, m.id) == null || _locked.Contains(m.id.Channel) || !double.IsFinite(m.value))) return false;
+        if(moves.Any(m => Resolve(shot, m.id) == null || _locked.Contains(m.id.Channel) || _driven.Contains(m.id.Channel) || !double.IsFinite(m.frame) || !double.IsFinite(m.value))) return false;
         var nodeTargets = new Dictionary<Guid, int>();
         foreach(var move in moves)
         {
@@ -568,34 +610,37 @@ public sealed class SpatialGraphEditor
                 if(timeline.AllKeys.Any(k => k.Id == node && k.Frame != target)) nodeTargets[node] = target;
             }
         }
+        moves = moves.Select(m => Resolve(shot, m.id)?.NodeId.HasValue == true ? (m.id, Resolve(shot, m.id)!.Time, m.value) : m).ToList();
+        // path progress of the node path is fixed by the node positions: keep the value, only retime
+        moves = moves.Select(m => ValueLocked(m.id) ? (m.id, m.frame, Resolve(shot, m.id)!.Value) : m).ToList();
+        var moving = moves.Select(x => x.id).ToHashSet();
+        foreach (var m in moves)
+        {
+            var key = Resolve(shot, m.id);
+            if (key == null || _locked.Contains(m.id.Channel) || !Editable(m.id.Channel, key.Time)
+                || !Editable(m.id.Channel, m.frame)
+                || !double.IsFinite(m.value)
+                || Curves[m.id.Channel].Keys.Any(k => k.Time == m.frame && !moving.Contains(new KeyId(m.id.Channel, k.Id))))
+            { Status = "无法移动：路径参数重复、通道锁定或超出镜头参数范围。"; return false; }
+        }
+        if (moves.GroupBy(m => (m.id.Channel, m.frame)).Any(g => g.Count() > 1))
+        { Status = "无法移动：目标路径参数重复。"; return false; }
+        // Free keys may be retimed by a bound-node move in this same channel. Edit them in a separate gesture.
+        if(nodeTargets.Count > 0 && moves.Any(m => Resolve(shot, m.id)?.NodeId == null))
+        { Status = "请分别拖动镜头节点与独立通道键的时间。"; return false; }
         if(nodeTargets.Count > 0)
         {
             if(gesture) BeforeGesture(timeline); else timeline.Snapshot();
             if(!timeline.MoveNodes(nodeTargets)) { Status = "节点重定时被拒绝：碰撞或越过邻居。"; return false; }
         }
-        moves = moves.Select(m => Resolve(shot, m.id)?.NodeId.HasValue == true ? (m.id, (long)Resolve(shot, m.id)!.Frame, m.value) : m).ToList();
-        // path progress of the node path is fixed by the node positions: keep the value, only retime
-        moves = moves.Select(m => ValueLocked(m.id.Channel) ? (m.id, m.frame, Resolve(shot, m.id)!.Value) : m).ToList();
-        var moving = moves.Select(x => x.id).ToHashSet();
-        foreach (var m in moves)
-        {
-            var key = Resolve(shot, m.id);
-            if (key == null || _locked.Contains(m.id.Channel) || !Editable(m.id.Channel, key.Frame)
-                || !Editable(m.id.Channel, (int)m.frame)
-                || !double.IsFinite(m.value)
-                || Curves[m.id.Channel].Keys.Any(k => k.Frame == m.frame && !moving.Contains(new KeyId(m.id.Channel, k.Id))))
-            { Status = "无法移动：路径参数重复、通道锁定或超出镜头参数范围。"; return false; }
-        }
-        if (moves.GroupBy(m => (m.id.Channel, m.frame)).Any(g => g.Count() > 1))
-        { Status = "无法移动：目标路径参数重复。"; return false; }
-        if (!moves.Any(m => Resolve(shot, m.id) is { } k && (k.Frame != m.frame || k.Value != m.value))) return nodeTargets.Count > 0;
+        if (!moves.Any(m => Resolve(shot, m.id) is { } k && (k.Time != m.frame || k.Value != m.value))) return nodeTargets.Count > 0;
         if (gesture) BeforeGesture(timeline); else timeline.Snapshot();
         // Order by direction so group translations never collide with a selected key's old position.
         foreach (var group in moves.GroupBy(m => m.id.Channel))
         {
-            bool forward = group.First().frame > Resolve(shot, group.First().id)!.Frame;
-            var ordered = forward ? group.OrderByDescending(m => Resolve(shot, m.id)!.Frame) : group.OrderBy(m => Resolve(shot, m.id)!.Frame);
-            foreach (var m in ordered) Curves[m.id.Channel].MoveKey(Resolve(shot, m.id)!, (int)m.frame, m.value);
+            bool forward = group.First().frame > Resolve(shot, group.First().id)!.Time;
+            var ordered = forward ? group.OrderByDescending(m => Resolve(shot, m.id)!.Time) : group.OrderBy(m => Resolve(shot, m.id)!.Time);
+            foreach (var m in ordered) Curves[m.id.Channel].MoveKey(Resolve(shot, m.id)!, m.frame, m.value);
             Curves[group.Key].Sort();
             // Only the moved nodes (plus the influence range) are refitted on the next sync.
             foreach (var m in group) if (Resolve(shot, m.id)?.NodeId is Guid node)
@@ -611,7 +656,8 @@ public sealed class SpatialGraphEditor
     { if (!_snapshot) { timeline.Snapshot(); _snapshot = true; } }
     public void EndGesture()
     { _gesture = Gesture.None; _snapshot = false; _handleKey = null; _anchors.Clear(); }
-    private bool Editable(GraphChannel ch, int frame) => frame >= DomainStart(ch) && frame <= DomainEnd(ch);
+    private double EditTime(KeyId id, double time) => IsTime(id.Channel) && Resolve(_shot, id)?.NodeId == null ? time : Math.Round(time);
+    private bool Editable(GraphChannel ch, double frame) => frame >= DomainStart(ch) && frame <= DomainEnd(ch);
     private CurveKey? Resolve(ShotCurves shot, KeyId id) => Curves.TryGetValue(id.Channel, out var curve)
         ? curve.Keys.FirstOrDefault(k => k.Id == id.Id) : null;
     private IEnumerable<(KeyId id, CurveKey key)> SelectedKeys(ShotCurves shot)
@@ -646,11 +692,11 @@ public sealed class SpatialGraphEditor
     private void Fit(ShotCurves shot, bool selectedOnly)
     {
         var keys = Curves.Where(x => _visible.Contains(x.Key)).SelectMany(x => x.Value.Keys.Select(k => (ch: x.Key, key: k)))
-            .Where(x => x.key.Frame >= DomainStart(x.ch) && x.key.Frame <= DomainEnd(x.ch) && (!selectedOnly || _selected.Contains(new KeyId(x.ch, x.key.Id))))
+            .Where(x => x.key.Time >= DomainStart(x.ch) && x.key.Time <= DomainEnd(x.ch) && (!selectedOnly || _selected.Contains(new KeyId(x.ch, x.key.Id))))
             .ToList();
         if (selectedOnly && keys.Count == 0) { Status = "没有可用于适配视图的可见所选关键帧。"; return; }
-        double a = selectedOnly ? keys.Min(x => ToFrame(x.ch, x.key.Frame)) : shot.Start;
-        double b = selectedOnly ? keys.Max(x => ToFrame(x.ch, x.key.Frame)) : shot.End;
+        double a = selectedOnly ? keys.Min(x => ToFrame(x.ch, x.key.Time)) : shot.Start;
+        double b = selectedOnly ? keys.Max(x => ToFrame(x.ch, x.key.Time)) : shot.End;
         double pad = Math.Max(2, (b - a) * .06);
         _left = a - pad; _span = Math.Max(4, b - a + 2 * pad);
         var values = keys.Select(x => Display(x.ch, x.key.Value)).Where(double.IsFinite).ToList();

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Numerics;
 
 namespace XcpCam.Core;
 
@@ -131,8 +132,9 @@ public sealed class CamTimeline
         Touch();
     }
 
-    private readonly List<(List<CamTrack> tracks, int active, int fps, int length, List<CurveObject> curves)> _undo = [];
-    private readonly List<(List<CamTrack> tracks, int active, int fps, int length, List<CurveObject> curves)> _redo = [];
+    private sealed record HistoryEntry(ProjectState State, bool RestoreEditor);
+    private readonly List<HistoryEntry> _undo = [];
+    private readonly List<HistoryEntry> _redo = [];
     private const int MaxUndo = 64;
 
     public bool CanUndo => _undo.Count > 0;
@@ -164,7 +166,7 @@ public sealed class CamTimeline
     }
 
     /// <summary>Change the frame rate keeping every node at the same time in seconds. Hard cuts are kept.</summary>
-    public void SetFps(int fps, bool keepSeconds = true)
+    public void SetFps(int fps, bool keepSeconds = true, bool snapshot = false)
     {
         fps = Math.Clamp(fps, 1, 240);
         if(fps == Fps) return;
@@ -174,23 +176,46 @@ public sealed class CamTimeline
             // Validate every rescale on clones before modifying anything; never silently merge keys.
             foreach(var track in Tracks)
             {
-                if(track.Keys.GroupBy(k => (int)Math.Round(k.Frame * r, MidpointRounding.AwayFromZero)).Any(g => g.Count() > 1))
-                    throw new InvalidOperationException("更改帧率会使镜头节点占用同一帧，请先移动冲突节点。");
+                var collision = track.Keys.GroupBy(k => ProgressCurve.Round(k.Frame * r)).FirstOrDefault(g => g.Count() > 1);
+                if(collision != null)
+                    throw new InvalidOperationException($"轨道「{track.Name}」的第 {string.Join("、", collision.Select(k => k.Frame))} 帧换算后都落在第 {collision.Key} 帧。");
                 foreach(var shot in track.Shots) shot.Clone().Rescale(r);
             }
+            int length = Math.Max(1, ProgressCurve.Round(Length * r));
+            var recordings = new Dictionary<TrackConstraint, SortedList<int, Vector3>>();
+            foreach(var constraint in Tracks.SelectMany(track => track.TrackConstraints).Where(c => c.Recorded.Count > 0))
+            {
+                var recording = new SortedList<int, Vector3>();
+                foreach(int frame in constraint.Recorded.Keys.Select(k => ProgressCurve.Round(k * r)).Distinct())
+                    recording.Add(frame, constraint.RecordedAt((float)(frame / r))!.Value);
+                recordings.Add(constraint, recording);
+            }
+            if(snapshot) SaveHistory(true);
             foreach(var track in Tracks)
-                foreach(var shot in track.Shots)
-                    shot.Rescale(r);
+            {
+                foreach(var shot in track.Shots) shot.Rescale(r);
+                if(track.FollowPath is { } follow)
+                {
+                    foreach(var point in follow.TimeAnchors.Keys.ToArray()) follow.TimeAnchors[point] *= r;
+                    follow.LoopEndFrame *= r;
+                }
+                foreach(var constraint in track.TrackConstraints)
+                {
+                    if(recordings.TryGetValue(constraint, out var recording)) constraint.Recorded = recording;
+                }
+            }
             foreach(var k in AllKeys)
             {
                 k.Frame = (int)Math.Round(k.Frame * r, MidpointRounding.AwayFromZero);
                 k.HoldFrames = (int)Math.Round(k.HoldFrames * r, MidpointRounding.AwayFromZero);
             }
-            Length = Math.Max(1, (int)Math.Round(Length * r, MidpointRounding.AwayFromZero));
+            Length = length;
             Playhead = (float)(Playhead * r);
             foreach(var t in Tracks) ResolveCollisions(t);
         }
+        if(!keepSeconds && snapshot) Snapshot();
         Fps = fps;
+        SyncSeconds();
         ResyncGaps();
         Touch();
     }
@@ -377,11 +402,11 @@ public sealed class CamTimeline
         return node;
     }
 
-    public void DeleteNodes(IEnumerable<Guid> ids)
+    public void DeleteNodes(IEnumerable<Guid> ids, bool snapshot = true)
     {
         var selected = ids.ToHashSet();
         if(!AllKeys.Any(k => selected.Contains(k.Id))) return;
-        Snapshot();
+        if(snapshot) Snapshot();
         foreach(var track in Tracks)
         {
             track.Keys.RemoveAll(k => selected.Contains(k.Id));
@@ -472,12 +497,26 @@ public sealed class CamTimeline
 
     // ---------------- undo ----------------
 
-    private (List<CamTrack>, int, int, int, List<CurveObject>) Capture() =>
-        (Tracks.Select(t => t.Clone()).ToList(), ActiveTrackIndex, Fps, Length, Curves.Select(c => c.Clone()).ToList());
+    internal sealed record ProjectState(int Version, int Fps, int Length, float Playhead, int ActiveTrackIndex,
+        int PathInfluence, Guid[] SelectedNodes, List<CamTrack> Tracks, List<CurveObject> Curves);
 
-    public void Snapshot()
+    internal ProjectState Capture(bool clone) => new(1, Fps, Length, Playhead, _active, PathInfluence,
+        SelectedNodes.ToArray(), clone ? Tracks.Select(t => t.Clone()).ToList() : Tracks,
+        clone ? Curves.Select(c => c.Clone()).ToList() : Curves);
+
+    public void ReplaceProject(CamTimeline project)
     {
-        _undo.Add(Capture());
+        ArgumentNullException.ThrowIfNull(project);
+        var prepared = ProjectCodec.Decode(ProjectCodec.Encode(project)).Capture(false);
+        SaveHistory(true);
+        Apply(prepared, true);
+    }
+
+    public void Snapshot() => SaveHistory(false);
+
+    private void SaveHistory(bool restoreEditor)
+    {
+        _undo.Add(new(Capture(true), restoreEditor));
         if(_undo.Count > MaxUndo) _undo.RemoveAt(0);
         _redo.Clear();
     }
@@ -485,19 +524,44 @@ public sealed class CamTimeline
     public void Undo() => Swap(_undo, _redo);
     public void Redo() => Swap(_redo, _undo);
 
-    private void Swap(List<(List<CamTrack> tracks, int active, int fps, int length, List<CurveObject> curves)> from,
-        List<(List<CamTrack> tracks, int active, int fps, int length, List<CurveObject> curves)> to)
+    private void Swap(List<HistoryEntry> from, List<HistoryEntry> to)
     {
         if(from.Count == 0) return;
-        to.Add(Capture());
-        var (tracks, active, fps, length, curves) = from[^1];
+        var entry = from[^1];
+        to.Add(new(Capture(true), entry.RestoreEditor));
         from.RemoveAt(from.Count - 1);
-        Tracks = tracks.Select(t => t.Clone()).ToList();
-        Curves = curves.Select(c => c.Clone()).ToList();
-        ResolveConstraints();
-        ActiveTrackIndex = active;
-        Fps = fps; Length = length;
-        SelectNodes(SelectedNodes.ToArray());
+        Restore(entry.State, entry.RestoreEditor);
+    }
+
+    internal void Restore(ProjectState state, bool restoreEditor)
+    {
+        var paths = new Dictionary<Guid, CurvePath?>();
+        var curves = state.Curves.ToDictionary(c => c.Id);
+        foreach(var track in state.Tracks)
+        {
+            track.FollowCurve = track.FollowPath is { } follow ? curves.GetValueOrDefault(follow.CurveId) : null;
+            FollowBinding? binding = null;
+            if(track.Shots.Count > 0 && track.FollowPath is { Enabled: true } constraint && track.FollowCurve is { } curve)
+            {
+                if(!paths.TryGetValue(curve.Id, out var path)) paths.Add(curve.Id, path = CurvePath.Create(curve));
+                if(path != null) binding = new(path, constraint, curve.Id);
+            }
+            var keys = track.Keys.ToDictionary(k => k.Id);
+            foreach(var shot in track.Shots)
+            {
+                shot.Follow = binding;
+                shot.RebindProjectNodes(keys);
+            }
+        }
+        Apply(state, restoreEditor);
+    }
+
+    private void Apply(ProjectState state, bool restoreEditor)
+    {
+        Tracks = state.Tracks; Curves = state.Curves;
+        Fps = state.Fps; Length = state.Length; ActiveTrackIndex = state.ActiveTrackIndex;
+        if(restoreEditor) { Playhead = state.Playhead; PathInfluence = state.PathInfluence; }
+        SelectNodes(restoreEditor ? state.SelectedNodes : SelectedNodes.ToArray());
         Touch();
     }
 }

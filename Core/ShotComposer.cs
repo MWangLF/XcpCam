@@ -47,7 +47,15 @@ public sealed class ShotComposer
         var runs = new List<OutputRun>();
         var prev = ShotAt(FirstFrame);
         int runStart = FirstFrame;
-        for(int f = FirstFrame + 1; f <= LastFrame; f++)
+        var boundaries = new SortedSet<int>();
+        foreach(int track in act)
+        {
+            var sequence = seq[track]!;
+            foreach(var segment in sequence.Segments) boundaries.Add(segment.Start);
+            if(sequence.End < LastFrame) boundaries.Add(sequence.End + 1);
+            boundaries.UnionWith(sequence.CutFrames);
+        }
+        foreach(int f in boundaries.GetViewBetween(FirstFrame, LastFrame))
         {
             var cur = ShotAt(f);
             if(cur != prev)
@@ -96,12 +104,47 @@ public sealed class ShotComposer
     }
 
     /// <summary>Output track at a frame (gaps resolve to the shot being held).</summary>
-    public int TrackAt(float frame) => SampleEx(frame).track;
+    public int TrackAt(float frame) => ResolveTrack(frame).track;
 
-    private (int track, int segment) ShotAt(float frame)
+    private (int track, int segment, int cuts) ShotAt(float frame)
     {
-        var (_, t, s) = SampleEx(frame, false);
-        return (t, s * 100000 + (_seq[t]?.CutFrames.Count(f => f <= frame) ?? 0));
+        var (track, at) = ResolveTrack(frame);
+        var sequence = _seq[track]!;
+        return (track, sequence.SegmentAt(at), sequence.CutsThrough(frame));
+    }
+
+    private (float step, float?[] samples)[]? _displaySpeeds;
+    private float _displaySpeedPeak;
+    public float DisplaySpeedPeak { get { EnsureDisplaySpeeds(); return _displaySpeedPeak; } }
+
+    public float? DisplaySpeedAt(int track, float frame)
+    {
+        if(SequenceOf(track) is not { } seq || frame < seq.Start || frame >= seq.End) return null;
+        EnsureDisplaySpeeds();
+        var (step, samples) = _displaySpeeds![track];
+        if(samples.Length == 0 || seq.CutsThrough(frame) != seq.CutsThrough(frame + Fps / 60f)) return null;
+        return samples[Math.Clamp((int)((frame - seq.Start) / step), 0, samples.Length - 1)];
+    }
+
+    private void EnsureDisplaySpeeds()
+    {
+        if(_displaySpeeds != null) return;
+        var speeds = new (float, float?[])[_seq.Length];
+        float peak = .001f;
+        for(int track = 0; track < _seq.Length; track++)
+        {
+            if(_seq[track] is not { } seq) continue;
+            float step = MathF.Max(MathF.Max(1, Fps / 30f), (seq.End - seq.Start) / 1024f);
+            var samples = new float?[Math.Min(1024, (int)MathF.Ceiling((seq.End - seq.Start) / step))];
+            for(int i = 0; i < samples.Length; i++)
+            {
+                samples[i] = seq.SpeedAt(seq.Start + i * step);
+                if(samples[i] is float speed) peak = Math.Max(peak, speed);
+            }
+            speeds[track] = (step, samples);
+        }
+        _displaySpeedPeak = peak;
+        _displaySpeeds = speeds;
     }
 
     public XcpFrame Sample(float frame) => SampleEx(frame).pose;
@@ -115,25 +158,21 @@ public sealed class ShotComposer
 
     private (XcpFrame pose, int track, int segment, float at) SampleRaw(float frame)
     {
-        if(frame < FirstFrame) frame = FirstFrame;
-        if(frame > LastFrame) frame = LastFrame;
-        int t = TopTrackAt(frame);
-        if(t < 0)
-        {
-            // in a gap: hold what was shown at the last covered moment before it
-            // (the latest end of any active track before this frame — that track was on top there,
-            // otherwise the higher track would still be covering and this would not be a gap)
-            float holdAt = float.NegativeInfinity;
-            for(int i = 0; i < _seq.Length; i++)
-                if(_active[i] && _seq[i] is { } s && s.End < frame && s.End > holdAt) holdAt = s.End;
-            if(float.IsNegativeInfinity(holdAt)) holdAt = FirstFrame;
-            t = TopTrackAt(holdAt);
-            if(t < 0) return SampleRaw(FirstFrame);
-            var (hp, hs) = _seq[t]!.Sample(holdAt);
-            return (hp, t, hs, holdAt);
-        }
-        var (pose, seg) = _seq[t]!.Sample(frame);
-        return (pose, t, seg, frame);
+        var (t, at) = ResolveTrack(frame);
+        var (pose, segment) = _seq[t]!.Sample(at);
+        return (pose, t, segment, at);
+    }
+
+    private (int track, float at) ResolveTrack(float frame)
+    {
+        frame = Math.Clamp(frame, FirstFrame, LastFrame);
+        int track = TopTrackAt(frame);
+        if(track >= 0) return (track, frame);
+        // Gaps hold the exact last covered moment, including the highest track present at that boundary.
+        float held = FirstFrame;
+        for(int i = 0; i < _seq.Length; i++)
+            if(_active[i] && _seq[i] is { } seq && seq.End < frame) held = Math.Max(held, seq.End);
+        return (TopTrackAt(held), held);
     }
 
     /// <summary>Output speed (yalms/s) at a frame, null across a cut.</summary>
@@ -157,7 +196,7 @@ public sealed class ShotComposer
         Quaternion prev = default;
         for(int i = 0; i < count; i++)
         {
-            float frame = i == count - 1 ? LastFrame : FirstFrame + i / xcpFps * Fps;
+            float frame = i == count - 1 ? LastFrame : FirstFrame + (xcpFps == Fps ? i : (float)(i * (double)Fps / xcpFps));
             var s = Sample(frame);
             var q = s.Rot;
             if(i > 0 && Quaternion.Dot(prev, q) < 0) q = Quaternion.Negate(q);
@@ -181,7 +220,7 @@ public sealed class ShotComposer
         int b1 = Math.Max(b0, (int)Math.Round(LastFrame * r));
 
         var poses = new XcpFrame[b1 - b0 + 1];
-        var ids = new (int, int)[b1 - b0 + 1];
+        var ids = new (int track, int segment, int cuts)[b1 - b0 + 1];
         for(int b = b0; b <= b1; b++)
         {
             var (p, t, s) = SampleEx((float)(b / r));

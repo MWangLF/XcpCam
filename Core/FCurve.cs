@@ -20,9 +20,9 @@ public class FCurve
     {
         // Read paths also call Sort. Do not invalidate active enumerators when already ordered.
         for(int i = 1; i < Keys.Count; i++)
-            if(Keys[i - 1].Frame > Keys[i].Frame)
+            if(Keys[i - 1].Time > Keys[i].Time)
             {
-                Keys.Sort((a, b) => a.Frame.CompareTo(b.Frame));
+                Keys.Sort((a, b) => a.Time.CompareTo(b.Time));
                 return;
             }
     }
@@ -34,7 +34,7 @@ public class FCurve
             new(a.X + (b.X - a.X) * t, a.Y + (b.Y - a.Y) * t);
     }
 
-    private static Point Position(CurveKey key) => new(key.Frame, key.Value);
+    private static Point Position(CurveKey key) => new(key.Time, key.Value);
     private static Point Offset(CurveKey key, bool right)
     {
         var v = right ? key.Right : key.Left;
@@ -51,12 +51,12 @@ public class FCurve
         var b = Keys[i + 1];
         var outgoing = Offset(a, true);
         var incoming = Offset(b, false);
-        double span = (double)b.Frame - a.Frame;
+        double span = (double)b.Time - a.Time;
         double reach = outgoing.X - incoming.X;
         // Shorten both complete vectors by the same ratio, retaining their slopes.
         double scale = reach > span && reach > 0 ? Math.Max(0, span) / reach : 1;
-        return (new(a.Frame + outgoing.X * scale, a.Value + outgoing.Y * scale),
-                new(b.Frame + incoming.X * scale, b.Value + incoming.Y * scale));
+        return (new(a.Time + outgoing.X * scale, a.Value + outgoing.Y * scale),
+                new(b.Time + incoming.X * scale, b.Value + incoming.Y * scale));
     }
 
     private Point Effective(int i, bool right)
@@ -108,21 +108,26 @@ public class FCurve
     {
         if (double.IsNaN(frame)) throw new ArgumentOutOfRangeException(nameof(frame));
         Sort();
+        return EvaluateOrdered(frame);
+    }
+
+    internal double EvaluateOrdered(double frame)
+    {
         if (Keys.Count == 0) return 0;
-        if (frame <= Keys[0].Frame) return Keys[0].Value;
-        if (frame >= Keys[^1].Frame) return Keys[^1].Value;
+        if (frame <= Keys[0].Time) return Keys[0].Value;
+        if (frame >= Keys[^1].Time) return Keys[^1].Value;
         int lo = 0, hi = Keys.Count - 1;
         while (hi - lo > 1)
         {
             int mid = lo + (hi - lo) / 2;
-            if (Keys[mid].Frame <= frame) lo = mid; else hi = mid;
+            if (Keys[mid].Time <= frame) lo = mid; else hi = mid;
         }
         var a = Keys[lo];
         var b = Keys[hi];
-        if (frame == a.Frame) return a.Value;
+        if (frame == a.Time) return a.Value;
         if (a.Interpolation == CurveInterpolation.Constant) return a.Value;
         if (a.Interpolation == CurveInterpolation.Linear)
-            return a.Value + (b.Value - a.Value) * ((frame - a.Frame) / ((double)b.Frame - a.Frame));
+            return a.Value + (b.Value - a.Value) * ((frame - a.Time) / ((double)b.Time - a.Time));
         var controls = SegmentHandles(lo);
         var p = Position(a);
         var q = Position(b);
@@ -137,21 +142,50 @@ public class FCurve
         return new Vector2((float)x, (float)y);
     }
 
-    public void RecalculateHandles()
+    /// <summary>Converts a linear segment to a Bézier segment with the same shape and timing.</summary>
+    public void SetInterpolation(CurveKey key, CurveInterpolation interpolation)
+    {
+        Sort();
+        SetInterpolationAt(Keys.IndexOf(key), interpolation);
+    }
+
+    public void MakeLinearSegmentsEditable()
+    {
+        Sort();
+        for(int i = 0; i < Keys.Count; i++)
+            if(Keys[i].Interpolation == CurveInterpolation.Linear) SetInterpolationAt(i, CurveInterpolation.Bezier);
+    }
+
+    private void SetInterpolationAt(int index, CurveInterpolation interpolation)
+    {
+        var key = Keys[index];
+        if(interpolation == CurveInterpolation.Bezier && key.Interpolation == CurveInterpolation.Linear && index + 1 < Keys.Count)
+        {
+            var next = Keys[index + 1];
+            var third = ToOffset((next.Time - key.Time) / 3, (next.Value - key.Value) / 3);
+            key.Right = third;
+            next.Left = -third;
+            key.Mode = next.Mode = HandleMode.Free;
+            key.AutomaticTangent = next.AutomaticTangent = false;
+        }
+        key.Interpolation = interpolation;
+    }
+
+    public void RecalculateHandles(ISet<Guid>? selected = null)
     {
         Sort();
         for (int i = 0; i < Keys.Count; i++)
         {
             var key = Keys[i];
-            if (key.Mode is HandleMode.Free or HandleMode.Aligned) continue;
+            if (key.Mode is HandleMode.Free or HandleMode.Aligned || selected != null && !selected.Contains(key.Id)) continue;
             if (Keys.Count == 1)
             {
                 key.Left = new Vector2(-10, 0);
                 key.Right = new Vector2(10, 0);
                 continue;
             }
-            double h0 = i > 0 ? (double)key.Frame - Keys[i - 1].Frame : (double)Keys[1].Frame - key.Frame;
-            double h1 = i + 1 < Keys.Count ? (double)Keys[i + 1].Frame - key.Frame : h0;
+            double h0 = i > 0 ? (double)key.Time - Keys[i - 1].Time : (double)Keys[1].Time - key.Time;
+            double h1 = i + 1 < Keys.Count ? (double)Keys[i + 1].Time - key.Time : h0;
             if (h0 <= 0 || h1 <= 0) throw new InvalidOperationException("Curve key frames must be unique.");
             double d0 = i > 0 ? (key.Value - Keys[i - 1].Value) / h0 : (Keys[1].Value - key.Value) / h1;
             double d1 = i + 1 < Keys.Count ? (Keys[i + 1].Value - key.Value) / h1 : d0;
@@ -173,19 +207,20 @@ public class FCurve
     }
 
     /// <summary>Subdivide without refitting. All automatic keys are frozen to preserve neighboring intervals.</summary>
-    public CurveKey InsertPreserving(int frame, Guid? nodeId = null)
+    public CurveKey InsertPreserving(double frame, Guid? nodeId = null)
     {
         Sort();
         foreach (var existing in Keys)
-            if (existing.Frame == frame)
+            if (existing.Time == frame)
             {
                 if (nodeId.HasValue) existing.NodeId = nodeId;
                 return existing;
             }
         double value = Evaluate(frame);
-        int index = Keys.FindIndex(k => k.Frame > frame);
+        int index = Keys.FindIndex(k => k.Time > frame);
         if (index < 0) index = Keys.Count;
-        var inserted = new CurveKey { Frame = frame, Value = value, NodeId = nodeId, Mode = HandleMode.Free };
+        var inserted = new CurveKey { Value = value, NodeId = nodeId, Mode = HandleMode.Free };
+        inserted.SetTime(frame);
 
         Point p = default, b = default, c = default, q = default;
         double t = 0;
@@ -206,8 +241,8 @@ public class FCurve
         {
             var l = Effective(i, false);
             var r = Effective(i, true);
-            left[i] = ToOffset(l.X - Keys[i].Frame, l.Y - Keys[i].Value);
-            right[i] = ToOffset(r.X - Keys[i].Frame, r.Y - Keys[i].Value);
+            left[i] = ToOffset(l.X - Keys[i].Time, l.Y - Keys[i].Value);
+            right[i] = ToOffset(r.X - Keys[i].Time, r.Y - Keys[i].Value);
         }
         for (int i = 0; i < Keys.Count; i++)
         {
@@ -240,13 +275,13 @@ public class FCurve
         return inserted;
     }
 
-    public bool MoveKey(CurveKey key, int frame, double value)
+    public bool MoveKey(CurveKey key, double frame, double value)
     {
         if (!Keys.Contains(key)) throw new ArgumentException("Key does not belong to this curve.", nameof(key));
         if (!double.IsFinite(value)) throw new ArgumentOutOfRangeException(nameof(value));
-        foreach (var other in Keys) if (!ReferenceEquals(other, key) && other.Frame == frame) return false;
-        if (key.Frame != frame) key.NodeId = null;
-        key.Frame = frame;
+        foreach (var other in Keys) if (!ReferenceEquals(other, key) && other.Time == frame) return false;
+        if (key.Time != frame) key.NodeId = null;
+        key.SetTime(frame);
         key.Value = value;
         Sort();
         return true;
@@ -256,7 +291,7 @@ public class FCurve
     {
         if (!Keys.Contains(key)) throw new ArgumentException("Key does not belong to this curve.", nameof(key));
         if (!float.IsFinite(absolute.X) || !float.IsFinite(absolute.Y)) throw new ArgumentOutOfRangeException(nameof(absolute));
-        var v = ToOffset(right ? Math.Max(0, (double)absolute.X - key.Frame) : Math.Min(0, (double)absolute.X - key.Frame),
+        var v = ToOffset(right ? Math.Max(0, (double)absolute.X - key.Time) : Math.Min(0, (double)absolute.X - key.Time),
             (double)absolute.Y - key.Value);
         key.AutomaticTangent = false;
         Vector2 opposite = right ? key.Left : key.Right;
@@ -281,7 +316,7 @@ public class FCurve
         var seen = new HashSet<int>();
         for (int i = 0; i < Keys.Count; i++)
         {
-            double time = Math.Round(Keys[i].Frame * factor, MidpointRounding.AwayFromZero);
+            double time = Math.Round(Keys[i].Time * factor, MidpointRounding.AwayFromZero);
             if (!double.IsFinite(time) || time < int.MinValue || time > int.MaxValue) throw new ArgumentOutOfRangeException(nameof(factor));
             frames[i] = (int)time;
             if (!seen.Add(frames[i])) throw new InvalidOperationException("Time scaling would create duplicate key frames.");
@@ -290,7 +325,7 @@ public class FCurve
         }
         for (int i = 0; i < Keys.Count; i++)
         {
-            Keys[i].Frame = frames[i];
+            Keys[i].SetTime(frames[i]);
             Keys[i].Left = left[i];
             Keys[i].Right = right[i];
         }

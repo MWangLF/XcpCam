@@ -16,14 +16,22 @@ public sealed class PosePath
     public PosePath(SpatialCurves source)
     {
         space = source.Clone();
+        foreach(var curve in space.Channels.Values) curve.Sort();
         var boundaries = new SortedSet<double> { space.Start, space.End };
         foreach(var c in new[] { SpatialChannel.PositionX, SpatialChannel.PositionY, SpatialChannel.PositionZ })
             foreach(var k in space.Channels[c].Keys) boundaries.Add(k.Frame);
+        var discontinuities = new HashSet<double>();
+        foreach(var axis in new[] { SpatialChannel.PositionX, SpatialChannel.PositionY, SpatialChannel.PositionZ })
+        {
+            var keys = space.Channels[axis].Keys;
+            for(int i = 1; i < keys.Count; i++)
+                if(keys[i - 1].Interpolation == CurveInterpolation.Constant && keys[i - 1].Value != keys[i].Value) discontinuities.Add(keys[i].Time);
+        }
         var ps = new List<double>(); var ds = new List<double>();
         double total = 0; Vector3 previous = default; bool first = true;
         void Add(double p, bool jump)
         {
-            var value = space.Sample(p).Pos;
+            var value = space.SampleOrdered(p, p, p).Pos;
             if(!first && !jump) total += Vector3.Distance(previous, value);
             ps.Add(p); ds.Add(total); previous = value; first = false;
         }
@@ -32,12 +40,7 @@ public sealed class PosePath
         {
             double a = knots[i], b = knots[i + 1];
             // All XYZ key boundaries are included, so no sample spans a constant-channel jump.
-            bool jump = new[] { SpatialChannel.PositionX, SpatialChannel.PositionY, SpatialChannel.PositionZ }.Any(c =>
-            {
-                var curve = space.Channels[c];
-                var key = curve.Keys.LastOrDefault(k => k.Frame < b);
-                return key?.Interpolation == CurveInterpolation.Constant && curve.Evaluate(Math.BitDecrement(b)) != curve.Evaluate(b);
-            });
+            bool jump = discontinuities.Contains(b);
             int count = space.IsDefaultPath ? 2 : 128;
             for(int j = 1; j <= count; j++)
             {
@@ -79,5 +82,5 @@ public sealed class PosePath
         double span = lengths[hi] - lengths[lo];
         return Math.Clamp(span > 1e-12 ? parameters[lo] + (parameters[hi] - parameters[lo]) * ((target - lengths[lo]) / span) : parameters[hi], start, end);
     }
-    public XcpFrame Sample(double positionParameter, double rotationParameter, double fovParameter) => space.Sample(positionParameter, rotationParameter, fovParameter);
+    public XcpFrame Sample(double positionParameter, double rotationParameter, double fovParameter) => space.SampleOrdered(positionParameter, rotationParameter, fovParameter);
 }

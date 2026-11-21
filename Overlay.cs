@@ -69,12 +69,7 @@ public sealed class Overlay
         // ---- paths, per track / per segment ----
         if(ShowPath && comp != null)
         {
-            float step = MathF.Max(1f, tl.Fps / 30f); // ~30 samples per second
-            float maxSpeed = 1e-3f;
-            for(int t = 0; t < comp.TrackCount; t++)
-                if(comp.SequenceOf(t) is { } seq)
-                    for(float f = seq.Start; f < seq.End; f += step)
-                        if(seq.SpeedAt(f) is float v) maxSpeed = MathF.Max(maxSpeed, v);
+            float maxSpeed = SpeedColors ? comp.DisplaySpeedPeak : 1;
 
             for(int t = comp.TrackCount - 1; t >= 0; t--) // lower tracks first, top track drawn last
             {

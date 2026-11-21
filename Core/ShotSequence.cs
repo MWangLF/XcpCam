@@ -24,7 +24,18 @@ public sealed class ShotSequence
     public int Start => Segments[0].Start;
     public int End => Segments[^1].End;
     public int Fps { get; }
-    public IEnumerable<int> CutFrames => Segments.SelectMany(s => s.Keys.Where(k => k.CutIn).Select(k => k.Frame));
+    private readonly int[] _cutFrames;
+    public IEnumerable<int> CutFrames => _cutFrames;
+    internal int CutsThrough(float frame)
+    {
+        int lo = 0, hi = _cutFrames.Length;
+        while(lo < hi)
+        {
+            int mid = (lo + hi) / 2;
+            if(_cutFrames[mid] <= frame) lo = mid + 1; else hi = mid;
+        }
+        return lo;
+    }
     public float TotalLength { get; }
     /// <summary>Enabled tracking constraints of the track (applied by <see cref="Constrain"/>).</summary>
     public IReadOnlyList<TrackConstraint> Constraints { get; private init; } = [];
@@ -34,6 +45,7 @@ public sealed class ShotSequence
     private ShotSequence(List<ShotSegment> segments, int fps)
     {
         Segments = segments; Fps = fps;
+        _cutFrames = segments.SelectMany(s => s.Keys).Where(k => k.CutIn).Select(k => k.Frame).Order().ToArray();
         float length = 0;
         foreach(var s in segments)
         {
@@ -103,6 +115,6 @@ public sealed class ShotSequence
         if(frame < Start || frame > End) return null;
         float d = Fps / 60f;
         var (a, sa) = Sample(frame); var (b, sb) = Sample(frame + d);
-        return sa != sb || CutFrames.Any(f => f > frame && f <= frame + d) ? null : Vector3.Distance(a.Pos, b.Pos) / (d / Fps);
+        return sa != sb || CutsThrough(frame) != CutsThrough(frame + d) ? null : Vector3.Distance(a.Pos, b.Pos) / (d / Fps);
     }
 }

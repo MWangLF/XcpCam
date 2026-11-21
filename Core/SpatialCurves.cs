@@ -12,6 +12,7 @@ public sealed class SpatialCurves
 {
     public Dictionary<SpatialChannel, FCurve> Channels = Enum.GetValues<SpatialChannel>().ToDictionary(c => c, _ => new FCurve());
     public int Start, End;
+    public bool PreserveIntermediateKeys;
     public long Revision { get; private set; }
     internal Dictionary<Guid, Dictionary<CameraChannel, double>> Anchors = new();
     internal bool LegacyInitialized;
@@ -33,13 +34,19 @@ public sealed class SpatialCurves
     {
         DirtyTangents = [.. DirtyTangents],
         Channels = Channels.ToDictionary(p => p.Key, p => p.Value.Clone()), Start = Start, End = End, Revision = Revision,
-        LegacyInitialized = LegacyInitialized, GeneratedRevision = GeneratedRevision,
+        LegacyInitialized = LegacyInitialized, GeneratedRevision = GeneratedRevision, PreserveIntermediateKeys = PreserveIntermediateKeys,
         Anchors = Anchors.ToDictionary(p => p.Key, p => new Dictionary<CameraChannel, double>(p.Value)),
     };
     public XcpFrame Sample(double parameter) => Sample(parameter, parameter, parameter);
     public XcpFrame Sample(double posParam, double rotParam, double fovParam)
     {
-        double V(SpatialChannel c, double p) => Channels[c].Evaluate(p);
+        foreach(var curve in Channels.Values) curve.Sort();
+        return SampleOrdered(posParam, rotParam, fovParam);
+    }
+
+    internal XcpFrame SampleOrdered(double posParam, double rotParam, double fovParam)
+    {
+        double V(SpatialChannel c, double p) => Channels[c].EvaluateOrdered(p);
         var pos = new Vector3((float)V(SpatialChannel.PositionX, posParam), (float)V(SpatialChannel.PositionY, posParam), (float)V(SpatialChannel.PositionZ, posParam));
         const float rad = MathF.PI / 180;
         var rot = Quaternion.Normalize(Quaternion.CreateFromYawPitchRoll((float)V(SpatialChannel.Yaw, rotParam) * rad,
@@ -73,6 +80,30 @@ public sealed class SpatialCurves
     internal bool SynchronizeNodes(IReadOnlyList<Keyframe> nodes)
     {
         var ids = nodes.Select(n => n.Id).ToHashSet();
+        if(PreserveIntermediateKeys)
+        {
+            // Keep the imported domain stable. Promote the existing curve value when the editor
+            // inserts a camera node, leaving all unrelated intermediate keys in place.
+            bool changed = false;
+            foreach(var id in Anchors.Keys.Where(id => !ids.Contains(id)).ToArray()) { Anchors.Remove(id); changed = true; }
+            foreach(var (channel, curve) in Channels)
+            {
+                var bound = new HashSet<Guid>();
+                foreach(var key in curve.Keys)
+                    if(key.NodeId is Guid id)
+                    {
+                        if(ids.Contains(id)) bound.Add(id);
+                        else { key.NodeId = null; changed = true; }
+                    }
+                foreach(var node in nodes.Where(n => !bound.Contains(n.Id)))
+                {
+                    int frame = checked((int)Math.Round(Anchors[node.Id][SpatialFrameMap.Group(channel)]));
+                    curve.InsertPreserving(frame, node.Id); changed = true;
+                }
+            }
+            if(changed) Touch();
+            return changed;
+        }
         if(Channels.Values.All(c => c.Keys.Count == nodes.Count && c.Keys.All(k => k.NodeId.HasValue && ids.Contains(k.NodeId.Value)) && c.Keys.Select(k => k.NodeId).Distinct().Count() == nodes.Count))
             return false;
         var old = Clone();

@@ -5,15 +5,15 @@
     "Punchline": "可视化运镜编辑",
     "Description": "一个 Dalamud 插件：在 GPose 里把镜头（例如 Brio 的各个相机）作为节点摆在一条按帧计时的相机时间轴上，生成平滑运镜，可以导出为 XAT .xcp 相机文件，也可以直接联动 Brio 播放。插件会在游戏画面里显示运镜路径和每个镜头，选中的镜头可以直接用变换手柄拖动、旋转。",
     "InternalName": "XcpCam",
-    "AssemblyVersion": "0.0.6.3",
+    "AssemblyVersion": "0.0.6.4",
     "RepoUrl": "https://github.com/MWangLF/XcpCam",
     "ApplicableVersion": "any",
     "DalamudApiLevel": 15,
     "IsHide": false,
     "IsTestingExclusive": false,
-    "DownloadLinkInstall": "https://github.com/MWangLF/XcpCam/releases/download/v0.0.6.3/XcpCam-0.0.6.3.zip",
-    "DownloadLinkUpdate": "https://github.com/MWangLF/XcpCam/releases/download/v0.0.6.3/XcpCam-0.0.6.3.zip",
-    "DownloadLinkTesting": "https://github.com/MWangLF/XcpCam/releases/download/v0.0.6.3/XcpCam-0.0.6.3.zip",
+    "DownloadLinkInstall": "https://github.com/MWangLF/XcpCam/releases/download/v0.0.6.4/XcpCam-0.0.6.4.zip",
+    "DownloadLinkUpdate": "https://github.com/MWangLF/XcpCam/releases/download/v0.0.6.4/XcpCam-0.0.6.4.zip",
+    "DownloadLinkTesting": "https://github.com/MWangLF/XcpCam/releases/download/v0.0.6.4/XcpCam-0.0.6.4.zip",
     "Tags": ["gpose", "camera", "xat", "brio"]
   }
 ]

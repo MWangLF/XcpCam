@@ -61,7 +61,7 @@ public sealed class TimelineWidget
     private bool _panning;
     private const float ViewHeight = 260f;
 
-    public void Draw(CamTimeline tl, ShotComposer? comp, ShortcutBindings shortcuts)
+    public void Draw(CamTimeline tl, ShotComposer? comp, ShortcutBindings shortcuts, bool speedColors)
     {
         PlayheadChanged = false; KeysChanged = false; DragStarted = false; TracksEdited = false;
         CurvePointsClicked = false; NodesClicked = false;
@@ -161,12 +161,14 @@ public sealed class TimelineWidget
         {
             foreach(var run in comp.Runs)
             {
+                if(run.End + 1 < ScrollFrame || run.Start > ScrollFrame + visibleFrames) continue;
                 uint c = tl.Tracks[Math.Clamp(run.Track, 0, lanes - 1)].Color;
                 dl.AddRectFilled(new Vector2(X(run.Start), outY), new Vector2(X(run.End + 1), outY + OutputH - 2), c, 2);
             }
             foreach(int cf in comp.CutFrames)
             {
                 float x = X(cf);
+                if(x < origin.X - 4 || x > origin.X + width + 4) continue;
                 dl.AddLine(new Vector2(x, outY - 2), new Vector2(x, origin.Y + height), 0xC0FFFFFF, 1.5f);
                 dl.AddTriangleFilled(new Vector2(x - 4, outY - 2), new Vector2(x + 4, outY - 2), new Vector2(x, outY + 4), 0xFFFFFFFF);
             }
@@ -194,16 +196,16 @@ public sealed class TimelineWidget
                 {
                     float a = X(seg.Start), b = X(seg.End);
                     dl.AddRectFilled(new Vector2(a, midY - 3), new Vector2(MathF.Max(b, a + 2), midY + 3), active ? 0xFF4A4A4A : 0xFF303030, 3);
-                    if(seg.Path != null && active)
+                    if(speedColors && seg.Path != null && active)
                     {
                         float stepPx = 3f;
                         for(float x = MathF.Max(a, origin.X); x < MathF.Min(b, origin.X + width); x += stepPx)
                         {
                             float f = FrameAt(x);
-                            if(seq.SpeedAt(f) is float v)
+                            if(comp!.DisplaySpeedAt(ti, f) is float v)
                             {
                                 bool shown = comp!.TrackAt(f) == ti;
-                                uint col = SpeedColor(v / MaxSpeed(comp));
+                                uint col = SpeedColor(v / comp.DisplaySpeedPeak);
                                 if(!shown) col = (col & 0x00FFFFFF) | 0x50000000;
                                 dl.AddRectFilled(new Vector2(x, midY - 3), new Vector2(x + stepPx, midY + 3), col, 0f);
                             }
@@ -212,9 +214,10 @@ public sealed class TimelineWidget
                 }
             }
 
-            foreach(var k in track.Keys.OrderBy(k => k.Frame))
+            foreach(var (k, idx) in track.Keys.Select((key, index) => (key, index + 1)))
             {
                 float x = X(k.Frame);
+                if(x > origin.X + width + 24 || X(k.Frame + k.HoldFrames) < origin.X - 24) continue;
                 if(k.HoldFrames > 0)
                     dl.AddRectFilled(new Vector2(x, midY - 6), new Vector2(X(k.Frame + k.HoldFrames), midY + 6), 0xA03399FF, 3);
                 if(k.CutIn)
@@ -229,7 +232,6 @@ public sealed class TimelineWidget
                 uint fill = track.Color;
                 if(!active) fill = (fill & 0x00FFFFFF) | 0x70000000;
                 DrawDiamond(dl, new Vector2(x, midY), NodeR + (sel ? 2 : 0), sel ? 0xFF00FFFF : fill, over || sel ? 0xFFFFFFFF : 0xFF000000);
-                int idx = track.Keys.IndexOf(k) + 1;
                 if(curveTimes.Count > 0) dl.AddText(new Vector2(x + NodeR + 1, midY - 7), 0xFFDDDDDD, $"{idx}");
                 else dl.AddText(new Vector2(x - 4, midY + NodeR - 1), 0xFFDDDDDD, $"{idx}");
             }
@@ -510,20 +512,6 @@ public sealed class TimelineWidget
     }
 
     // cached max speed per composer instance (for the speed tint)
-    private ShotComposer? _speedFor;
-    private float _maxSpeed = 1;
-    private float MaxSpeed(ShotComposer comp)
-    {
-        if(ReferenceEquals(_speedFor, comp)) return _maxSpeed;
-        _speedFor = comp;
-        _maxSpeed = 1e-3f;
-        for(int t = 0; t < comp.TrackCount; t++)
-            if(comp.SequenceOf(t) is { } seq)
-                for(float f = seq.Start; f < seq.End; f += MathF.Max(1, comp.Fps / 30f))
-                    if(seq.SpeedAt(f) is float v) _maxSpeed = MathF.Max(_maxSpeed, v);
-        return _maxSpeed;
-    }
-
     public void EnsureVisible(float frame, float width)
     {
         float visible = (width - HeaderW) / PixelsPerFrame;

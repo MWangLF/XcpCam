@@ -87,8 +87,8 @@ public sealed unsafe class BoneSource : ITrackTargetSource
         if(string.IsNullOrEmpty(name)) return _targets.GPoseTarget;
         if(index >= 0 && index < _objects.Length && _objects[index] is ICharacter hinted && hinted.Name.TextValue == name)
             return hinted;
-        var match = Characters().Where(x => x.Name == name).Select(x => (int?)x.Index).FirstOrDefault();
-        if(match is int found) { index = found; return _objects[found]; }
+        var matches = Characters().Where(x => x.Name == name).Take(2).ToArray();
+        if(matches.Length == 1) { index = matches[0].Index; return _objects[index]; }
         return null;
     }
 

@@ -20,6 +20,24 @@ public sealed class MotionInterval
     internal Dictionary<CameraChannel, FCurve>? AutoSnapshot;
     public void MarkManual() { AutoTiming = false; AutoSnapshot = null; }
     public Dictionary<CameraChannel, FCurve> Channels = new();
+    // Persist the channel-to-curve mapping explicitly so shared edits survive a round trip.
+    internal sealed record ChannelTable(FCurve[] Curves, Dictionary<CameraChannel, int> Indices);
+    internal ChannelTable ProjectChannels
+    {
+        get
+        {
+            var curves = Channels.Values.Distinct().ToArray();
+            return new(curves, Channels.ToDictionary(p => p.Key, p => Array.IndexOf(curves, p.Value)));
+        }
+        set
+        {
+            if(value?.Curves == null || value.Indices == null || value.Curves.Length is < 1 or > 3 ||
+                value.Indices.Count != 3 || value.Indices.Values.Any(i => (uint)i >= value.Curves.Length) ||
+                value.Indices.Values.Distinct().Count() != value.Curves.Length)
+                throw new System.IO.InvalidDataException("无效的运动通道映射。");
+            Channels = value.Indices.ToDictionary(p => p.Key, p => value.Curves[p.Value]);
+        }
+    }
     internal PosePath? Path;
     /// <summary>Leg length along a Follow Path target curve (overrides the node path distance for timing).</summary>
     internal double? FollowDistance;
@@ -69,7 +87,7 @@ public sealed class MotionInterval
     public MotionInterval Clone()
     {
         var copy = new MotionInterval { Id = Id, StartNodeId = StartNodeId, EndNodeId = EndNodeId,
-            Start = Start, End = End, HoldFrames = HoldFrames, Linked = Linked, Path = Path,
+            Start = Start, End = End, HoldFrames = HoldFrames, Linked = Linked, Path = Path, FollowDistance = FollowDistance,
             AutoTiming = AutoTiming, AutoSnapshot = AutoSnapshot?.ToDictionary(p => p.Key, p => p.Value.Clone()),
             Ranges = new(Ranges), splitTiming = splitTiming?.Clone(),
             splitCurves = splitCurves?.ToDictionary(p => p.Key, p => p.Value.Clone()),
@@ -207,6 +225,27 @@ public sealed class ShotCurves
     public IReadOnlyList<(int start, int end)> Holds => HoldRegions;
     private List<Keyframe> nodes = [];
     private Dictionary<Guid, XcpFrame> poses = new();
+    internal void ValidateProjectNodes(HashSet<Guid> owned)
+    {
+        if(poses == null || CutObserved == null || CutRestore == null || ManualFactors == null || Space.DirtyTangents == null ||
+            nodes.Any(n => !owned.Contains(n.Id)) || nodes.Select(n => n.Id).Distinct().Count() != nodes.Count ||
+            !SeededNodes.SetEquals(nodes.Select(n => n.Id)))
+            throw new System.IO.InvalidDataException("镜头段内部节点无效。");
+    }
+
+    internal void RebindProjectNodes(Dictionary<Guid, Keyframe> keys)
+    {
+        for(int i = 0; i < nodes.Count; i++)
+        {
+            var n = nodes[i];
+            // A cloned shot can carry an older bound-node snapshot. Keep it until the next Ensure.
+            if(keys.TryGetValue(n.Id, out var k) && n.Frame == k.Frame && n.HoldFrames == k.HoldFrames &&
+                n.CutIn == k.CutIn && n.CutAuto == k.CutAuto && n.LastGap == k.LastGap && n.TimeSec == k.TimeSec &&
+                n.Pos == k.Pos && n.Rot == k.Rot && n.Fov == k.Fov && n.Tangent == k.Tangent && n.HoldSec == k.HoldSec &&
+                n.SelfCheckError == k.SelfCheckError && n.TargetName == k.TargetName && n.BasePos == k.BasePos && n.BaseRot == k.BaseRot)
+                nodes[i] = k;
+        }
+    }
     public SpatialCurves Space = new();
     /// <summary>
     /// Advanced-mode position timing: frame → length factor (0..1) along this shot's path, keyed at every node
@@ -306,7 +345,7 @@ public sealed class ShotCurves
     }
 
     public Vector3 OffsetAt(double frame) => Offset[0].Keys.Count == 0 ? Vector3.Zero :
-        new Vector3((float)Offset[0].Evaluate(frame), (float)Offset[1].Evaluate(frame), (float)Offset[2].Evaluate(frame));
+        new Vector3((float)Offset[0].EvaluateOrdered(frame), (float)Offset[1].EvaluateOrdered(frame), (float)Offset[2].EvaluateOrdered(frame));
 
     private Vector3 OffsetAt(MotionInterval? interval, double frame) => OffsetAt(interval == null ? frame : TimingFrame(interval, frame));
 
@@ -317,15 +356,14 @@ public sealed class ShotCurves
     /// </summary>
     private double AdvancedPosition(MotionInterval interval, double frame)
     {
-        var a = PathProgress.Keys.FirstOrDefault(k => k.NodeId == interval.StartNodeId);
-        var b = PathProgress.Keys.FirstOrDefault(k => k.NodeId == interval.EndNodeId);
-        if(a == null || b == null || interval.Path == null) return DirectParameter(CameraChannel.Position, frame, interval);
-        double u = PathProgress.Evaluate(TimingFrame(interval, frame));
-        double lo = Math.Min(a.Value, b.Value), hi = Math.Max(a.Value, b.Value);
+        if(PathProgress.Keys.Count == 0 || interval.Path == null) return DirectParameter(CameraChannel.Position, frame, interval);
+        double a = PathProgress.EvaluateOrdered(interval.Start), b = PathProgress.EvaluateOrdered(interval.End);
+        double u = PathProgress.EvaluateOrdered(TimingFrame(interval, frame));
+        double lo = Math.Min(a, b), hi = Math.Max(a, b);
         if(hi - lo <= 1e-12) return DirectParameter(CameraChannel.Position, frame, interval);
         var range = interval.Ranges[CameraChannel.Position];
         if(u >= lo - 1e-12 && u <= hi + 1e-12)
-            return interval.Path.Parameter(CameraChannel.Position, range.start, range.end, (u - a.Value) / (b.Value - a.Value));
+            return interval.Path.Parameter(CameraChannel.Position, range.start, range.end, (u - a) / (b - a));
         return interval.Path.Parameter(CameraChannel.Position, Space.Start, Space.End, Math.Clamp(u, 0, 1));
     }
 
@@ -775,6 +813,53 @@ public sealed class ShotCurves
     /// <summary>Returns every following node to the automatic 0–100 % time distribution.</summary>
     public void ResetFactors() { ManualFactors.Clear(); Space.Touch(); }
 
+    // Preserve the fractional times of imported offset keys between their bounding camera nodes.
+    // The two sides of a bound key may belong to intervals with different stretch factors.
+    private static void RetimeTimeCurve(FCurve curve, Func<CurveKey, double> target)
+    {
+        curve.Sort();
+        var anchors = curve.Keys.Where(k => k.NodeId.HasValue).ToArray();
+        if(anchors.Length == 0) return;
+        var old = anchors.Select(k => k.Time).ToArray();
+        var frames = anchors.Select(target).ToArray();
+        if(old.SequenceEqual(frames)) return;
+        int span = 0;
+        foreach(var key in curve.Keys)
+        {
+            double time = key.Time;
+            while(span + 1 < old.Length - 1 && time >= old[span + 1]) span++;
+            double Scale(int i) => old.Length == 1 ? 1 : (frames[i + 1] - frames[i]) / (old[i + 1] - old[i]);
+            double scale = Scale(span);
+            double left = span > 0 && time == old[span] ? Scale(span - 1) : scale;
+            key.SetTime(key.NodeId.HasValue ? target(key) : frames[span] + (time - old[span]) * scale);
+            key.Left.X *= (float)left;
+            key.Right.X *= (float)scale;
+        }
+    }
+
+    private static void RemapProgressValues(List<CurveKey> keys, FCurve previous)
+    {
+        int start = 0;
+        for(int end = 1; end < keys.Count; end++)
+        {
+            if(keys[end].NodeId == null) continue;
+            var a = keys[start]; var b = keys[end];
+            double oldA = previous.EvaluateOrdered(a.Time), oldB = previous.EvaluateOrdered(b.Time);
+            if(a.Value != oldA || b.Value != oldB)
+            {
+                double scale = oldB > oldA + 1e-12 ? (b.Value - a.Value) / (oldB - oldA) : 0;
+                a.Right.Y *= (float)scale; b.Left.Y *= (float)scale;
+                for(int i = start + 1; i < end; i++)
+                {
+                    var k = keys[i];
+                    k.Value = a.Value + (k.Value - oldA) * scale;
+                    k.Left.Y *= (float)scale; k.Right.Y *= (float)scale;
+                }
+            }
+            start = end;
+        }
+    }
+
     private void SyncPositionTiming()
     {
         var path = spatialPath;
@@ -782,28 +867,47 @@ public sealed class ShotCurves
         // A new Follow Path target resets every factor to the automatic time distribution.
         if(Follow != null && followCurve != Follow.CurveId) ManualFactors.Clear();
         var factors = Follow != null ? AutoFactors() : null;
+        // Imported timing uses a stable global parameter for the anchors, then arc length inside
+        // each leg. A hold or cut must not collapse the domain of its editable progress keys.
+        bool importedProgress = Space.PreserveIntermediateKeys && Follow == null && Space.End > Space.Start;
         bool anchored = Follow != null && !Follow.Constraint.EditorTiming && UsesTimeAnchors;
+        var nodeFrames = Space.PreserveIntermediateKeys ? nodes.ToDictionary(n => n.Id, n => n.Frame) : null;
         foreach(var (curve, progress) in Offset.Select(c => (c, false)).Prepend((PathProgress, true)))
         {
+            bool preserve = nodeFrames != null && (!progress || Follow == null);
+            if(preserve && curve.Keys.Where(k => k.NodeId.HasValue).All(k => nodeFrames!.ContainsKey(k.NodeId!.Value)))
+                RetimeTimeCurve(curve, key => nodeFrames![key.NodeId!.Value]);
             var old = curve.Clone();
             var keys = new List<CurveKey>();
             for(int i = 0; i < nodes.Count; i++)
             {
                 var node = nodes[i];
                 var key = curve.Keys.FirstOrDefault(k => k.NodeId == node.Id);
+                if(key == null && Space.PreserveIntermediateKeys && curve.Keys.Count > 0)
+                    key = curve.InsertPreserving(node.Frame, node.Id);
                 key ??= new CurveKey { NodeId = node.Id, Mode = HandleMode.AutoClamped, Value = old.Keys.Count > 0 ? old.Evaluate(node.Frame) : 0 };
-                key.Frame = node.Frame;
+                key.SetTime(node.Frame);
                 if(progress && factors != null)
                 {
                     // following a curve: the player camera position is ignored; the node is a factor on the curve
                     // (with timeline anchors every factor comes from them, hand-set values do not apply)
                     if(anchored || !ManualFactors.Contains(node.Id)) key.Value = factors[i];
                 }
+                else if(progress && importedProgress && Space.Anchors.TryGetValue(node.Id, out var importedAnchor))
+                    key.Value = (importedAnchor[CameraChannel.Position] - Space.Start) / (Space.End - Space.Start);
                 else if(progress)
                     key.Value = path != null && total > 1e-12 && Space.Anchors.TryGetValue(node.Id, out var anchor)
                         ? Math.Clamp((path.Distance(anchor[CameraChannel.Position]) - start) / total, 0, 1)
                         : nodes.Count > 1 ? i / (double)(nodes.Count - 1) : 0;
                 keys.Add(key);
+            }
+            if(preserve && keys.Count != 0 && curve.Keys.Any(k => !k.NodeId.HasValue))
+            {
+                var occupied = keys.Select(k => k.Time).ToHashSet();
+                double first = keys[0].Time, last = keys[^1].Time;
+                keys.AddRange(curve.Keys.Where(k => !k.NodeId.HasValue && k.Time > first && k.Time < last && occupied.Add(k.Time)));
+                keys.Sort((a, b) => a.Time.CompareTo(b.Time));
+                if(progress) RemapProgressValues(keys, old);
             }
             curve.Keys = keys;
             if(keys.Count == 0) continue;
@@ -817,7 +921,16 @@ public sealed class ShotCurves
                 Math.Abs((ProgressKey(interval.EndNodeId)?.Value ?? 0) - (ProgressKey(interval.StartNodeId)?.Value ?? 0)) * Follow.Path.Length;
     }
 
-    private MotionInterval? At(double frame) => Intervals.FirstOrDefault(i => frame < i.End) ?? Intervals.LastOrDefault();
+    private MotionInterval? At(double frame)
+    {
+        int lo = 0, hi = Intervals.Count;
+        while(lo < hi)
+        {
+            int mid = (lo + hi) / 2;
+            if(frame < Intervals[mid].End) hi = mid; else lo = mid + 1;
+        }
+        return Intervals.Count == 0 ? null : Intervals[Math.Min(lo, Intervals.Count - 1)];
+    }
     public double Evaluate(CameraChannel channel, double frame) => At(frame)?.Evaluate(channel, frame) ?? 0;
 
     public XcpFrame Sample(float frame)
@@ -829,13 +942,16 @@ public sealed class ShotCurves
             var n = nodes.FirstOrDefault();
             return n == null ? new XcpFrame(Vector3.Zero, Quaternion.Identity, MathF.PI / 4) : NodePose(n);
         }
+        // Hidden channel keys remain editable and are recovered when an imported leg's cut is cleared.
+        if(Space.PreserveIntermediateKeys && frame < interval.End && CutObserved.GetValueOrDefault(interval.EndNodeId))
+            frame = interval.Start;
         XcpFrame pose;
         if(EditorMode == CurveEditorMode.Advanced || neutralSimple)
-            pose = Space.Sample(AdvancedPosition(interval, frame), DirectParameter(CameraChannel.Rotation, frame, interval), DirectParameter(CameraChannel.Fov, frame, interval));
+            pose = Space.SampleOrdered(AdvancedPosition(interval, frame), DirectParameter(CameraChannel.Rotation, frame, interval), DirectParameter(CameraChannel.Fov, frame, interval));
         else if(parameterSimple)
         {
             double P(CameraChannel c) { var r = interval.Ranges[c]; return r.start + (r.end - r.start) * interval.Evaluate(c, frame); }
-            pose = Space.Sample(P(CameraChannel.Position), P(CameraChannel.Rotation), P(CameraChannel.Fov));
+            pose = Space.SampleOrdered(P(CameraChannel.Position), P(CameraChannel.Rotation), P(CameraChannel.Fov));
         }
         else pose = interval.Geometry(interval.Evaluate(CameraChannel.Position, frame), interval.Evaluate(CameraChannel.Rotation, frame), interval.Evaluate(CameraChannel.Fov, frame));
         if(Follow != null) return FollowPose(FollowFactor(interval, frame), OffsetAt(interval, frame), pose);
@@ -854,6 +970,8 @@ public sealed class ShotCurves
         var interval = At(frame);
         if(interval != null)
         {
+            if(Space.PreserveIntermediateKeys && frame < interval.End && CutObserved.GetValueOrDefault(interval.EndNodeId))
+                frame = interval.Start;
             if(EditorMode == CurveEditorMode.Advanced || neutralSimple)
                 return channel == CameraChannel.Position ? AdvancedPosition(interval, frame) : DirectParameter(channel, frame, interval);
             if(parameterSimple) { var r = interval.Ranges[channel]; return r.start + (r.end - r.start) * interval.Evaluate(channel, frame); }
@@ -866,7 +984,7 @@ public sealed class ShotCurves
     public XcpFrame NodePose(Keyframe node)
     {
         if(!Space.Anchors.TryGetValue(node.Id, out var anchor)) return new XcpFrame(node.Pos, node.Rot, node.Fov);
-        var pose = Space.Sample(anchor[CameraChannel.Position], anchor[CameraChannel.Rotation], anchor[CameraChannel.Fov]);
+        var pose = Space.SampleOrdered(anchor[CameraChannel.Position], anchor[CameraChannel.Rotation], anchor[CameraChannel.Fov]);
         if(Follow != null && ProgressKey(node.Id) is { } key) return FollowPose(key.Value, OffsetAt(node.Frame), pose);
         return pose with { Pos = pose.Pos + OffsetAt(node.Frame) };
     }
@@ -1071,17 +1189,20 @@ public sealed class ShotCurves
             foreach(var interval in Intervals) interval.Ranges.Clear();
         }
         SeededNodes = current.Select(n => n.Id).ToHashSet();
-        EnsureGeometry();
+        EnsureGeometry(rebind: true);
         SyncPositionTiming();
     }
 
-    private void EnsureGeometry()
+    private void EnsureGeometry(bool rebind = false)
     {
         if(nodes.Count == 0) return;
         if(spatialPath == null || spatialRevision != Space.Revision)
         {
+            foreach(var curve in Space.Channels.Values) curve.Sort();
             spatialPath = new PosePath(Space); spatialRevision = Space.Revision;
+            rebind = true;
         }
+        if(!rebind) return;
         foreach(var interval in Intervals)
         {
             interval.Path = spatialPath;
@@ -1098,7 +1219,10 @@ public sealed class ShotCurves
         var source = Intervals.FirstOrDefault(i => node.Frame > i.Start && node.Frame < i.End);
         if(source == null) return;
         EnsureGeometry();
-        var sampled = source.Geometry(source.Evaluate(CameraChannel.Position, node.Frame), source.Evaluate(CameraChannel.Rotation, node.Frame), source.Evaluate(CameraChannel.Fov, node.Frame));
+        bool importedAdvanced = Space.PreserveIntermediateKeys && EditorMode == CurveEditorMode.Advanced;
+        var sampled = importedAdvanced ? Space.SampleOrdered(ParameterAt(CameraChannel.Position, node.Frame),
+            ParameterAt(CameraChannel.Rotation, node.Frame), ParameterAt(CameraChannel.Fov, node.Frame)) :
+            source.Geometry(source.Evaluate(CameraChannel.Position, node.Frame), source.Evaluate(CameraChannel.Rotation, node.Frame), source.Evaluate(CameraChannel.Fov, node.Frame));
         // following a curve: the new node keeps the current factor along it, so the motion is unchanged
         double? followFactor = Follow != null ? FollowFactor(source, node.Frame) : null;
         var followed = followFactor is double ff ? FollowPose(ff, OffsetAt(source, node.Frame), Sample(node.Frame) with { Rot = sampled.Rot }) : (XcpFrame?)null;
@@ -1123,7 +1247,7 @@ public sealed class ShotCurves
             double progress = source.Evaluate(channel, node.Frame);
             left.splitValues[channel] = (0, progress); right.splitValues[channel] = (progress, 1);
             var range = source.Ranges[channel];
-            double middle = source.Parameter(channel, progress);
+            double middle = importedAdvanced ? ParameterAt(channel, node.Frame) : source.Parameter(channel, progress);
             left.Ranges[channel] = (range.start, middle); right.Ranges[channel] = (middle, range.end);
             left.Channels[channel] = ProgressCurve.Slice(timing, source.Start, node.Frame, source.Start, source.End);
             right.Channels[channel] = ProgressCurve.Slice(timing, node.Frame, source.End, source.Start, source.End);
@@ -1173,6 +1297,15 @@ public sealed class ShotCurves
             i.RefreshSplitAfterRescale(factor);
         }
         var holds = HoldRegions.Select(h => (ProgressCurve.Round(h.start * factor), ProgressCurve.Round(h.end * factor))).ToList();
+        var progress = PathProgress.Clone();
+        if(Space.PreserveIntermediateKeys && Follow == null) RetimeTimeCurve(progress, key => ProgressCurve.Round(key.Time * factor));
+        else progress.Rescale(factor);
+        var offsets = Offset.Select(curve => curve.Clone()).ToArray();
+        foreach(var curve in offsets)
+        {
+            if(Space.PreserveIntermediateKeys) RetimeTimeCurve(curve, key => ProgressCurve.Round(key.Time * factor));
+            else curve.Rescale(factor);
+        }
         // Commit only after all curves, intervals, and holds have passed prevalidation.
         for(int n = 0; n < Intervals.Count; n++)
         {
@@ -1183,8 +1316,8 @@ public sealed class ShotCurves
             if(i.AutoTiming && i.AutoSnapshot != null) i.AutoSnapshot = i.Channels.ToDictionary(p => p.Key, p => p.Value.Clone());
         }
         Start = start; End = end; HoldRegions = holds;
-        PathProgress.Rescale(factor);
-        foreach(var curve in Offset) curve.Rescale(factor);
+        PathProgress.Keys = progress.Keys;
+        for(int i = 0; i < Offset.Length; i++) Offset[i].Keys = offsets[i].Keys;
     }
 
     public static Vector3 Euler(Quaternion q, Vector3? near = null)

@@ -19,6 +19,14 @@ public sealed class PathDisplay
         var result = new PathDisplay();
         if(shot.End <= shot.Start) return result;
         var events = new SortedSet<float>();
+        var spatialJumps = shot.Space.Channels.ToDictionary(pair => pair.Key, pair =>
+        {
+            pair.Value.Sort();
+            var keys = pair.Value.Keys;
+            return Enumerable.Range(1, Math.Max(0, keys.Count - 1)).Where(n =>
+                keys[n - 1].Interpolation == CurveInterpolation.Constant && keys[n - 1].Value != keys[n].Value)
+                .Select(n => keys[n].Time).ToArray();
+        });
         foreach(var interval in shot.Intervals)
         {
             events.Add(interval.Start); events.Add(interval.End);
@@ -38,13 +46,12 @@ public sealed class PathDisplay
                     : channel == CameraChannel.Rotation ? new[] { SpatialChannel.Yaw, SpatialChannel.Pitch, SpatialChannel.Roll } : new[] { SpatialChannel.Fov };
                 foreach(var c in spatialChannels)
                 {
-                    var spatial = shot.Space.Channels[c];
-                    for(int n = 1; n < spatial.Keys.Count; n++)
+                    var parameters = spatialJumps[c];
+                    var range = interval.Ranges[channel];
+                    int n = Array.BinarySearch(parameters, range.start);
+                    for(n = n >= 0 ? n + 1 : ~n; n < parameters.Length && parameters[n] <= range.end; n++)
                     {
-                        if(spatial.Keys[n - 1].Interpolation != CurveInterpolation.Constant || spatial.Keys[n - 1].Value == spatial.Keys[n].Value) continue;
-                        double parameter = spatial.Keys[n].Frame;
-                        var range = interval.Ranges[channel];
-                        if(parameter <= range.start || parameter > range.end) continue;
+                        double parameter = parameters[n];
                         // ParameterAt uses exactly the active mode, including holds and simple timing.
                         double lo = interval.Start, hi = interval.End;
                         for(int j = 0; j < 52; j++)
@@ -59,7 +66,7 @@ public sealed class PathDisplay
         }
         foreach(var hold in shot.Holds) { events.Add(hold.start); events.Add(hold.end); }
         var times = new SortedSet<float> { shot.Start, shot.End };
-        int samples = Math.Clamp((int)Math.Ceiling((shot.End - shot.Start) * 30.0 / Math.Max(1, fps)), 2, 4096);
+        int samples = Math.Clamp((int)Math.Ceiling((shot.End - shot.Start) * 30.0 / Math.Max(1, fps)), 2, 1536);
         for(int n = 1; n < samples; n++) times.Add(shot.Start + (shot.End - shot.Start) * n / (float)samples);
         foreach(float frame in events.Where(f => f > shot.Start && f <= shot.End))
         {
@@ -71,11 +78,12 @@ public sealed class PathDisplay
             if(jump) { result.Jumps.Add(new DisplayJump(frame, before, after)); times.Add(beforeFrame); }
             times.Add(frame);
         }
+        var jumpFrames = result.Jumps.Select(j => j.Frame).ToHashSet();
         float previousFrame = times.Min; var previous = shot.Sample(previousFrame);
         foreach(float frame in times.Skip(1))
         {
             var pose = shot.Sample(frame);
-            bool dashed = result.Jumps.Any(j => j.Frame == frame && previousFrame == MathF.BitDecrement(frame));
+            bool dashed = previousFrame == MathF.BitDecrement(frame) && jumpFrames.Contains(frame);
             result.Edges.Add(new DisplayEdge(previousFrame, frame, previous, pose, dashed));
             previousFrame = frame; previous = pose;
         }

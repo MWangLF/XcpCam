@@ -11,7 +11,7 @@ using XcpCam.Core;
 
 namespace XcpCam;
 
-public sealed class MainWindow : Window, IDisposable
+public sealed partial class MainWindow : Window, IDisposable
 {
     private readonly ITargetManager _targets;
     private readonly IClientState _clientState;
@@ -35,6 +35,7 @@ public sealed class MainWindow : Window, IDisposable
     private readonly PathSettings _settings = new();
     private bool _useProjectionFov = true;
     private bool _syncFpsWithBrio = true;
+    private bool _importedVivacityPending;
     private bool _followBrioPlayhead;
     private bool _drivePlayheadToBrio;
     private bool _lookThrough;
@@ -132,25 +133,42 @@ public sealed class MainWindow : Window, IDisposable
         : (int)Math.Ceiling(_anim.Duration * _tl.Fps);
 
     /// <summary>Length follows the bound source: Vivacity two-way, the animation scrubber read-only.</summary>
-    private bool LengthFromAnimation => SourceAvailable && _source == BindSource.Animation;
-    private bool LengthFromVivacity => SourceAvailable && _source == BindSource.Vivacity;
+    private bool LengthFromAnimation => _syncLengthWithSource && SourceAvailable && _source == BindSource.Animation;
+    private bool LengthFromVivacity => _syncLengthWithSource && SourceAvailable && _source == BindSource.Vivacity;
 
     private void SyncLengthFromSource()
     {
-        if(SourceLengthFrames is int length && length > 0) _tl.Length = Math.Min(length, 100000);
+        if(SourceLengthFrames is int length && length > 0) _tl.Length = Math.Max(_tl.LastFrame, length);
     }
 
     /// <summary>Sets the timeline length; when bound to Vivacity also writes Brio's FrameMax.</summary>
     private void SetTimelineLength(int frames)
     {
         if(LengthFromAnimation) return; // the animation's own duration is authoritative
-        frames = Math.Clamp(frames, 1, 100000);
+        frames = Math.Clamp(frames, 1, Math.Max(100000, _tl.Length));
         _tl.Length = frames;
-        if(LengthFromVivacity)
-        {
-            int brioFrames = (int)Math.Round(TransportMath.ConvertFrame(frames, _tl.Fps, _brio.TimelineRate));
-            _brio.FrameMax = Math.Max(_brio.FrameMin + 1, brioFrames);
-        }
+        if(LengthFromVivacity) WriteVivacityLength(frames);
+    }
+
+    private void WriteVivacityLength(int frames)
+    {
+        int brioFrames = (int)Math.Round(TransportMath.ConvertFrame(frames, _tl.Fps, _brio.TimelineRate));
+        _brio.FrameMax = Math.Max(_brio.FrameMin + 1, brioFrames);
+    }
+
+    private void AlignToVivacity()
+    {
+        int fps = _brio.TimelineFps;
+        _tl.SetFps(fps);
+        if(LengthFromVivacity) WriteVivacityLength(_tl.Length);
+        SetStatus($"已同步灵动时间轴 {fps} fps，镜头时间按秒换算。", false);
+    }
+
+    private void SyncImportedVivacityLength()
+    {
+        if(!_importedVivacityPending || !LengthFromVivacity) return;
+        WriteVivacityLength(_tl.Length);
+        _importedVivacityPending = false;
     }
 
     /// <summary>Grows the timeline to include <paramref name="frame"/> (captures/duplicates past the end).</summary>
@@ -315,6 +333,8 @@ public sealed class MainWindow : Window, IDisposable
 
     public void Dispose()
     {
+        _importCancel?.Cancel();
+        _importCancel?.Dispose();
         try { _sync.Unbind(); } catch { /* Brio may already be gone */ }
         try { ReleaseAnimFreeze(); } catch { /* ditto */ }
     }
@@ -351,6 +371,7 @@ public sealed class MainWindow : Window, IDisposable
             if(_recording != null) { _recording = null; SetStatus("已离开 GPose，录制目标轨迹已中止。", true); }
             return;
         }
+        if(!_wasGpose && _config.OpenOnGPose) IsOpen = true;
         _wasGpose = true;
 
         if(_source == BindSource.Animation)
@@ -407,15 +428,10 @@ public sealed class MainWindow : Window, IDisposable
         // fps only follows the Vivacity timeline; the animation bar is in seconds and has no fps of its own
         if(_source == BindSource.Vivacity && _syncFpsWithBrio && _brio.IsConnected)
         {
-            int fps = _brio.TimelineFps;
-            if(fps != _tl.Fps)
+            if(_brio.TimelineFps != _tl.Fps)
             {
-                try
-                {
-                    _tl.SetFps(fps);
-                    SetStatus($"已同步 Brio 灵动时间轴帧率：{fps}fps（镜头节点按秒保持不变）", false);
-                }
-                catch(InvalidOperationException ex)
+                try { AlignToVivacity(); }
+                catch(Exception ex) when(ex is InvalidOperationException or ArgumentException or OverflowException)
                 {
                     _syncFpsWithBrio = false;
                     SetStatus(ex.Message + " 已暂停自动帧率同步。", true);
@@ -423,8 +439,9 @@ public sealed class MainWindow : Window, IDisposable
             }
         }
 
-        // Length always follows the bound source immediately (after fps sync, so frames match).
-        if(SourceAvailable) SyncLengthFromSource();
+        // Publish an imported length before polling the previous source length.
+        SyncImportedVivacityLength();
+        if(_syncLengthWithSource && SourceAvailable) SyncLengthFromSource();
 
         RebuildPathIfNeeded();
 
@@ -476,6 +493,17 @@ public sealed class MainWindow : Window, IDisposable
     private int _shortcutFrame = -1;
     private bool _mainFocused;
 
+    private void RestoreHistory(bool redo)
+    {
+        long revision = _tl.Revision;
+        int length = _tl.Length;
+        if(redo) _tl.Redo(); else _tl.Undo();
+        if(_tl.Revision == revision) return;
+        Selected = null;
+        _importedVivacityPending = false;
+        if(LengthFromVivacity && length != _tl.Length) WriteVivacityLength(_tl.Length);
+    }
+
     private void HandleShortcuts(bool? mainFocused = null)
     {
         if(mainFocused is bool f) _mainFocused = f;
@@ -499,8 +527,8 @@ public sealed class MainWindow : Window, IDisposable
             if(!pressed || !accepted || mods != (chord >> 8)) continue;
             switch(action)
             {
-                case Shortcut.Undo when _tl.CanUndo: _tl.Undo(); Selected = null; break;
-                case Shortcut.Redo when _tl.CanRedo: _tl.Redo(); Selected = null; break;
+                case Shortcut.Undo when _tl.CanUndo: RestoreHistory(redo: false); break;
+                case Shortcut.Redo when _tl.CanRedo: RestoreHistory(redo: true); break;
                 case Shortcut.ToggleCut when !_curveTool.OwnsGizmo && _tl.SelectedNodes.Count <= 1 && Selected is { } node && CanToggleCut(node):
                     ToggleNodeCut(node); break;
                 case Shortcut.Delete: if(!_curveTool.DeleteSelected()) DeleteSelectedNodes(); break;
@@ -1057,17 +1085,21 @@ public sealed class MainWindow : Window, IDisposable
 
     private void RebuildPathIfNeeded()
     {
-        _tl.RefreshAutoCuts(); // node now 1 frame after its predecessor -> hard cut (unless switched off by hand)
         int hash = ComputeHash();
         // also rebuild whenever the composer was built for a different number of tracks
         bool structureChanged = _comp != null && _comp.TrackCount != _tl.Tracks.Count;
         if(hash == _pathHash && !structureChanged) return;
-        _pathHash = hash;
+        _tl.RefreshAutoCuts();
+        _pathHash = ComputeHash();
         try
         {
             _tl.SyncSeconds();
             _comp = ShotComposer.Create(_tl, _settings, _bones);
-            if(_sync.Bound && ExportComposer(out _) is { } export) _sync.Refresh(export);
+            if(_sync.Bound && ExportComposer(out _) is { } export)
+            {
+                _sync.StartFrame = export.FirstFrame;
+                _sync.Refresh(export);
+            }
         }
         catch(Exception ex)
         {
@@ -1139,7 +1171,7 @@ public sealed class MainWindow : Window, IDisposable
 
     private void RefreshNodePose(Keyframe node)
     {
-        if(ShotFor(node) is not { } shot) return;
+        if(_tl.TrackOf(node)?.Shots.FirstOrDefault(s => s.SeededNodes.Contains(node.Id)) is not { } shot) return;
         var pose = shot.NodePose(node);
         node.Pos = pose.Pos; node.Rot = pose.Rot; node.Fov = pose.Fov;
     }
@@ -1181,9 +1213,9 @@ public sealed class MainWindow : Window, IDisposable
 
     private void DrawGraphTab()
     {
-        if(ImGui.SmallButton("撤销##graph")) { _tl.Undo(); Selected = null; }
+        if(ImGui.SmallButton("撤销##graph")) { RestoreHistory(redo: false); }
         ImGui.SameLine();
-        if(ImGui.SmallButton("重做##graph")) { _tl.Redo(); Selected = null; }
+        if(ImGui.SmallButton("重做##graph")) { RestoreHistory(redo: true); }
         var selected = Selected;
         if(selected != null && selected.Id != _graphNode)
         {
@@ -1192,7 +1224,7 @@ public sealed class MainWindow : Window, IDisposable
             if(owner != null)
             {
                 _tl.ActiveTrackIndex = _tl.Tracks.IndexOf(owner);
-                _graphShot = CurveModel.Groups(owner).FindIndex(g => g.Contains(selected));
+                _graphShot = owner.Shots.FindIndex(shot => shot.SeededNodes.Contains(selected.Id));
             }
         }
         ImGui.SetNextItemWidth(180);
@@ -1201,7 +1233,6 @@ public sealed class MainWindow : Window, IDisposable
         if(ImGui.Combo("轨道", ref trackIndex, trackNames, trackNames.Length))
         { _tl.ActiveTrackIndex = trackIndex; _graphShot = 0; Selected = null; }
         var track = _tl.ActiveTrack;
-        CurveModel.Ensure(track, _tl.Fps);
         if(track.Shots.Count == 0) { ImGui.TextDisabled("请先在相机时间轴抓取镜头。"); return; }
         _graphShot = Math.Clamp(_graphShot, 0, track.Shots.Count - 1);
         ImGui.SameLine(); ImGui.SetNextItemWidth(250);
@@ -1257,7 +1288,7 @@ public sealed class MainWindow : Window, IDisposable
         {
             ImGui.SetNextItemWidth(60);
             int fps = _tl.Fps;
-            if(ImGui.InputInt("fps", ref fps, 0)) Try(() => { _tl.Snapshot(); _tl.SetFps(fps); });
+            if(ImGui.InputInt("fps", ref fps, 0)) Try(() => _tl.SetFps(fps, snapshot: true));
         }
         ImGui.SameLine();
         DrawInfluenceOption();
@@ -1293,25 +1324,28 @@ public sealed class MainWindow : Window, IDisposable
         _defaultGapFrames = Math.Clamp(_defaultGapFrames, 1, 10000);
         ImGui.SameLine();
         ImGui.BeginDisabled(!_tl.CanUndo);
-        if(ImGui.Button("撤销")) { _tl.Undo(); Selected = null; }
+        if(ImGui.Button("撤销")) { RestoreHistory(redo: false); }
         ImGui.EndDisabled();
         ImGui.SameLine();
         ImGui.BeginDisabled(!_tl.CanRedo);
-        if(ImGui.Button("重做")) { _tl.Redo(); Selected = null; }
+        if(ImGui.Button("重做")) { RestoreHistory(redo: true); }
         ImGui.EndDisabled();
         ImGui.SameLine();
         if(ImGui.Button("适配")) _tlw.FitAll(_tl, ImGui.GetContentRegionAvail().X + 300);
-        ImGui.SameLine();
-        bool canExport = _comp != null && _comp.LastFrame > _comp.FirstFrame;
-        ImGui.BeginDisabled(!canExport);
+        ImGui.BeginDisabled(_comp == null);
         if(ImGui.Button("导出 .xcp")) OpenSaveDialog();
         ImGui.EndDisabled();
         if(ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled) && _comp != null && _comp.CutFrames.Count > 0)
             ImGui.SetTooltip(".xcp 是 30fps 的连续帧，Brio 播放时会在相邻两帧之间插值，\n所以每个切镜处会有约 1 帧（33ms）的快速过渡。\n需要完全瞬切请使用「Brio 联动」里的烘焙，或「预览镜头」。");
 
+        ImGui.SameLine();
+        ImGui.Checkbox("附带可编辑时间轴", ref _embedProject);
+        ImGui.SameLine();
+        DrawImportControls();
+
         // --- the timeline ---
         ImGui.Spacing();
-        _tlw.Draw(_tl, _comp, _config.Shortcuts);
+        _tlw.Draw(_tl, _comp, _config.Shortcuts, _overlay.SpeedColors);
         if(_tlw.TracksEdited)
         {
             // tracks were added / removed / reordered inside the widget: keep the selection valid and
@@ -1586,7 +1620,7 @@ public sealed class MainWindow : Window, IDisposable
     /// <summary>Settings tab: display options, movement limit, then Brio integration. Also the plugin's config UI.</summary>
     private void DrawSettingsTab(bool gpose)
     {
-        bool changed = false;
+        bool changed = ImGui.Checkbox("进入 GPose 时自动打开 XcpCam", ref _config.OpenOnGPose);
         if(ImGui.CollapsingHeader("显示选项", ImGuiTreeNodeFlags.DefaultOpen))
         {
             changed |= ImGui.Checkbox("游戏内显示", ref _overlay.Enabled);
@@ -1699,7 +1733,7 @@ public sealed class MainWindow : Window, IDisposable
             if(ImGui.IsItemHovered()) ImGui.SetTooltip("拖动播放头带动动画时，通过 Brio 把目标动画速度设为 0，避免动画自己继续往前走。\n在 Brio 里重新播放动画即可恢复。");
         }
         ImGui.SameLine();
-        ImGui.TextDisabled(_source == BindSource.Animation ? "总长自动等于动画长度。" : "总长与灵动时间轴双向同步。");
+        ImGui.Checkbox("总长跟随绑定时间轴", ref _syncLengthWithSource);
 
         // ---- mode 1 ----
         ImGui.Separator();
@@ -1717,6 +1751,13 @@ public sealed class MainWindow : Window, IDisposable
             if(ImGui.Button("绑定"))
                 Try(() =>
                 {
+                    if(_source == BindSource.Vivacity && _syncFpsWithBrio && _tl.Fps != _brio.TimelineFps)
+                    {
+                        AlignToVivacity();
+                        RebuildPathIfNeeded();
+                    }
+                    SyncImportedVivacityLength();
+                    _sync.StartFrame = _tl.FirstFrame;
                     _sync.Bind(ExportComposer(out var warning)!);
                     SetStatus($"已绑定到{SourceName}（XAT）" + (warning.Length > 0 ? "。" + warning : ""), warning.Length > 0);
                 });
@@ -2024,7 +2065,7 @@ public sealed class MainWindow : Window, IDisposable
                 throw new InvalidOperationException($"导出 .xcp 需要 GPose 目标（{err}）");
             var export = ExportComposer(out var warning)!;
             var frames = XcpMath.ToRelative(export.BakeXcp(PathBuilder.Fps), bp, br);
-            XcpWriter.Write(path, frames);
+            XcpFile.Write(path, frames, _embedProject ? ProjectCodec.Encode(_tl) : null, bp, br);
             _lastDir = Path.GetDirectoryName(path) ?? _lastDir;
             string cutNote = _comp.CutFrames.Count > 0 ? $"，{_comp.CutFrames.Count} 处切镜（.xcp 切镜处约有 1 帧过渡）" : "";
             SetStatus($"已导出 {frames.Count} 帧 (30fps){cutNote} → {path}" + (warning.Length > 0 ? "。" + warning : ""), warning.Length > 0);
