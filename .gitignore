@@ -5,4 +5,5 @@ obj/
 *.user
 *.suo
 *.xcp
+*.log
 .README.md
