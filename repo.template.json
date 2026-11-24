@@ -14,6 +14,7 @@
     "DownloadLinkInstall": "https://github.com/MWangLF/XcpCam/releases/download/v__VERSION__/XcpCam-__VERSION__.zip",
     "DownloadLinkUpdate": "https://github.com/MWangLF/XcpCam/releases/download/v__VERSION__/XcpCam-__VERSION__.zip",
     "DownloadLinkTesting": "https://github.com/MWangLF/XcpCam/releases/download/v__VERSION__/XcpCam-__VERSION__.zip",
+    "IconUrl": "https://raw.githubusercontent.com/MWangLF/XcpCam/main/Resources/Images/XcpCamIcon.png",
     "Tags": ["gpose", "camera", "xat", "brio"]
   }
 ]
