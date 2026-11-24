@@ -26,7 +26,8 @@ public sealed class TimelineSync
 
     /// <summary>Supplies (isPlaying, timeInFrames, fps) of whatever the camera timeline is bound to.</summary>
     public Func<(bool playing, double frame, int fps)>? Clock;
-    public string ClockName = "时间轴";
+    public Func<string>? ClockNameProvider;
+    public string ClockName => ClockNameProvider?.Invoke() ?? I18n.T("topbar.tab_timeline");
     public Func<bool>? ClockCycle;
     public Func<long>? ClockGeneration;
     private long _lastGeneration;
@@ -49,7 +50,7 @@ public sealed class TimelineSync
 
     public void Bind(ShotComposer comp)
     {
-        var target = Base?.Invoke() ?? throw new InvalidOperationException("联动 XAT 需要 GPose 目标：.xcp 是相对目标的格式。");
+        var target = Base?.Invoke() ?? throw new InvalidOperationException(I18n.T("brio.sync.need_gpose_target"));
         var frames = XcpMath.ToRelative(comp.BakeXcp(PathBuilder.Fps), target.pos, target.rot);
         XcpWriter.Write(TempFile, frames);
         _brio.LoadCutsceneFile(TempFile);
@@ -61,7 +62,7 @@ public sealed class TimelineSync
         _lastTime = c.frame;
         _lastGeneration = ClockGeneration?.Invoke() ?? 0;
         _startedThisRun = false;
-        Status = $"已绑定：{frames.Count} 帧（{comp.DurationSec:0.00}s，{comp.CutFrames.Count} 处切镜），在{ClockName}第 {StartFrame} 帧开始";
+        Status = I18n.T("brio.sync.bound", frames.Count, $"{comp.DurationSec:0.00}", comp.CutFrames.Count, ClockName, StartFrame);
         _log.Info($"TimelineSync bound to {ClockName}, {frames.Count} frames, start frame {StartFrame}");
     }
 
@@ -79,7 +80,7 @@ public sealed class TimelineSync
         if(Bound && _brio.CutsceneIsRunning) _brio.StopCutscene();
         Bound = false;
         PlayheadSec = null;
-        Status = "未绑定";
+        Status = I18n.T("brio.sync.unbound");
     }
 
     /// <summary>Call every framework tick.</summary>
@@ -88,12 +89,12 @@ public sealed class TimelineSync
         if(!Bound) return;
         if(!_brio.IsConnected || !_brio.CanSync)
         {
-            Status = "Brio 未连接，联动暂停";
+            Status = I18n.T("brio.sync.paused_disconnected");
             return;
         }
         if(!_brio.HasCutsceneFile)
         {
-            Status = "Brio 中的 XAT 文件已被替换，已解除绑定";
+            Status = I18n.T("brio.sync.replaced");
             Bound = false;
             return;
         }
@@ -139,11 +140,11 @@ public sealed class TimelineSync
             : null;
 
         if(playing && _brio.CurrentCameraIsFree)
-            Status = "⚠ 当前是 Brio 自由相机，XAT 播放不会生效。请切到默认/普通相机。";
+            Status = I18n.T("brio.sync.free_cam_warn");
         else
             Status = playing
-                ? (_startedThisRun ? "播放中（XAT 已同步启动）" : $"等待{ClockName}到达第 {StartFrame} 帧")
-                : $"已绑定，等待{ClockName}播放";
+                ? (_startedThisRun ? I18n.T("brio.sync.playing_started") : I18n.T("brio.sync.waiting_start", ClockName, StartFrame))
+                : I18n.T("brio.sync.waiting_play", ClockName);
 
         _wasPlaying = playing;
         _lastTime = time;

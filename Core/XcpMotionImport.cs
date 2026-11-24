@@ -23,9 +23,9 @@ public static class XcpMotionImport
         ArgumentNullException.ThrowIfNull(worldFrames);
         cancellationToken.ThrowIfCancellationRequested();
         int count = worldFrames.Count, last = count - 1;
-        if(count < 1 || count > MaxFrames) throw new ArgumentOutOfRangeException(nameof(worldFrames), $"XCP 帧数须在 1 到 {MaxFrames} 之间。");
+        if(count < 1 || count > MaxFrames) throw new ArgumentOutOfRangeException(nameof(worldFrames), I18n.T("core.import.frame_range", MaxFrames));
         foreach(double tolerance in new[] { positionTolerance, angleTolerance, fovTolerance })
-            if(!double.IsFinite(tolerance) || tolerance < 0) throw new ArgumentException("误差容限须为有限非负数。");
+            if(!double.IsFinite(tolerance) || tolerance < 0) throw new ArgumentException(I18n.T("core.import.invalid_tol"));
         var anchors = new SortedSet<int> { 0, last };
         if(cutFrames != null) foreach(int cut in cutFrames)
         {
@@ -42,7 +42,7 @@ public static class XcpMotionImport
             cancellationToken.ThrowIfCancellationRequested();
             var f = worldFrames[i];
             if(!XcpMath.IsFinite(f.Pos) || !XcpMath.IsFinite(f.Rot) || !float.IsFinite(f.Fov) || f.Rot == default)
-                throw new ArgumentException($"XCP 第 {i} 帧的姿态无效。", nameof(worldFrames));
+                throw new ArgumentException(I18n.T("core.import.invalid_pose", i), nameof(worldFrames));
             samples[i] = f;
             previous = Euler(f.Rot, i == 0 || cutFrames?.Contains(i) == true ? Vector3.Zero : previous);
             values[3][i] = previous.X; values[4][i] = previous.Y; values[5][i] = previous.Z;
@@ -123,7 +123,7 @@ public static class XcpMotionImport
                 if(bad < 0 && !(position <= positionTolerance && angle <= angleTolerance && fov <= fovTolerance)) bad = i;
             }
             if(bad < 0) return new(timeline, nodes.Count, extra, position, angle, fov);
-            if(attempt != 0) throw new InvalidOperationException($"XCP 从第 {bad} 帧起超差。最大位置误差 {position:G6} 米，旋转 {angle:G6} 度，FoV {fov:G6} 度。");
+            if(attempt != 0) throw new InvalidOperationException(I18n.T("core.import.out_of_tol", bad, $"{position:G6}", $"{angle:G6}", $"{fov:G6}"));
         }
     }
 
@@ -273,7 +273,7 @@ public static class XcpMotionImport
     private static void CheckWork(int keys, int nodes)
     {
         if(keys > MaxFittedKeys || nodes > 1024)
-            throw new InvalidOperationException("重建所需的镜头节点或曲线键过多，请分段导入或适当放宽误差范围。");
+            throw new InvalidOperationException(I18n.T("core.import.too_many_keys"));
     }
 
     private static CurveKey Key(int frame, double value, Keyframe? node = null) => new()

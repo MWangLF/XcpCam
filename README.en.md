@@ -1,7 +1,7 @@
 # XcpCam - Visual Camera Path Editor for FFXIV GPose
 
 <p>
-  <a href="https://github.com/MWangLF/XcpCam/releases"><img alt="Release" src="https://img.shields.io/github/v/release/MWangLF/XcpCam?include_prereleases&style=flat-square&label=Release&color=blue"></a>
+  <a href="https://github.com/MWangLF/XcpCam/releases"><img alt="Release" src="https://img.shields.io/github/v/release/MWangLF/XcpCam?style=flat-square&label=Release&color=blue"></a>
   <a href="https://github.com/MWangLF/XcpCam/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/MWangLF/XcpCam/total?style=flat-square&label=Downloads&color=blue"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/MWangLF/XcpCam?style=flat-square&label=License&color=blue"></a>
 </p>
@@ -13,16 +13,19 @@
   <a href="README.ko.md"><img alt="한국어" src="https://img.shields.io/badge/%ED%95%9C%EA%B5%AD%EC%96%B4-lightgrey?style=flat-square"></a>
 </p>
 
-> **Current Version: 0.0.6.4 (Pre-release)**. XcpCam is under active development. Feedback and bug reports are welcome via [GitHub Issues](https://github.com/MWangLF/XcpCam/issues).
+> **Current Version: 0.1.0.0**. XcpCam is under active development. Feedback and bug reports are welcome via [GitHub Issues](https://github.com/MWangLF/XcpCam/issues).
 
 **XcpCam** is a Dalamud plugin for creating and editing cinematic camera paths directly inside FFXIV GPose. Place camera nodes, shape Blender-style 3D curves, and attach bone-tracking constraints on a frame-based multi-track timeline—then export `.xcp` camera files for XAT / Brio or sync live with **Brio**'s Vivacity timeline and character animations.
 
 ## Features
 
+- **Modern Workspace & Multi-Language UI**
+  - **Brio Dark + Blender N-Panel** split workspace (with an optional Follow Dalamud theme) and detached sub-windows for Paths, Constraints, Brio Sync, and Settings so secondary panels never interrupt timeline editing.
+  - Includes a **fixed bottom Mini Timeline** (keep scrubbing and previewing even when the main window is collapsed), a **floating Viewport Toolbar**, and built-in **Simplified Chinese / English / Japanese / Korean** localization (follows your game client language by default, switchable anytime in Settings).
 - **In-Game Visual Editing**
   - Real-time 3D overlay showing camera trajectories (with blue-to-red speed coloring), camera frustums, hard-cut markers, and tracking aim lines.
   - Pick camera nodes, curve control points, and Bézier handles directly in the viewport. Transform gizmos automatically follow your selection with translate / rotate / scale, local space, snapping, and multi-selection group translate & rotate.
-  - Right-click context menus on viewport nodes, automatic window opening on GPose entry (toggleable), and fully configurable shortcuts.
+  - Right-click context menus on viewport nodes, paired auto-open/auto-close with GPose (manually opened windows stay open), and fully configurable shortcuts.
 - **Multi-Track Camera Timeline & Hard Cuts**
   - Frame-accurate multi-track timeline with track priority layering, mute / solo, drag retiming, hold frames, box selection, and multi-step undo / redo.
   - Supports both **in-track hard cuts** and **multi-track cuts**, with instantaneous cuts in live preview and Brio baking.

@@ -1,4 +1,5 @@
 using Dalamud.Bindings.ImGui;
+using Dalamud.Interface;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -77,7 +78,8 @@ public sealed class SpatialGraphEditor
     private bool _rightHandle, _snapshot;
     private Vector2 _handleOrigin;
     private double _dragSpan, _dragHeight;
-    private const float HeaderWidth = 150, RulerHeight = 24;
+    private float HeaderWidth => 162f * XcpStyle.Scale;
+    private float RulerHeight => 23f * XcpStyle.Scale;
     private enum Gesture { None, Keys, Handle, Box, Scrub, Pan }
     private readonly record struct KeyId(GraphChannel Channel, Guid Id);
     private readonly record struct Anchor(KeyId Id, double Value, double DisplayFrame);
@@ -87,9 +89,9 @@ public sealed class SpatialGraphEditor
     private double FrozenFrame(GraphChannel channel, double parameter) => IsTime(channel) ? parameter : SpatialFrameMap.Frame(_dragMap ?? _shot, Spatial(channel), parameter);
     private readonly record struct Hit(KeyId Id, bool Handle, bool Right, Vector2 Position);
 
-    public void Draw(ShotCurves shot, CamTimeline timeline, ShortcutBindings shortcuts)
+    public void Draw(ShotCurves shot, CamTimeline timeline, ShortcutBindings shortcuts, bool brioTheme = true)
     {
-        if(shot.EditorMode != CurveEditorMode.Advanced) { EndGesture(); ImGui.TextDisabled("高级曲线已锁定，请先切换模式。"); return; }
+        if(shot.EditorMode != CurveEditorMode.Advanced) { EndGesture(); ImGui.TextDisabled(I18n.T("graph.sg_locked")); return; }
         _shot = shot;
         if (_shotId != shot.Id)
         {
@@ -132,18 +134,21 @@ public sealed class SpatialGraphEditor
         if (_primary is { } p && !_selected.Contains(p)) _primary = null;
         ImGui.PushID("SpatialGraph" + shot.Id);
         long beforeToolbar = timeline.Revision;
-        DrawToolbar(shot, timeline);
+        DrawToolbar(shot, timeline, brioTheme);
         if(timeline.Revision != beforeToolbar) { ImGui.PopID(); return; }
         DrawInspector(shot, timeline);
 
+        float s = XcpStyle.Scale;
+        float statusReserve = string.IsNullOrEmpty(Status) ? 4f * s : ImGui.GetTextLineHeightWithSpacing() + 8f * s;
+        float headerW = HeaderWidth, rulerH = RulerHeight;
         var start = ImGui.GetCursorScreenPos();
-        float width = MathF.Max(210, ImGui.GetContentRegionAvail().X - HeaderWidth);
-        const float graphHeight = 340;
-        DrawChannels(start, shortcuts);
-        var origin = start + new Vector2(HeaderWidth, 0);
-        var plot = origin + new Vector2(0, RulerHeight);
+        float width = MathF.Max(210f * s, ImGui.GetContentRegionAvail().X - headerW);
+        float graphHeight = MathF.Max(265f * s, ImGui.GetContentRegionAvail().Y - statusReserve);
+        DrawChannels(start, headerW, graphHeight, shortcuts, brioTheme);
+        var origin = start + new Vector2(headerW, 0);
+        var plot = origin + new Vector2(0, rulerH);
         var end = origin + new Vector2(width, graphHeight);
-        float plotHeight = graphHeight - RulerHeight;
+        float plotHeight = graphHeight - rulerH;
         if (_gesture == Gesture.None) UpdateNormalization();
         if (_fit) { Fit(shot, false); _fit = false; }
         ImGui.SetCursorScreenPos(origin);
@@ -168,23 +173,23 @@ public sealed class SpatialGraphEditor
 
         var dl = ImGui.GetWindowDrawList();
         dl.PushClipRect(origin, end, true);
-        dl.AddRectFilled(origin, end, 0xFF202020);
-        dl.AddRectFilled(origin, plot, 0xFF303030);
+        dl.AddRectFilled(origin, end, XcpStyle.CanvasBg(brioTheme));
+        dl.AddRectFilled(origin, new Vector2(end.X, plot.Y), XcpStyle.CanvasRuler(brioTheme));
         double step = NiceStep(_span * 65 / width, true);
         double first = Math.Ceiling(_left / step) * step;
         for (double f = first; f <= _left + _span; f += step)
         {
             float x = X(f);
-            dl.AddLine(new Vector2(x, plot.Y - 6), new Vector2(x, end.Y), 0x284F4F4F);
-            dl.AddText(new Vector2(x + 3, origin.Y + 3), 0xFFC0C0C0, f.ToString("0"));
+            dl.AddLine(new Vector2(x, plot.Y - 6f * s), new Vector2(x, end.Y), XcpStyle.CanvasGrid(brioTheme));
+            dl.AddText(new Vector2(x + 3f * s, origin.Y + 3f * s), 0xFFC4C4D0, f.ToString("0"));
         }
         dl.PushClipRect(plot, end, true);
         double vs = NiceStep(_height * 50 / plotHeight, false);
         for (double v = Math.Ceiling(_bottom / vs) * vs; v <= _bottom + _height; v += vs)
         {
             float y = end.Y - (float)((v - _bottom) / _height * plotHeight);
-            dl.AddLine(new Vector2(plot.X, y), new Vector2(end.X, y), 0x254F4F4F);
-            dl.AddText(new Vector2(plot.X + 3, y + 2), 0xFF888888, v.ToString("0.###"));
+            dl.AddLine(new Vector2(plot.X, y), new Vector2(end.X, y), XcpStyle.CanvasGrid(brioTheme));
+            dl.AddText(new Vector2(plot.X + 3f * s, y + 2f * s), 0xFF8C8C9A, v.ToString("0.###"));
         }
         float cutA = Math.Clamp(X(shot.Start), plot.X, end.X);
         float cutB = Math.Clamp(X(shot.End), plot.X, end.X);
@@ -275,15 +280,15 @@ public sealed class SpatialGraphEditor
         {
             float x = X(boundary);
             dl.AddLine(new Vector2(x, origin.Y), new Vector2(x, end.Y), 0xFFAAAAFF, 2);
-            dl.AddText(new Vector2(x + 3, plot.Y + 20), 0xFFAAAAFF, boundary == shot.Start ? "起始帧" : "结束帧");
+            dl.AddText(new Vector2(x + 3, plot.Y + 20), 0xFFAAAAFF, boundary == shot.Start ? I18n.T("graph.boundary_start") : I18n.T("graph.boundary_end"));
         }
         foreach (var channel in Enum.GetValues<CameraChannel>())
         {
             float x = X(timeline.Playhead);
             uint color = channel == CameraChannel.Position ? 0xFF70CE70 : channel == CameraChannel.Rotation ? 0xFFE080D0 : 0xFF60DFDF;
-            string label = channel == CameraChannel.Position ? "位置" : channel == CameraChannel.Rotation ? "旋转" : "FoV";
+            string label = channel == CameraChannel.Position ? I18n.T("graph.ch.pos") : channel == CameraChannel.Rotation ? I18n.T("graph.ch.rot") : I18n.T("graph.ch.fov");
             dl.AddLine(new Vector2(x, plot.Y), new Vector2(x, end.Y), color, 1);
-            dl.AddText(new Vector2(x + 3, plot.Y + 4 + (int)channel * 16), color, label + "映射");
+            dl.AddText(new Vector2(x + 3, plot.Y + 4 + (int)channel * 16), color, I18n.T("graph.map_suffix", label));
         }
         float cursorX = X(_cursor);
         dl.AddLine(new Vector2(cursorX, origin.Y), new Vector2(cursorX, end.Y), 0xFF5555EE, 2);
@@ -294,6 +299,7 @@ public sealed class SpatialGraphEditor
             dl.AddRectFilled(a, b, 0x3050A0FF); dl.AddRect(a, b, 0xFFC09050);
         }
         dl.PopClipRect();
+        dl.AddRect(start, end, XcpStyle.CardBorderU32(brioTheme), 3f * s, ImDrawFlags.None, 1f);
 
         if (hovered && _gesture == Gesture.None)
         {
@@ -321,7 +327,7 @@ public sealed class SpatialGraphEditor
                         if (!_locked.Contains(h.Id.Channel))
                         {
                             if (h.Handle && _driven.Contains(h.Id.Channel))
-                                Status = "此通道由追踪约束控制，手柄不能编辑；关键帧仍可横向拖动重定时节点。";
+                                Status = I18n.T("graph.driven_handle_locked");
                             else if (h.Handle)
                             {
                                 _gesture = Gesture.Handle; _handleKey = h.Id; _rightHandle = h.Right;
@@ -337,7 +343,7 @@ public sealed class SpatialGraphEditor
                                     .Select(x => new Anchor(x.id, x.key.Value, ToFrame(x.id.Channel, x.key.Time))).ToList();
                             }
                         }
-                        else Status = "通道已锁定。";
+                        else Status = I18n.T("graph.ch_locked");
                     }
                 }
                 else if (shortcuts.Held(Shortcut.Box)) { _gesture = Gesture.Box; _boxEnd = mouse; }
@@ -388,10 +394,10 @@ public sealed class SpatialGraphEditor
                                 BeforeGesture(timeline);
                                 if (key.Mode.ToString() is "Auto" or "AutoClamped" or "Vector") key.Mode = Named(key.Mode, "Free");
                                 curve.SetHandle(key, _rightHandle, target);
-                                shot.Space.Touch(); timeline.Touch(); Status = "已编辑手柄（支持小数路径参数）。";
+                                shot.Space.Touch(); timeline.Touch(); Status = I18n.T("graph.handle_edited");
                             }
                         }
-                        else Status = "无法编辑手柄：通道锁定或数值无效。";
+                        else Status = I18n.T("graph.handle_edit_failed");
                     }
                 }
             }
@@ -410,106 +416,161 @@ public sealed class SpatialGraphEditor
             }
         }
         if (hovered && hit is { } hover && Resolve(shot, hover.Id) is { } hoveredKey)
-            ImGui.SetTooltip($"{ChannelLabel(hover.Id.Channel)} | 帧 {ToFrame(hover.Id.Channel, hoveredKey.Time):0.###} | 数值 {hoveredKey.Value:G8}" +
-                (_locked.Contains(hover.Id.Channel) ? " | 已锁定" : ""));
-        ImGui.SetCursorScreenPos(new Vector2(start.X, end.Y + 4));
-        ImGui.TextDisabled(Status);
+            ImGui.SetTooltip(I18n.T("graph.hover_channel", ChannelLabel(hover.Id.Channel), $"{ToFrame(hover.Id.Channel, hoveredKey.Time):0.###}", $"{hoveredKey.Value:G8}") +
+                (_locked.Contains(hover.Id.Channel) ? I18n.T("graph.hover_locked_suffix") : ""));
+        ImGui.SetCursorScreenPos(new Vector2(start.X, end.Y + 4f * s));
+        if(!string.IsNullOrEmpty(Status)) ImGui.TextDisabled(Status);
+        else ImGui.Dummy(new Vector2(1, 1));
         ImGui.PopID();
     }
 
-    private void DrawToolbar(ShotCurves shot, CamTimeline timeline)
+    private void DrawToolbar(ShotCurves shot, CamTimeline timeline, bool brioTheme)
     {
-        ImGui.TextUnformatted($"{shot.Name} · 帧数 → {ChannelLabel(_active)} 数值 | 已选 {_selected.Count} 个关键帧");
-        if (ImGui.Button("适配全部")) { UpdateNormalization(); Fit(shot, false); }
-        ImGui.SameLine();
-        if (ImGui.Button("适配所选")) { UpdateNormalization(); Fit(shot, true); }
-        ImGui.SameLine();
-        if (ImGui.Checkbox("归一化可见通道", ref _normalize)) { UpdateNormalization(); Fit(shot, false); }
-        ImGui.TextDisabled("横轴：实际帧。路径进度 = 沿路径的长度比例（0–1，同 Blender 跟随路径的偏移系数）；位置偏移叠加在路径点上（世界坐标米）；旋转/FoV为度。");
-        ImGui.TextDisabled(shot.IsFollowing ? "当前轨道跟随曲线：路径进度可上下拖动改变节点在曲线上的位置，手柄调整快慢。"
-            : "路径形状在游戏内用曲线手柄编辑；这里的路径进度数值由节点位置决定，只能用手柄调整快慢。");
-        if(_driven.Count > 0)
-            ImGui.TextColored(new Vector4(0.6f, 0.9f, 1, 1), _driven.Contains(GraphChannel.Fov)
-                ? "偏航 / 俯仰 / 滚转与 FoV 由追踪约束控制：数值和手柄不能编辑，曲线显示的是节点自身的值。"
-                : "偏航 / 俯仰 / 滚转由追踪约束控制：数值和手柄不能编辑，曲线显示的是节点自身的值。");
+        float s = XcpStyle.Scale;
+
+        // ---- Row 1: cursor + keyframe edit + view controls ----
         int cursor = _cursor;
-        ImGui.SetNextItemWidth(140);
-        if (ImGui.InputInt("帧数游标", ref cursor)) _cursor = Math.Clamp(cursor, shot.Start, shot.End);
-        if (ImGui.Button("在游标帧添加镜头节点")) Add(shot, timeline);
+        ImGui.SetNextItemWidth(74f * s);
+        if(ImGui.InputInt("##sg_cur", ref cursor, 0)) _cursor = Math.Clamp(cursor, shot.Start, shot.End);
+        UiWidgets.Tooltip(I18n.T("graph.cursor_tip"));
+
+        ImGui.SameLine(0, 4f * s);
+        if(UiWidgets.IconTextButton("sg_add", FontAwesomeIcon.Plus, I18n.T("graph.insert_node"), I18n.T("graph.sg_insert_node_tip"), brioTheme: brioTheme))
+            Add(shot, timeline);
+        ImGui.SameLine(0, 3f * s);
+        if(UiWidgets.IconTextButton("sg_key", FontAwesomeIcon.PlusCircle, I18n.T("graph.sg_insert_ch_key"), I18n.T("graph.sg_insert_ch_key_tip"), brioTheme: brioTheme))
+            InsertChannelKeys(shot, timeline);
+        ImGui.SameLine(0, 3f * s);
+        if(UiWidgets.IconButton("sg_del", FontAwesomeIcon.TrashAlt, I18n.T("graph.sg_del_tip"), brioTheme: brioTheme))
+            Delete(shot, timeline);
+
+        ImGui.SameLine(0, 10f * s);
+        if(UiWidgets.IconTextButton("sg_fit_all", FontAwesomeIcon.Expand, I18n.T("common.fit_all"), I18n.T("graph.sg_fit_all_tip"), brioTheme: brioTheme))
+        { UpdateNormalization(); Fit(shot, false); }
+        ImGui.SameLine(0, 3f * s);
+        if(UiWidgets.IconTextButton("sg_fit_sel", FontAwesomeIcon.Crosshairs, I18n.T("graph.sg_fit_sel"), I18n.T("graph.sg_fit_sel_tip"), brioTheme: brioTheme))
+        { UpdateNormalization(); Fit(shot, true); }
+        ImGui.SameLine(0, 3f * s);
+        if(UiWidgets.TogglePill("sg_norm", I18n.T("graph.sg_normalize"), _normalize, I18n.T("graph.sg_normalize_tip"), brioTheme: brioTheme))
+        { _normalize = !_normalize; UpdateNormalization(); Fit(shot, false); }
+
         ImGui.SameLine();
-        if (ImGui.Button("插入可见通道键")) InsertChannelKeys(shot, timeline);
-        ImGui.SameLine();
-        if (ImGui.Button("删除所选")) Delete(shot, timeline);
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip("跳过锁定通道；空间端点与中间关键帧均可编辑。");
-        ImGui.SetNextItemWidth(180);
-        ImGui.Combo("插值", ref _preset, "贝塞尔\0线性\0恒定\0");
-        ImGui.SameLine(); ImGui.SetNextItemWidth(150);
-        ImGui.Combo("作用范围", ref _scope, "所选关键帧\0当前通道\0当前镜头全部通道\0");
-        ImGui.SameLine();
-        if (ImGui.Button("应用插值")) { _applyHandles = false; ApplyPreset(shot, timeline); }
+        UiWidgets.HelpMarker(I18n.T("graph.sg_help_base") +
+            (shot.IsFollowing ? I18n.T("graph.sg_help_follow") : I18n.T("graph.sg_help_nodepath")));
+
+        if(_driven.Count > 0)
+        {
+            ImGui.SameLine();
+            UiWidgets.Chip("sg_driven", _driven.Contains(GraphChannel.Fov) ? I18n.T("graph.driven_rot_fov") : I18n.T("graph.driven_rot"), XcpStyle.Warning,
+                I18n.T("graph.driven_channel_tip"));
+        }
+
+        // ---- Row 2: interpolation & handles ----
+        ImGui.SetNextItemWidth(92f * s); ImGui.Combo("##sg_interp", ref _preset, I18n.Combo("graph.interp.bezier", "graph.interp.linear", "graph.interp.constant"));
+        UiWidgets.Tooltip(I18n.T("graph.interp_out_tip"));
+        ImGui.SameLine(0, 3f * s);
+        ImGui.SetNextItemWidth(116f * s); ImGui.Combo("##sg_scope", ref _scope, I18n.Combo("graph.scope.selected", "graph.scope.active_ch", "graph.scope.all_ch"));
+        UiWidgets.Tooltip(I18n.T("graph.scope_batch_tip"));
+        ImGui.SameLine(0, 3f * s);
+        if(ImGui.Button($"{I18n.T("graph.apply_interp")}##sg_app_i")) { _applyHandles = false; ApplyPreset(shot, timeline); }
+
+        ImGui.SameLine(0, 8f * s);
         ImGui.BeginDisabled(_preset != 0);
-        ImGui.SetNextItemWidth(140); ImGui.Combo("手柄模式", ref _handleMode, "自动钳制\0自动\0对齐\0自由\0向量\0"); ImGui.SameLine();
-        if(ImGui.Button("应用手柄")) { _applyHandles = true; ApplyPreset(shot, timeline); }
+        ImGui.SetNextItemWidth(108f * s); ImGui.Combo("##sg_hmode", ref _handleMode, I18n.Combo("graph.hmode.auto_clamped", "graph.hmode.auto", "graph.hmode.aligned", "graph.hmode.free", "graph.hmode.vector"));
+        UiWidgets.Tooltip(I18n.T("graph.hmode_both_tip"));
+        ImGui.SameLine(0, 3f * s);
+        if(ImGui.Button($"{I18n.T("graph.apply_handle")}##sg_app_h")) { _applyHandles = true; ApplyPreset(shot, timeline); }
         ImGui.EndDisabled();
-        ImGui.TextDisabled("插值作用于关键帧到下一关键帧的出段；贝塞尔手柄模式同时影响该关键帧两侧。锁定通道不修改。");
+
+        ImGui.SameLine(0, 10f * s);
+        ImGui.AlignTextToFramePadding();
+        ImGui.TextDisabled(I18n.T("graph.sg_selected_count", _selected.Count));
     }
 
-    private void DrawChannels(Vector2 start, ShortcutBindings shortcuts)
+    private void DrawChannels(Vector2 start, float headerW, float graphHeight, ShortcutBindings shortcuts, bool brioTheme)
     {
-        ImGui.SetCursorScreenPos(start);
-        ImGui.TextDisabled("通道  显示 / 锁定");
+        float s = XcpStyle.Scale;
+        var dl = ImGui.GetWindowDrawList();
+        dl.AddRectFilled(start, start + new Vector2(headerW - 1f, graphHeight), XcpStyle.CanvasHeaderBg(brioTheme));
+        dl.AddLine(start + new Vector2(headerW - 1f, 0), start + new Vector2(headerW - 1f, graphHeight), XcpStyle.CanvasBorder(brioTheme));
+
+        ImGui.SetCursorScreenPos(start + new Vector2(8f * s, 3f * s));
+        ImGui.TextDisabled(I18n.T("graph.sg_channels_header"));
+
+        float footerH = 28f * s;
+        float listTop = start.Y + RulerHeight + 4f * s;
+        float rowH = MathF.Min(30f * s, MathF.Max(22f * s, (graphHeight - RulerHeight - footerH - 8f * s) / Channels.Length));
+        float btnSz = MathF.Min(20f * s, rowH - 4f * s);
+        var sq = new Vector2(btnSz, btnSz);
+
         int i = 0;
-        foreach (var ch in DisplayChannels)
+        foreach(var ch in DisplayChannels)
         {
+            float y = listTop + i++ * rowH;
+            bool visible = _visible.Contains(ch), locked = _locked.Contains(ch), driven = _driven.Contains(ch);
+            uint col = Color(ch);
+
+            if(_active == ch)
+                dl.AddRectFilled(new Vector2(start.X + 1f, y), new Vector2(start.X + headerW - 2f, y + rowH), XcpStyle.CanvasLaneActive(brioTheme));
+            dl.AddRectFilled(new Vector2(start.X + 4f * s, y + 4f * s), new Vector2(start.X + 7f * s, y + rowH - 4f * s), visible ? col : 0x55777777, 2f * s);
+
             ImGui.PushID(ch.ToString());
-            ImGui.SetCursorScreenPos(start + new Vector2(0, 27 + i++ * 36));
-            bool visible = _visible.Contains(ch), locked = _locked.Contains(ch);
-            if (ImGui.Checkbox("##visible", ref visible))
-            { if (visible) _visible.Add(ch); else _visible.Remove(ch); EndGesture(); }
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip("显示或隐藏此通道；隐藏不等于锁定，批量预设和删除仍按作用范围处理。");
-            ImGui.SameLine(0, 4);
-            if (ImGui.Checkbox("##lock", ref locked))
-            { if (locked) _locked.Add(ch); else _locked.Remove(ch); EndGesture(); }
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip("锁定：禁止曲线编辑器修改此通道（包括批量操作）。");
-            ImGui.SameLine(0, 4);
-            if (ImGui.Selectable(ChannelLabel(ch), _active == ch, ImGuiSelectableFlags.None, new Vector2(88, 0)))
+            float midY = y + (rowH - btnSz) * 0.5f;
+            ImGui.SetCursorScreenPos(new Vector2(start.X + 11f * s, midY));
+            if(UiWidgets.IconButton("v", visible ? FontAwesomeIcon.Eye : FontAwesomeIcon.EyeSlash,
+                visible ? I18n.T("graph.hide_ch_tip") : I18n.T("graph.show_ch_tip"), sq, active: false, subtle: true, brioTheme: brioTheme))
+            { if(visible) _visible.Remove(ch); else _visible.Add(ch); EndGesture(); }
+
+            ImGui.SameLine(0, 2f * s);
+            if(UiWidgets.IconButton("l", locked || driven ? FontAwesomeIcon.Lock : FontAwesomeIcon.LockOpen,
+                driven ? I18n.T("graph.driven_lock_tip") : locked ? I18n.T("graph.locked_tip") : I18n.T("graph.lock_tip"),
+                sq, active: locked, subtle: !locked, activeColor: XcpStyle.Warning, brioTheme: brioTheme))
+            { if(locked) _locked.Remove(ch); else _locked.Add(ch); EndGesture(); }
+
+            ImGui.SameLine(0, 4f * s);
+            ImGui.SetCursorPosY(ImGui.GetCursorPosY() + (btnSz - ImGui.GetTextLineHeight()) * 0.5f);
+            float labelW = MathF.Max(40f * s, headerW - (11f * s + btnSz * 2f + 12f * s));
+            if(ImGui.Selectable(ChannelLabel(ch), _active == ch, ImGuiSelectableFlags.None, new Vector2(labelW, 0)))
             {
                 _active = ch;
-                if (!shortcuts.Held(Shortcut.ExtendSelection)) _visible.Clear();
+                if(!shortcuts.Held(Shortcut.ExtendSelection)) _visible.Clear();
                 _visible.Add(ch); EndGesture(); _fit = true;
             }
             ImGui.PopID();
         }
-        ImGui.SetCursorScreenPos(start + new Vector2(0, 295));
-        if (ImGui.SmallButton("显示全部")) { foreach (var ch in Channels) _visible.Add(ch); EndGesture(); }
+
+        ImGui.SetCursorScreenPos(new Vector2(start.X + 6f * s, start.Y + graphHeight - footerH + 2f * s));
+        if(UiWidgets.IconTextButton("show_all_ch", FontAwesomeIcon.Eye, I18n.T("graph.sg_show_all"), I18n.T("graph.sg_show_all_tip"),
+            size: new Vector2(headerW - 14f * s, 22f * s), brioTheme: brioTheme))
+        { foreach(var ch in Channels) _visible.Add(ch); EndGesture(); }
     }
 
     private void DrawInspector(ShotCurves shot, CamTimeline timeline)
     {
-        if (_primary is not { } id || Resolve(shot, id) is not { } key)
-        { ImGui.TextDisabled("选择关键帧编辑所在帧与通道数值；节点锚点横移会重定时。"); return; }
+        float s = XcpStyle.Scale;
+        if(_primary is not { } id || Resolve(shot, id) is not { } key) return;
         bool editable = !_locked.Contains(id.Channel) && !_driven.Contains(id.Channel) && Editable(id.Channel, key.Time) && _gesture == Gesture.None;
         ImGui.BeginDisabled(!editable);
         double frame = ToFrame(id.Channel, key.Time);
         double value = key.Value;
-        ImGui.SetNextItemWidth(110);
-        bool moved = ImGui.InputDouble("帧数", ref frame, 0, 0, "%.6g", ImGuiInputTextFlags.EnterReturnsTrue);
-        ImGui.SameLine(); ImGui.SetNextItemWidth(155);
-        bool changed = ImGui.InputDouble("原始值", ref value, 0, 0, "%.3f", ImGuiInputTextFlags.EnterReturnsTrue);
-        if ((moved || changed) && editable) ApplyMoves(shot, timeline, [(id, moved ? EditTime(id, ToParameter(id.Channel, frame)) : key.Time, value)], false);
+        ImGui.SetNextItemWidth(92f * s);
+        bool moved = ImGui.InputDouble($"{I18n.T("common.frame")}##sgkf", ref frame, 0, 0, "%.6g", ImGuiInputTextFlags.EnterReturnsTrue);
+        ImGui.SameLine(); ImGui.SetNextItemWidth(120f * s);
+        bool changed = ImGui.InputDouble($"{I18n.T("graph.sg_value_label")}##sgkv", ref value, 0, 0, "%.3f", ImGuiInputTextFlags.EnterReturnsTrue);
+        if((moved || changed) && editable) ApplyMoves(shot, timeline, [(id, moved ? EditTime(id, ToParameter(id.Channel, frame)) : key.Time, value)], false);
         ImGui.EndDisabled();
-        ImGui.SameLine(); ImGui.TextDisabled(ChannelLabel(id.Channel));
+        ImGui.SameLine(); ImGui.TextDisabled($"· {ChannelLabel(id.Channel)}");
     }
 
     private void Add(ShotCurves shot, CamTimeline timeline)
     {
         EndGesture();
-        if(_locked.Count > 0) { Status = "添加节点会同步全部通道，请先解除通道锁定。"; return; }
+        if(_locked.Count > 0) { Status = I18n.T("graph.sg_add_locked"); return; }
         try
         {
             var node = timeline.AddSampledNode(shot, _cursor);
             _selectionRevision = -1;
-            Status = $"已选择帧 {node.Frame} 的相机节点；所有通道关键帧与节点同步。";
+            Status = I18n.T("graph.sg_add_ok", node.Frame);
         }
         catch(InvalidOperationException ex) { Status = ex.Message; }
     }
@@ -520,7 +581,7 @@ public sealed class SpatialGraphEditor
         var additions = _visible.Where(ch => (ch != GraphChannel.Progress || shot.Space.PreserveIntermediateKeys && !shot.IsFollowing) && !_locked.Contains(ch) && !_driven.Contains(ch))
             .Select(ch => (ch, time: IsTime(ch) ? _cursor : Math.Round(ToParameter(ch, _cursor))))
             .Where(x => Editable(x.ch, x.time) && Curves[x.ch].Keys.All(k => k.Time != x.time)).ToArray();
-        if(additions.Length == 0) { Status = "当前游标帧没有可插入的可见通道。"; return; }
+        if(additions.Length == 0) { Status = I18n.T("graph.sg_insert_ch_none"); return; }
         timeline.Snapshot();
         shot.Space.PreserveIntermediateKeys = true;
         _selected.Clear();
@@ -531,7 +592,7 @@ public sealed class SpatialGraphEditor
         }
         _primary = _selected.First(); PushSelection(shot, timeline);
         shot.Space.Touch(); timeline.Touch();
-        Status = $"已保形插入 {additions.Length} 个通道键。";
+        Status = I18n.T("graph.sg_insert_ch_ok", additions.Length);
     }
 
     private void Delete(ShotCurves shot, CamTimeline timeline)
@@ -540,7 +601,7 @@ public sealed class SpatialGraphEditor
         var targets = SelectedKeys(shot).Where(x => !_locked.Contains(x.id.Channel) && !_driven.Contains(x.id.Channel) && Editable(x.id.Channel, x.key.Time)).ToList();
         var ids = targets.Where(x => x.key.NodeId.HasValue).Select(x => x.key.NodeId!.Value)
             .Concat(timeline.SelectedNodes.Where(shot.SeededNodes.Contains)).Distinct().ToArray();
-        if(ids.Length > 0 && _locked.Count > 0) { Status = "删除节点会同步全部通道，请先解除通道锁定。"; return; }
+        if(ids.Length > 0 && _locked.Count > 0) { Status = I18n.T("graph.sg_del_locked"); return; }
         var independent = targets.Where(x => !x.key.NodeId.HasValue).ToArray();
         if(ids.Length == 0 && independent.Length == 0) return;
         timeline.Snapshot();
@@ -549,7 +610,7 @@ public sealed class SpatialGraphEditor
         if(ids.Length > 0) timeline.DeleteNodes(ids, snapshot: false);
         else { shot.Space.Touch(); timeline.Touch(); }
         _selected.Clear(); _primary = null;
-        Status = $"已删除 {ids.Length} 个镜头节点、{independent.Length} 个中间通道键。";
+        Status = I18n.T("graph.sg_del_ok", ids.Length, independent.Length);
     }
 
     private void ApplyPreset(ShotCurves shot, CamTimeline timeline)
@@ -562,7 +623,7 @@ public sealed class SpatialGraphEditor
         var interpolation = (CurveInterpolation)_preset;
         var mode = (HandleMode)_handleMode;
         targets = targets.Where(x => _applyHandles || x.key.Interpolation != interpolation).ToList();
-        if (targets.Count == 0) { Status = "预设：指定范围内没有可修改的关键帧。"; return; }
+        if (targets.Count == 0) { Status = I18n.T("graph.sg_preset_none"); return; }
         timeline.Snapshot();
         foreach (var x in targets)
         {
@@ -592,7 +653,7 @@ public sealed class SpatialGraphEditor
         // influence range; only Free/Aligned handles are frozen as hand-authored.
         if(_applyHandles)
             foreach(var target in targets) target.key.AutomaticTangent = target.key.Mode is not (HandleMode.Free or HandleMode.Aligned);
-        shot.Space.Touch(); timeline.Touch(); Status = $"已对 {targets.Count} 个关键帧应用预设；自动手柄只考虑所选连续节点组，选区外不修改。";
+        shot.Space.Touch(); timeline.Touch(); Status = I18n.T("graph.sg_preset_ok", targets.Count);
     }
 
     private bool ApplyMoves(ShotCurves shot, CamTimeline timeline, List<(KeyId id, double frame, double value)> moves, bool gesture)
@@ -621,17 +682,17 @@ public sealed class SpatialGraphEditor
                 || !Editable(m.id.Channel, m.frame)
                 || !double.IsFinite(m.value)
                 || Curves[m.id.Channel].Keys.Any(k => k.Time == m.frame && !moving.Contains(new KeyId(m.id.Channel, k.Id))))
-            { Status = "无法移动：路径参数重复、通道锁定或超出镜头参数范围。"; return false; }
+            { Status = I18n.T("graph.sg_move_invalid"); return false; }
         }
         if (moves.GroupBy(m => (m.id.Channel, m.frame)).Any(g => g.Count() > 1))
-        { Status = "无法移动：目标路径参数重复。"; return false; }
+        { Status = I18n.T("graph.sg_move_dup"); return false; }
         // Free keys may be retimed by a bound-node move in this same channel. Edit them in a separate gesture.
         if(nodeTargets.Count > 0 && moves.Any(m => Resolve(shot, m.id)?.NodeId == null))
-        { Status = "请分别拖动镜头节点与独立通道键的时间。"; return false; }
+        { Status = I18n.T("graph.sg_move_mixed"); return false; }
         if(nodeTargets.Count > 0)
         {
             if(gesture) BeforeGesture(timeline); else timeline.Snapshot();
-            if(!timeline.MoveNodes(nodeTargets)) { Status = "节点重定时被拒绝：碰撞或越过邻居。"; return false; }
+            if(!timeline.MoveNodes(nodeTargets)) { Status = I18n.T("graph.sg_move_retime_blocked"); return false; }
         }
         if (!moves.Any(m => Resolve(shot, m.id) is { } k && (k.Time != m.frame || k.Value != m.value))) return nodeTargets.Count > 0;
         if (gesture) BeforeGesture(timeline); else timeline.Snapshot();
@@ -649,7 +710,7 @@ public sealed class SpatialGraphEditor
                 if (m.id.Channel == GraphChannel.Progress) shot.MarkFactorManual(node); // keep the hand-set curve position
             }
         }
-        shot.Space.Touch(); timeline.Touch(); Status = "已编辑关键帧。"; return true;
+        shot.Space.Touch(); timeline.Touch(); Status = I18n.T("graph.sg_move_ok"); return true;
     }
 
     private void BeforeGesture(CamTimeline timeline)
@@ -666,9 +727,9 @@ public sealed class SpatialGraphEditor
     }
     private static string ChannelLabel(GraphChannel ch) => ch switch
     {
-        GraphChannel.Progress => "路径进度", GraphChannel.OffsetX => "偏移 X", GraphChannel.OffsetY => "偏移 Y", GraphChannel.OffsetZ => "偏移 Z",
-        GraphChannel.Yaw => "偏航", GraphChannel.Pitch => "俯仰", GraphChannel.Roll => "滚转", GraphChannel.Fov => "FoV",
-        _ => "未知通道"
+        GraphChannel.Progress => I18n.T("graph.ch.progress"), GraphChannel.OffsetX => I18n.T("graph.ch.offset_x"), GraphChannel.OffsetY => I18n.T("graph.ch.offset_y"), GraphChannel.OffsetZ => I18n.T("graph.ch.offset_z"),
+        GraphChannel.Yaw => I18n.T("graph.ch.yaw"), GraphChannel.Pitch => I18n.T("graph.ch.pitch"), GraphChannel.Roll => I18n.T("graph.ch.roll"), GraphChannel.Fov => I18n.T("graph.ch.fov"),
+        _ => I18n.T("graph.ch.unknown")
     };
     private static T Named<T>(T _, string name) where T : struct, Enum => Enum.Parse<T>(name);
     private double Scale(GraphChannel ch) => _normalize && _normalization.TryGetValue(ch, out var n) ? n.scale : 1;
@@ -694,7 +755,7 @@ public sealed class SpatialGraphEditor
         var keys = Curves.Where(x => _visible.Contains(x.Key)).SelectMany(x => x.Value.Keys.Select(k => (ch: x.Key, key: k)))
             .Where(x => x.key.Time >= DomainStart(x.ch) && x.key.Time <= DomainEnd(x.ch) && (!selectedOnly || _selected.Contains(new KeyId(x.ch, x.key.Id))))
             .ToList();
-        if (selectedOnly && keys.Count == 0) { Status = "没有可用于适配视图的可见所选关键帧。"; return; }
+        if (selectedOnly && keys.Count == 0) { Status = I18n.T("graph.sg_fit_sel_none"); return; }
         double a = selectedOnly ? keys.Min(x => ToFrame(x.ch, x.key.Time)) : shot.Start;
         double b = selectedOnly ? keys.Max(x => ToFrame(x.ch, x.key.Time)) : shot.End;
         double pad = Math.Max(2, (b - a) * .06);

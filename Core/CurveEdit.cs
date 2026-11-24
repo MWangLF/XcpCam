@@ -27,18 +27,18 @@ public static class CurveEdit
         switch(kind)
         {
             case CurvePrimitive.Bezier:
-                obj.Name = "贝塞尔曲线";
+                obj.Name = I18n.T("core.curve.bezier");
                 spline.Points.Add(B(FromBlender(-1.5f, -.5f), FromBlender(-1, 0), FromBlender(-.5f, .5f), CurveHandle.Aligned));
                 spline.Points.Add(B(FromBlender(0, 0), FromBlender(1, 0), FromBlender(2, 0), CurveHandle.Aligned));
                 break;
             case CurvePrimitive.Circle:
-                obj.Name = "贝塞尔圆环";
+                obj.Name = I18n.T("core.curve.circle");
                 spline.Cyclic = true;
                 foreach(var (x, y) in new[] { (-1f, 0f), (0f, 1f), (1f, 0f), (0f, -1f) })
                     spline.Points.Add(B(Vector3.Zero, FromBlender(x, y), Vector3.Zero, CurveHandle.Auto));
                 break;
             case CurvePrimitive.Path:
-                obj.Name = "路径";
+                obj.Name = I18n.T("core.curve.path");
                 spline.Type = SplineType.Nurbs; spline.Order = 5; spline.Endpoint = true;
                 for(int i = -2; i <= 2; i++) spline.Points.Add(new CurvePoint { Co = FromBlender(i, 0) });
                 break;

@@ -1,7 +1,7 @@
 # XcpCam - FFXIV GPose 비주얼 카메라 워크 편집 플러그인
 
 <p>
-  <a href="https://github.com/MWangLF/XcpCam/releases"><img alt="Release" src="https://img.shields.io/github/v/release/MWangLF/XcpCam?include_prereleases&style=flat-square&label=Release&color=blue"></a>
+  <a href="https://github.com/MWangLF/XcpCam/releases"><img alt="Release" src="https://img.shields.io/github/v/release/MWangLF/XcpCam?style=flat-square&label=Release&color=blue"></a>
   <a href="https://github.com/MWangLF/XcpCam/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/MWangLF/XcpCam/total?style=flat-square&label=Downloads&color=blue"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/MWangLF/XcpCam?style=flat-square&label=License&color=blue"></a>
 </p>
@@ -13,16 +13,19 @@
   <a href="README.ko.md"><img alt="한국어" src="https://img.shields.io/badge/%ED%95%9C%EA%B5%AD%EC%96%B4-blue?style=flat-square"></a>
 </p>
 
-> **현재 버전: 0.0.6.4 (Pre-release)**. 플러그인은 지속적으로 업데이트되고 있으며, 버그 제보나 기능 제안은 [GitHub Issues](https://github.com/MWangLF/XcpCam/issues)로 남겨 주세요.
+> **현재 버전: 0.1.0.0**. 플러그인은 지속적으로 업데이트되고 있으며, 버그 제보나 기능 제안은 [GitHub Issues](https://github.com/MWangLF/XcpCam/issues)로 남겨 주세요.
 
 **XcpCam**은 FFXIV GPose에서 카메라 워크를 직관적으로 제작·편집할 수 있는 Dalamud 플러그인입니다. 게임 화면에서 직접 카메라 노드, Blender 스타일의 3D 커브, 본(Bone) 추적 제약 조건을 배치하고, 프레임 기반 멀티트랙 타임라인과 그래프 에디터로 정밀하게 다듬을 수 있습니다. XAT / Brio 호환 `.xcp` 파일 내보내기는 물론 **Brio**의 Vivacity 타임라인 및 캐릭터 애니메이션과의 실시간 연동도 지원합니다.
 
 ## 주요 특징 및 기능
 
+- **모던 워크스페이스 & 다국어 지원**
+  - **Brio Dark + Blender N-Panel** 분할 레이아웃(Dalamud 테마 따르기 전환 가능)을 적용했으며, 경로·제약·Brio 연동·설정을 독립 서브 창으로 열어 타임라인 편집을 방해하지 않습니다.
+  - 메인 창을 접은 상태에서도 제어할 수 있는 **하단 고정 미니 타임라인**과 **플로팅 뷰포트 툴바**를 제공하며, **중국어(간체) / English / 日本語 / 한국어** 4개 언어를 기본 내장(기본값은 게임 언어 자동 추종, 설정에서 즉시 전환 가능)합니다.
 - **게임 화면 내 직관적인 편집**
   - 카메라 경로(속도에 따른 파랑→빨강 색상 표시), 카메라 프러스텀, 하드 컷 마커, 추적 조준선을 실시간으로 오버레이 표시합니다.
   - 화면에서 카메라 노드, 커브 제어점, 베지어 핸들을 바로 클릭해 선택할 수 있으며, 기즈모가 선택 대상에 자동 전환됩니다. 이동 / 회전 / 크기 조절, 로컬 좌표, 스냅, 다중 선택 그룹 이동 및 회전을 지원합니다.
-  - 노드 우클릭 메뉴, GPose 진입 시 자동 창 열기(설정에서 전환 가능), 단축키 자유 설정을 제공합니다.
+  - 노드 우클릭 메뉴, GPose 진입/종료 연동 자동 열기·닫기(수동으로 연 창은 유지), 단축키 자유 설정을 제공합니다.
 - **멀티트랙 카메라 타임라인 & 하드 컷**
   - 프레임 단위 멀티트랙 타임라인으로 트랙 우선순위 덮어쓰기, 음소거 / 솔로, 드래그 리타이밍, 정지 프레임, 박스 선택, 다단계 실행 취소 / 다시 실행을 지원합니다.
   - **단일 트랙 하드 컷**과 **멀티트랙 전환 컷**을 모두 지원하며, 실시간 미리보기와 Brio 베이크에서 완전한 즉시 전환을 구현합니다.

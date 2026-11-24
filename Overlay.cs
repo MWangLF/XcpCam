@@ -101,7 +101,7 @@ public sealed class Overlay
                 if(_gui.WorldToScreen(b, out var sp) && IsSane(sp))
                 {
                     dl.AddCircle(sp, 7, 0xFFFFFFFF, 12, 2f);
-                    dl.AddText(sp + new Vector2(9, 2), 0xFFFFFFFF, $"切 F{cf}");
+                    dl.AddText(sp + new Vector2(9, 2), 0xFFFFFFFF, I18n.T("overlay.cut_label", cf));
                 }
             }
         }
@@ -136,7 +136,7 @@ public sealed class Overlay
                     var drawn = new List<XcpFrame>();
                     foreach(var segment in sequence.Segments)
                         foreach(var jump in Display(segment.Curves, tl, comp).Jumps)
-                            foreach(var item in new[] { (pose: jump.Before, text: "跳变前"), (pose: jump.After, text: "跳变后") })
+                            foreach(var item in new[] { (pose: jump.Before, text: I18n.T("overlay.jump_before")), (pose: jump.After, text: I18n.T("overlay.jump_after")) })
                             {
                                 var pose = item.pose;
                                 bool Same(XcpFrame a) => Vector3.DistanceSquared(a.Pos, pose.Pos) < 1e-7f &&

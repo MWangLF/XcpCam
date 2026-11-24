@@ -81,13 +81,13 @@ public static class ProjectCodec
     private sealed class FiniteFloat : JsonConverter<float>
     {
         public override float Read(ref Utf8JsonReader r, Type t, JsonSerializerOptions o)
-        { float v = r.GetSingle(); Require(float.IsFinite(v), "浮点数溢出"); return v; }
+        { float v = r.GetSingle(); Require(float.IsFinite(v), "core.codec.float_overflow"); return v; }
         public override void Write(Utf8JsonWriter w, float v, JsonSerializerOptions o) => w.WriteNumberValue(v);
     }
     private sealed class FiniteDouble : JsonConverter<double>
     {
         public override double Read(ref Utf8JsonReader r, Type t, JsonSerializerOptions o)
-        { double v = r.GetDouble(); Require(double.IsFinite(v), "浮点数溢出"); return v; }
+        { double v = r.GetDouble(); Require(double.IsFinite(v), "core.codec.float_overflow"); return v; }
         public override void Write(Utf8JsonWriter w, double v, JsonSerializerOptions o) => w.WriteNumberValue(v);
     }
 
@@ -113,7 +113,7 @@ public static class ProjectCodec
         {
             CheckSize(bytes);
             var state = JsonSerializer.Deserialize<CamTimeline.ProjectState>(bytes, Options);
-            if(state == null) throw new InvalidDataException("工程为空。");
+            if(state == null) throw new InvalidDataException(I18n.T("core.codec.empty"));
             Validate(state);
             var timeline = new CamTimeline();
             timeline.Restore(state, true);
@@ -125,12 +125,12 @@ public static class ProjectCodec
     {
         public override void Write(byte[] buffer, int offset, int count)
         {
-            Require(Length + count <= MaxBytes, "工程长度超限。");
+            Require(Length + count <= MaxBytes, "core.codec.too_large");
             base.Write(buffer, offset, count);
         }
         public override void Write(ReadOnlySpan<byte> buffer)
         {
-            Require(Length + buffer.Length <= MaxBytes, "工程长度超限。");
+            Require(Length + buffer.Length <= MaxBytes, "core.codec.too_large");
             base.Write(buffer);
         }
     }
@@ -139,37 +139,37 @@ public static class ProjectCodec
     {
         try { return action(); }
         catch(Exception ex) when(ex is JsonException or ArgumentException or NullReferenceException or OverflowException or FormatException)
-        { throw new InvalidDataException("工程内容无效。", ex); }
+        { throw new InvalidDataException(I18n.T("core.codec.invalid"), ex); }
         catch(TargetInvocationException ex) when(ex.InnerException is InvalidDataException error)
         { throw new InvalidDataException(error.Message, error); }
     }
 
-    private static void Require(bool ok, string reason)
-    { if(!ok) throw new InvalidDataException(reason); }
+    private static void Require(bool ok, string reasonKey)
+    { if(!ok) throw new InvalidDataException(I18n.T(reasonKey)); }
 
     // Bound token and container counts before constructing a model (even tiny {} entries allocate objects).
     private static void CheckSize(byte[] bytes)
     {
-        Require(bytes.Length is > 0 and <= MaxBytes, "工程长度无效。");
+        Require(bytes.Length is > 0 and <= MaxBytes, "core.codec.invalid_len");
         var r = new Utf8JsonReader(bytes, new JsonReaderOptions { MaxDepth = MaxDepth });
         Span<int> counts = stackalloc int[MaxDepth + 1]; counts.Clear();
         int tokens = 0;
         while(r.Read())
         {
-            Require(++tokens <= 4_000_000, "工程条目过多。");
+            Require(++tokens <= 4_000_000, "core.codec.too_many_tokens");
             if(r.TokenType is JsonTokenType.EndArray or JsonTokenType.EndObject) continue;
-            Require(++counts[r.CurrentDepth] <= MaxCollection * 2, "工程集合过大。");
+            Require(++counts[r.CurrentDepth] <= MaxCollection * 2, "core.codec.collection_too_large");
             if(r.TokenType is JsonTokenType.StartArray or JsonTokenType.StartObject) counts[r.CurrentDepth + 1] = 0;
-            Require(r.ValueSpan.Length <= 1_048_576, "工程字段过长。");
+            Require(r.ValueSpan.Length <= 1_048_576, "core.codec.field_too_long");
         }
     }
 
-    private static void Unique(Guid id, HashSet<Guid> ids) => Require(id != Guid.Empty && ids.Add(id), "工程标识为空或重复。");
+    private static void Unique(Guid id, HashSet<Guid> ids) => Require(id != Guid.Empty && ids.Add(id), "core.codec.invalid_id");
     private static void Validate(CamTimeline.ProjectState state)
     {
-        Require(state.Version == 1, "不支持的工程版本。");
+        Require(state.Version == 1, "core.codec.unsupported_version");
         Require(state.Fps is >= 1 and <= 240 && state.Length > 0 && state.Length < int.MaxValue - 1 &&
-            state.Tracks.Count > 0 && (uint)state.ActiveTrackIndex < state.Tracks.Count && state.PathInfluence >= 0, "时间线参数无效。");
+            state.Tracks.Count > 0 && (uint)state.ActiveTrackIndex < state.Tracks.Count && state.PathInfluence >= 0, "core.codec.invalid_timeline");
         var objects = new Dictionary<Guid, CurveObject>();
         var ids = new HashSet<Guid>();
         foreach(var curve in state.Curves)
@@ -177,7 +177,7 @@ public static class ProjectCodec
             Unique(curve.Id, ids); objects.Add(curve.Id, curve);
             foreach(var spline in curve.Splines)
             {
-                Require(spline.Resolution is >= 1 and <= 1024 && spline.Order is >= 2 and <= 64, "样条参数无效。");
+                Require(spline.Resolution is >= 1 and <= 1024 && spline.Order is >= 2 and <= 64, "core.codec.invalid_spline");
                 foreach(var point in spline.Points) Unique(point.Id, ids);
             }
         }
@@ -188,45 +188,45 @@ public static class ProjectCodec
             foreach(var node in track.Keys)
             {
                 Unique(node.Id, nodeIds); owned.Add(node.Id);
-                Require(node.Frame >= 0 && node.HoldFrames >= 0 && (long)node.Frame + node.HoldFrames < int.MaxValue && frames.Add(node.Frame), "节点帧冲突或越界。");
+                Require(node.Frame >= 0 && node.HoldFrames >= 0 && (long)node.Frame + node.HoldFrames < int.MaxValue && frames.Add(node.Frame), "core.codec.invalid_node_frame");
             }
             if(track.FollowPath is { } follow)
             {
-                Require(objects.TryGetValue(follow.CurveId, out var target), "跟随路径引用了不存在的曲线。");
+                Require(objects.TryGetValue(follow.CurveId, out var target), "core.codec.missing_curve");
                 var points = target!.Splines.SelectMany(s => s.Points).Select(p => p.Id).ToHashSet();
-                Require(follow.TimeAnchors.Keys.All(points.Contains), "时间锚点引用了不存在的曲线点。");
+                Require(follow.TimeAnchors.Keys.All(points.Contains), "core.codec.missing_anchor_point");
             }
             foreach(var constraint in track.TrackConstraints)
             {
                 Unique(constraint.Id, ids);
-                Require(constraint.Recorded.Keys.All(f => f >= 0), "追踪记录帧无效。");
+                Require(constraint.Recorded.Keys.All(f => f >= 0), "core.codec.invalid_recorded_frame");
             }
             foreach(var shot in track.Shots)
             {
                 Unique(shot.Id, ids);
-                Require(owned.Contains(shot.AnchorNodeId) && shot.SeededNodes.IsSubsetOf(owned) && shot.Start <= shot.End && shot.Offset.Length == 3, "镜头段引用或范围无效。");
-                Require(shot.HoldRegions.All(h => h.start <= h.end), "停留范围无效。");
+                Require(owned.Contains(shot.AnchorNodeId) && shot.SeededNodes.IsSubsetOf(owned) && shot.Start <= shot.End && shot.Offset.Length == 3, "core.codec.invalid_shot_ref");
+                Require(shot.HoldRegions.All(h => h.start <= h.end), "core.codec.invalid_hold");
                 Complete(shot.Space.Channels);
-                Require(shot.Space.Start <= shot.Space.End, "空间曲线范围无效。");
+                Require(shot.Space.Start <= shot.Space.End, "core.codec.invalid_space_range");
                 foreach(var curve in shot.Space.Channels.Values.Concat(shot.Offset).Append(shot.PathProgress)) ValidateCurve(curve, owned);
                 foreach(var anchor in shot.Space.Anchors.Values) Complete(anchor);
                 foreach(var interval in shot.Intervals)
                 {
                     Unique(interval.Id, ids);
                     Require(owned.Contains(interval.StartNodeId) && owned.Contains(interval.EndNodeId) &&
-                        shot.Space.Anchors.ContainsKey(interval.StartNodeId) && shot.Space.Anchors.ContainsKey(interval.EndNodeId), "区间引用了不存在的节点或空间锚点。");
+                        shot.Space.Anchors.ContainsKey(interval.StartNodeId) && shot.Space.Anchors.ContainsKey(interval.EndNodeId), "core.codec.invalid_interval_ref");
                     ValidateInterval(interval, 0);
                 }
                 shot.ValidateProjectNodes(owned);
             }
         }
-        Require(state.SelectedNodes.All(nodeIds.Contains) && state.SelectedNodes.Distinct().Count() == state.SelectedNodes.Length, "选区节点无效。");
+        Require(state.SelectedNodes.All(nodeIds.Contains) && state.SelectedNodes.Distinct().Count() == state.SelectedNodes.Length, "core.codec.invalid_selection");
     }
 
     private static void Complete<TEnum,TValue>(Dictionary<TEnum,TValue> map) where TEnum : struct, Enum
     {
         var channels = Enum.GetValues<TEnum>();
-        Require(map.Count == channels.Length && channels.All(map.ContainsKey), "通道缺失或无效。");
+        Require(map.Count == channels.Length && channels.All(map.ContainsKey), "core.codec.invalid_channels");
     }
     private static void ValidateCurve(FCurve curve, HashSet<Guid>? owned = null)
     {
@@ -234,28 +234,28 @@ public static class ProjectCodec
         foreach(var key in curve.Keys)
         {
             Unique(key.Id, ids);
-            Require(owned == null || key.NodeId == null || owned.Contains(key.NodeId.Value), "曲线关键帧引用了不存在的节点。");
-            Require((key.Subframe == null || key.NodeId == null && Math.Abs(key.Time - key.Frame) <= .5) && frames.Add(key.Time), "曲线关键帧重复或小数帧无效。");
+            Require(owned == null || key.NodeId == null || owned.Contains(key.NodeId.Value), "core.codec.missing_key_node");
+            Require((key.Subframe == null || key.NodeId == null && Math.Abs(key.Time - key.Frame) <= .5) && frames.Add(key.Time), "core.codec.invalid_key_frame");
         }
     }
     private static void ValidateInterval(MotionInterval i, int depth)
     {
-        Require(depth < MaxDepth && i.End > i.Start && i.StartNodeId != i.EndNodeId && i.HoldFrames >= 0, "运动区间无效。");
+        Require(depth < MaxDepth && i.End > i.Start && i.StartNodeId != i.EndNodeId && i.HoldFrames >= 0, "core.codec.invalid_interval");
         Complete(i.Channels);
-        Require(!i.Linked || i.Channels.Values.Distinct().Count() == 1, "联动通道未共享曲线。");
+        Require(!i.Linked || i.Channels.Values.Distinct().Count() == 1, "core.codec.unshared_linked");
         foreach(var curve in i.Channels.Values.Distinct())
         {
             ValidateCurve(curve);
             Require(curve.Keys.Count >= 2 && curve.Keys[0].Frame == i.Start && curve.Keys[^1].Frame == i.End &&
-                curve.Keys.All(k => k.Frame >= i.Start && k.Frame <= i.End), "运动曲线端点无效。");
+                curve.Keys.All(k => k.Frame >= i.Start && k.Frame <= i.End), "core.codec.invalid_curve_endpoints");
         }
         foreach(var snapshot in new[] { i.AutoSnapshot, i.splitCurves })
             if(snapshot != null) { Complete(snapshot); foreach(var curve in snapshot.Values) ValidateCurve(curve); }
-        Require(i.Ranges.Keys.All(Enum.IsDefined), "空间参数通道无效。");
+        Require(i.Ranges.Keys.All(Enum.IsDefined), "core.codec.invalid_space_channel");
         if(i.splitValues != null) Complete(i.splitValues);
         if(i.splitTiming != null)
         {
-            Require(i.splitValues != null && i.splitCurves != null, "细分快照不完整。");
+            Require(i.splitValues != null && i.splitCurves != null, "core.codec.incomplete_split");
             ValidateInterval(i.splitTiming, depth + 1);
         }
     }

@@ -29,6 +29,7 @@ XcpCam.Tests.XcpFileTests.Run();
 XcpCam.Tests.ProjectCodecTests.Run();
 XcpCam.Tests.XcpMotionImportTests.Run();
 XcpCam.Tests.XcpRoundTripTests.Run(Check);
+XcpCam.Tests.I18nTests.Run(Check);
 
 var rng = new Random(1);
 float R(float a, float b) => a + (float)rng.NextDouble() * (b - a);

@@ -7,5 +7,6 @@
 	</PropertyGroup>
 	<ItemGroup>
 		<Compile Include="..\Core\*.cs" />
+		<EmbeddedResource Include="..\Locales\*.json" LogicalName="XcpCam.Locales.%(Filename)%(Extension)" />
 	</ItemGroup>
 </Project>

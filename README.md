@@ -1,7 +1,7 @@
 # XcpCam - FFXIV GPose 可视化运镜编辑插件
 
 <p>
-  <a href="https://github.com/MWangLF/XcpCam/releases"><img alt="Release" src="https://img.shields.io/github/v/release/MWangLF/XcpCam?include_prereleases&style=flat-square&label=Release&color=blue"></a>
+  <a href="https://github.com/MWangLF/XcpCam/releases"><img alt="Release" src="https://img.shields.io/github/v/release/MWangLF/XcpCam?style=flat-square&label=Release&color=blue"></a>
   <a href="https://github.com/MWangLF/XcpCam/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/MWangLF/XcpCam/total?style=flat-square&label=Downloads&color=blue"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/MWangLF/XcpCam?style=flat-square&label=License&color=blue"></a>
 </p>
@@ -13,16 +13,19 @@
   <a href="README.ko.md"><img alt="한국어" src="https://img.shields.io/badge/%ED%95%9C%EA%B5%AD%EC%96%B4-lightgrey?style=flat-square"></a>
 </p>
 
-> **当前版本：0.0.6.4（Pre-release）**。插件仍在持续迭代中，欢迎通过 [GitHub Issues](https://github.com/MWangLF/XcpCam/issues) 反馈问题或建议。
+> **当前版本：0.1.0.0**。插件仍在持续迭代中，欢迎通过 [GitHub Issues](https://github.com/MWangLF/XcpCam/issues) 反馈问题或建议。
 
 **XcpCam** 是一款面向 FFXIV GPose 的 Dalamud 运镜编辑插件。在游戏画面中直接摆放和编辑镜头节点、3D 曲线与骨骼追踪约束，配合按帧计时的多轨时间轴与双层曲线编辑器，既可导出兼容 XAT / Brio 的 `.xcp` 相机文件，也能与 **Brio** 的灵动时间轴（Vivacity）和角色动画实时联动。
 
 ## 特色与功能
 
+- **现代化工作区与多语言支持**
+  - 采用 **Brio Dark + Blender 侧栏（N-Panel）** 分栏布局（支持切换「跟随 Dalamud」主题），路径、约束、Brio 联动与设置均可弹出独立子窗口，不打断主时间轴编辑。
+  - 提供**底部固定简易时间轴**（主窗口收起时仍可随时预览与调帧）与**浮动视口工具条**，内置**简体中文 / English / 日本語 / 한국어**四语支持，默认跟随游戏客户端语言并可在设置中随时切换。
 - **游戏内所见即所得编辑**
   - 在游戏画面中实时显示运镜路径（支持按速度蓝→红着色）、镜头视锥、硬切标记与追踪瞄准线。
   - 直接点选镜头节点、曲线控制点与贝塞尔手柄，变换手柄自动切换作用对象，支持移动 / 旋转 / 缩放、本地坐标、步长吸附以及多选组整体平移与旋转。
-  - 预览节点支持右键快捷菜单，进入 GPose 默认自动打开面板，快捷键可在设置页自由绑定。
+  - 预览节点支持右键快捷菜单，支持进入 GPose 自动打开并在退出 GPose 时自动关闭（手动打开不自动关闭），快捷键可在设置页自由绑定。
 - **多轨相机时间轴与硬切**
   - 按帧计时的多轨时间轴，支持轨道优先级覆盖、静音 / 独奏、拖动重定时、停留帧、框选多选与多步撤销 / 重做。
   - 同时支持**同轨硬切**与**多轨切换硬切**，实时预览与烘焙到 Brio 均可实现完全瞬切。

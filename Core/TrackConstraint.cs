@@ -46,7 +46,9 @@ public sealed class TrackConstraint
 
     public static string TypeName(TrackType t) => t switch
     {
-        TrackType.Damped => "阻尼追踪", TrackType.Locked => "锁定追踪", _ => "标准追踪",
+        TrackType.Damped => I18n.T("constraint.type.damped"),
+        TrackType.Locked => I18n.T("constraint.type.locked"),
+        _ => I18n.T("constraint.type.track_to"),
     };
 
     public TrackConstraint Clone()

@@ -8,7 +8,7 @@ namespace XcpCam.Core;
 /// <summary>One camera track (layer). Tracks earlier in the list are higher and win where they overlap.</summary>
 public sealed class CamTrack
 {
-    public string Name = "镜头 1";
+    public string Name = I18n.T("core.default_track_name", 1);
     public uint Color = 0xFFFFAA33;
     public bool Muted;
     public bool Solo;
@@ -178,7 +178,7 @@ public sealed class CamTimeline
             {
                 var collision = track.Keys.GroupBy(k => ProgressCurve.Round(k.Frame * r)).FirstOrDefault(g => g.Count() > 1);
                 if(collision != null)
-                    throw new InvalidOperationException($"轨道「{track.Name}」的第 {string.Join("、", collision.Select(k => k.Frame))} 帧换算后都落在第 {collision.Key} 帧。");
+                    throw new InvalidOperationException(I18n.T("core.fps_collision", track.Name, string.Join(I18n.T("common.list_sep"), collision.Select(k => k.Frame)), collision.Key));
                 foreach(var shot in track.Shots) shot.Clone().Rescale(r);
             }
             int length = Math.Max(1, ProgressCurve.Round(Length * r));
@@ -227,7 +227,7 @@ public sealed class CamTimeline
     public bool IsFrameFree(int frame, Keyframe? except = null, CamTrack? track = null)
         => !TrackFor(except, track).Keys.Any(k => k != except && k.Frame == frame);
 
-    public const string TimelineAnchorNotice = "锚点保留小数帧。编辑速度曲线会同步曲线节点的经过帧；拖动曲线节点则按新锚点重新定时。切换锚定或编辑时间会改变速度，部分镜头位置可能变化；可撤销。";
+    public static string TimelineAnchorNotice => I18n.T("core.timeline_anchor_notice");
 
     /// <summary>Whether the followed curve of a track is anchored to the timeline (otherwise to the camera).</summary>
     public static bool CurveAnchoredToTimeline(CamTrack track) => track.FollowPath is { } follow && (follow.EditorTiming || follow.TimeAnchors.Count > 0);
@@ -371,7 +371,7 @@ public sealed class CamTimeline
     public void AddCapturedNode(Keyframe node, bool snapshot = true)
     {
         var track = ActiveTrack;
-        if(track.Keys.Any(k => k.Frame == node.Frame)) throw new InvalidOperationException("这一帧已经有镜头节点。");
+        if(track.Keys.Any(k => k.Frame == node.Frame)) throw new InvalidOperationException(I18n.T("core.node_frame_exists"));
         CurveModel.Ensure(track, Fps);
         if(snapshot) Snapshot();
         if(track.FollowPath != null && !node.CutIn && track.Shots.FirstOrDefault(s =>
@@ -388,10 +388,10 @@ public sealed class CamTimeline
 
     public Keyframe AddSampledNode(ShotCurves shot, int frame)
     {
-        var owner = Tracks.FirstOrDefault(t => t.Shots.Contains(shot)) ?? throw new InvalidOperationException("找不到镜头轨道。");
+        var owner = Tracks.FirstOrDefault(t => t.Shots.Contains(shot)) ?? throw new InvalidOperationException(I18n.T("core.track_not_found"));
         var existing = owner.Keys.FirstOrDefault(k => k.Frame == frame);
         if(existing != null) { SelectNodes([existing.Id]); return existing; }
-        if(!shot.Intervals.Any(i => frame > i.Start && frame < i.End)) throw new InvalidOperationException("请在两个镜头节点之间添加关键帧。");
+        if(!shot.Intervals.Any(i => frame > i.Start && frame < i.End)) throw new InvalidOperationException(I18n.T("core.add_between_nodes"));
         var source = owner.Keys.Where(k => shot.SeededNodes.Contains(k.Id)).OrderBy(k => k.Frame).LastOrDefault(k => k.Frame <= frame);
         var pose = shot.Sample(frame);
         var node = new Keyframe { Frame = frame, Pos = pose.Pos, Rot = pose.Rot, Fov = pose.Fov,
@@ -469,7 +469,7 @@ public sealed class CamTimeline
     {
         int n = Tracks.Count + 1;
         string name;
-        do name = $"镜头 {n++}"; while(Tracks.Any(t => t.Name == name));
+        do name = I18n.T("core.default_track_name", n++); while(Tracks.Any(t => t.Name == name));
         var used = Tracks.Select(t => t.Color).ToHashSet();
         var color = Palette.FirstOrDefault(c => !used.Contains(c), Palette[Tracks.Count % Palette.Length]);
         var track = new CamTrack { Name = name, Color = color };

@@ -1,4 +1,5 @@
 using Dalamud.Bindings.ImGui;
+using Dalamud.Interface;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -22,9 +23,9 @@ public sealed class CurveTool
     private readonly Action<Keyframe> _writeNodePosition;
     private readonly Action<string, bool> _status;
 
-    /// <summary>Shows the selected curve's full edit cage in game (handles, object mode, node path handles).
-    /// Picking and the gizmo no longer depend on it: they follow whatever was selected last.</summary>
-    public bool Active;
+    /// <summary>Shows the selected curve's path handles/control points in game (handles, object mode, node path handles).
+    /// Picking and the gizmo follow whatever was selected last.</summary>
+    public bool Active = true;
     /// <summary>Track whose followed curve the selected points were picked from (anchor context).</summary>
     public CamTrack? PointTrack;
     /// <summary>Control points of the active track's followed curve, always pickable: (point index, screen).</summary>
@@ -38,7 +39,7 @@ public sealed class CurveTool
     public readonly HashSet<CurveSelection> Selection = [];
     public readonly List<(CurveSelection sel, Vector2 screen)> Candidates = [];
     public CurveSelection? Hover;
-    private int _handleType = 1, _addKind;
+    private int _handleType = 1;
 
     public CurveTool(CamTimeline tl, Overlay overlay, GizmoEditor gizmo, Func<Keyframe, ShotCurves?> shotFor,
         Action<Keyframe> writeNodePosition, Action<string, bool> status)
@@ -86,13 +87,9 @@ public sealed class CurveTool
         if(Curve is { } c && EditMode) DrawCage(c);
         else if(Curve is { } o && !EditMode && _overlay.ToScreen(Pivot(o), out var s))
             Candidates.Add((new CurveSelection(-1, -1), s));
-        else if(EditingNodePath) DrawNodePathCage();
+        else if(EditingNodePath && _tl.ActiveTrack.FollowPath == null) DrawNodePathCage();
     }
 
-    /// <summary>
-    /// The active track's followed curve: its control points are always drawn and pickable (camera-anchored:
-    /// round, timeline-anchored: square), unless the same curve already shows its full edit cage.
-    /// </summary>
     private void DrawFollowedPoints()
     {
         var track = _tl.ActiveTrack;
@@ -153,30 +150,51 @@ public sealed class CurveTool
             .Distinct().OrderBy(x => x.spline).ThenBy(x => x.index).ToList();
     }
 
-    /// <summary>Tilt / radius of the selected points (curve page and timeline inspector).</summary>
-    public void DrawPointProperties(CurveObject c, List<CurvePoint> selectedPoints)
+    /// <summary>Tilt / radius of the selected points (path tab and N-Panel inspector).</summary>
+    public void DrawPointProperties(CurveObject c, List<CurvePoint> selectedPoints, bool compact = false)
     {
         if(selectedPoints.Count == 0) return;
         float tilt = selectedPoints.Average(p => p.Tilt) * 180 / MathF.PI, radius = selectedPoints.Average(p => p.Radius);
-        ImGui.SetNextItemWidth(120);
-        if(ImGui.DragFloat("倾斜 (°)", ref tilt, .5f)) { foreach(var p in selectedPoints) p.Tilt = tilt * MathF.PI / 180; c.Touch(); _tl.Touch(); }
-        if(ImGui.IsItemActivated()) _tl.Snapshot();
-        if(ImGui.IsItemHovered()) ImGui.SetTooltip("沿曲线的滚转，只在约束开启「跟随曲线」时影响相机。");
-        ImGui.SameLine(); ImGui.SetNextItemWidth(120);
-        if(ImGui.DragFloat("半径", ref radius, .01f, 0f, 100f)) { foreach(var p in selectedPoints) p.Radius = MathF.Max(0, radius); c.Touch(); _tl.Touch(); }
-        if(ImGui.IsItemActivated()) _tl.Snapshot();
-        if(ImGui.IsItemHovered()) ImGui.SetTooltip("约束开启「使用半径」时按半径缩放位置偏移。");
+        if(compact)
+        {
+            float half = MathF.Max(60f, (UiWidgets.InnerAvailWidth - 6f * XcpStyle.Scale) * 0.5f);
+            ImGui.SetNextItemWidth(half);
+            if(ImGui.DragFloat("##tilt", ref tilt, .5f, -3600f, 3600f, I18n.T("curve.tilt_fmt"))) { foreach(var p in selectedPoints) p.Tilt = tilt * MathF.PI / 180; c.Touch(); _tl.Touch(); }
+            if(ImGui.IsItemActivated()) _tl.Snapshot();
+            UiWidgets.Tooltip(I18n.T("curve.tilt_tip"));
+            ImGui.SameLine(0, 6f * XcpStyle.Scale);
+            ImGui.SetNextItemWidth(half);
+            if(ImGui.DragFloat("##radius", ref radius, .01f, 0f, 100f, I18n.T("curve.radius_fmt"))) { foreach(var p in selectedPoints) p.Radius = MathF.Max(0, radius); c.Touch(); _tl.Touch(); }
+            if(ImGui.IsItemActivated()) _tl.Snapshot();
+            UiWidgets.Tooltip(I18n.T("curve.radius_tip"));
+        }
+        else
+        {
+            ImGui.SetNextItemWidth(120f * XcpStyle.Scale);
+            if(ImGui.DragFloat($"{I18n.T("curve.tilt_label")}##tilt_f", ref tilt, .5f)) { foreach(var p in selectedPoints) p.Tilt = tilt * MathF.PI / 180; c.Touch(); _tl.Touch(); }
+            if(ImGui.IsItemActivated()) _tl.Snapshot();
+            UiWidgets.Tooltip(I18n.T("curve.tilt_tip"));
+            ImGui.SameLine();
+            ImGui.SetNextItemWidth(120f * XcpStyle.Scale);
+            if(ImGui.DragFloat($"{I18n.T("curve.radius_label")}##rad_f", ref radius, .01f, 0f, 100f)) { foreach(var p in selectedPoints) p.Radius = MathF.Max(0, radius); c.Touch(); _tl.Touch(); }
+            if(ImGui.IsItemActivated()) _tl.Snapshot();
+            UiWidgets.Tooltip(I18n.T("curve.radius_tip"));
+        }
     }
 
-    /// <summary>Handle type of the selected points (curve page and timeline inspector).</summary>
-    public void DrawHandleTypeControl()
+    /// <summary>Handle type of the selected points (path tab and N-Panel inspector).</summary>
+    public void DrawHandleTypeControl(bool brioTheme = true, bool compact = false)
     {
-        ImGui.SetNextItemWidth(110);
-        ImGui.Combo("##htype", ref _handleType, "自由\0自动\0矢量\0对齐\0");
-        ImGui.SameLine();
-        if(ImGui.Button("设置手柄类型"))
-            Edit("已设置手柄类型。", curve => { foreach(var (s, _, points) in SelectedSplines(curve)) CurveEdit.SetHandleType(s, points, (CurveHandle)_handleType); });
-        if(ImGui.IsItemHovered()) ImGui.SetTooltip("自动（黄）、矢量（绿）、对齐（粉）、自由（黑）。拖动自动手柄会变为对齐，拖动矢量手柄会变为自由。");
+        float s = XcpStyle.Scale;
+        string btnLabel = compact ? I18n.T("curve.btn_set_handle_compact") : I18n.T("curve.btn_set_handle");
+        float btnW = MathF.Max((compact ? 74f : 90f) * s, ImGui.CalcTextSize(btnLabel).X + 16f * s);
+        float comboW = compact ? MathF.Max(70f * s, UiWidgets.InnerAvailWidth - btnW - 5f * s) : 115f * s;
+        ImGui.SetNextItemWidth(comboW);
+        ImGui.Combo("##htype", ref _handleType, I18n.Combo("curve.handle.free", "curve.handle.auto", "curve.handle.vector", "curve.handle.aligned"));
+        ImGui.SameLine(0, 5f * s);
+        if(ImGui.Button($"{btnLabel}##ht", new Vector2(btnW, 0)))
+            Edit(I18n.T("curve.status_handle_set"), curve => { foreach(var (sp, _, points) in SelectedSplines(curve)) CurveEdit.SetHandleType(sp, points, (CurveHandle)_handleType); });
+        UiWidgets.Tooltip(I18n.T("curve.handle_tip"));
     }
 
     private void DrawCage(CurveObject curve)
@@ -201,7 +219,7 @@ public sealed class CurveTool
                     }
                 }
                 else if(i + 1 < spline.Points.Count || spline.Cyclic)
-                    _overlay.DrawLine(co, curve.ToWorld(spline.Wrap(i + 1).Co), 0xFF808080, 1, true); // NURBS/poly control polygon
+                    _overlay.DrawLine(co, curve.ToWorld(spline.Wrap(i + 1).Co), 0xFF808080, 1, true);
                 _overlay.DrawMarker(co, pointSelected ? 0xFF33AAFF : 0xFF101010, true, pointSelected);
                 if(_overlay.ToScreen(co, out var sc)) Candidates.Add((new CurveSelection(si, i), sc));
             }
@@ -220,7 +238,7 @@ public sealed class CurveTool
             bool first = i == 0, last = i == nodes.Count - 1;
             foreach(var (part, offset) in new[] { (CurvePart.Left, h.left), (CurvePart.Right, h.right) })
             {
-                if(part == CurvePart.Left && first || part == CurvePart.Right && last) continue; // end handles shape nothing
+                if(part == CurvePart.Left && first || part == CurvePart.Right && last) continue;
                 var hw = co + offset;
                 bool hs = Selection.Contains(new CurveSelection(0, i, part));
                 _overlay.DrawLine(co, hw, color, 1.2f);
@@ -234,7 +252,7 @@ public sealed class CurveTool
 
     public void Click(CurveSelection s, bool additive)
     {
-        if(s.Spline < 0) return; // object mode: the object marker only shows the gizmo
+        if(s.Spline < 0) return;
         if(additive) { if(!Selection.Add(s)) Selection.Remove(s); }
         else { Selection.Clear(); Selection.Add(s); }
         if(EditingNodePath && s.Part == CurvePart.Point)
@@ -249,7 +267,6 @@ public sealed class CurveTool
 
     // ---------------------------------------------------------------- gizmo
 
-    /// <summary>Whether the gizmo acts on curves: selected curve points / handles, or a curve in object mode.</summary>
     public bool OwnsGizmo => Selection.Count > 0 || Active && !EditMode && Curve != null;
 
     public void DrawGizmo()
@@ -262,11 +279,8 @@ public sealed class CurveTool
     }
 
     private void Started() { if(_gizmo.DragStarted) _tl.Snapshot(); }
-    private void LimitNote() { if(_gizmo.IsUsing && _gizmo.Limited) _status($"变换手柄已限制：需保持在目标周围 {GizmoEditor.MaxRange:0} 米内，单帧跳动过大的拖动会被忽略。", true); }
+    private void LimitNote() { if(_gizmo.IsUsing && _gizmo.Limited) _status(I18n.T("curve.gizmo_limited", $"{GizmoEditor.MaxRange:0}"), true); }
 
-    /// <summary>World median of all control points: the pivot for object-mode transforms. The origin
-    /// (<see cref="CurveObject.Location"/>) stays behind when points are moved in edit mode, so pivoting on it
-    /// would rotate/scale such a curve around an off-centre point.</summary>
     public static Vector3 Pivot(CurveObject curve)
     {
         var points = curve.Splines.SelectMany(s => s.Points).ToList();
@@ -283,7 +297,6 @@ public sealed class CurveTool
         Started();
         if(changed)
         {
-            // rotate / scale about the pivot: keep the pivot's local point at the gizmo position
             curve.Rotation = r; curve.Scale = s;
             curve.Location = p - Vector3.Transform(local * s, r);
             curve.Touch(); _tl.Touch();
@@ -297,7 +310,6 @@ public sealed class CurveTool
         return curve.ToWorld(s.Part switch { CurvePart.Left => p.Left, CurvePart.Right => p.Right, _ => p.Co });
     }
 
-    /// <summary>Total scale already applied to the selected points during the current gizmo drag.</summary>
     private Vector3 _pointScale = Vector3.One;
 
     private void PointGizmo(CurveObject curve)
@@ -309,8 +321,6 @@ public sealed class CurveTool
         var op = _gizmo.Operation;
         bool changed = _gizmo.DrawTransform(ref p, ref r, ref scale, op);
         Started();
-        // ImGuizmo reports scale relative to the drag start, but the points are already scaled by the
-        // previous frames: apply only this frame's ratio so the scale follows the mouse
         if(_gizmo.DragStarted || !_gizmo.IsUsing) _pointScale = Vector3.One;
         if(changed && op == GizmoEditor.Op.Scale)
         {
@@ -320,7 +330,6 @@ public sealed class CurveTool
         }
         if(changed)
         {
-            // Blender transforms points about the selection median: G translates, R rotates, S scales
             Vector3 Map(Vector3 world) => op switch
             {
                 GizmoEditor.Op.Rotate => center + Vector3.Transform(world - center, r),
@@ -340,7 +349,8 @@ public sealed class CurveTool
                 }
                 foreach(var s in group.Where(s => s.Part != CurvePart.Point && !points.Contains(s.Point)))
                 {
-                    var pt = spline.Points[s.Point]; bool left = s.Part == CurvePart.Left;
+                    var pt = spline.Points[s.Point];
+                    bool left = s.Part == CurvePart.Left;
                     CurveEdit.MoveHandle(spline, s.Point, left, curve.ToLocal(Map(curve.ToWorld(left ? pt.Left : pt.Right))));
                 }
                 spline.CalcHandles();
@@ -376,7 +386,6 @@ public sealed class CurveTool
                 if(ShotOf(node) is not { } shot) continue;
                 if(s.Part == CurvePart.Point)
                 {
-                    // handles are offsets from the node, so they move with it
                     node.Pos = GizmoEditor.ClampRange(shot.NodePose(node).Pos + delta);
                     _writeNodePosition(node);
                 }
@@ -391,7 +400,7 @@ public sealed class CurveTool
         LimitNote();
     }
 
-    // ---------------------------------------------------------------- operators
+    // ---------------------------------------------------------------- commands
 
     private Vector3 AddLocation()
     {
@@ -413,21 +422,72 @@ public sealed class CurveTool
         _tl.Curves.Add(curve);
         CurveId = curve.Id; NodePath = false; EditMode = true; Selection.Clear(); Active = true;
         _tl.Touch();
-        _status($"已添加「{curve.Name}」（当前镜头前方 3 米）。在游戏画面中点选控制点或手柄编辑。", false);
+        _status(I18n.T("curve.status_added", curve.Name), false);
     }
 
-    /// <summary>Delete key / button in edit mode: removes the selected control points.</summary>
+    private List<(Spline spline, int index, HashSet<int> points)> ActivePointGroups()
+        => EditMode && !NodePath && Curve is { } curve ? SelectedSplines(curve, pointsOnly: true).ToList() : [];
+
+    public bool CanExtrude => ActivePointGroups().Any(g => !g.spline.Cyclic && (g.points.Contains(0) || g.points.Contains(g.spline.Points.Count - 1)));
+    public bool CanSubdivide => ActivePointGroups().Any(g => g.spline.Points.Count > 1 && g.points.Any(i => i < g.spline.SegmentCount && g.points.Contains((i + 1) % g.spline.Points.Count)));
+    public bool CanToggleCyclic => ActivePointGroups().Any(g => g.spline.Points.Count >= 2);
+    public bool CanSwitchDirection => ActivePointGroups().Sum(g => g.points.Count) > 0;
+
+    public void ExtrudeSelected()
+    {
+        var groups = ActivePointGroups();
+        if(!groups.Any(g => !g.spline.Cyclic && (g.points.Contains(0) || g.points.Contains(g.spline.Points.Count - 1)))) return;
+        Edit(I18n.T("curve.status_extruded"), _ =>
+        {
+            Selection.Clear();
+            foreach(var (s, si, points) in groups.Where(g => !g.spline.Cyclic))
+            {
+                var ends = points.Where(p => p == 0 || p == s.Points.Count - 1).OrderDescending().ToArray();
+                var added = new List<CurvePoint>();
+                foreach(int end in ends) added.Add(s.Points[CurveEdit.Extrude(s, end)]);
+                foreach(var point in added) Selection.Add(new CurveSelection(si, s.Points.IndexOf(point)));
+            }
+        });
+    }
+
+    public void SubdivideSelected()
+    {
+        var groups = ActivePointGroups();
+        if(!groups.Any(g => g.spline.Points.Count > 1 && g.points.Any(i => i < g.spline.SegmentCount && g.points.Contains((i + 1) % g.spline.Points.Count)))) return;
+        Edit(I18n.T("curve.status_subdivided"), _ =>
+        {
+            Selection.Clear();
+            foreach(var (s, si, points) in groups)
+                foreach(int i in CurveEdit.Subdivide(s, points)) Selection.Add(new CurveSelection(si, i));
+        });
+    }
+
+    public void ToggleCyclicSelected()
+    {
+        var groups = ActivePointGroups();
+        if(!groups.Any(g => g.spline.Points.Count >= 2)) return;
+        Edit(I18n.T("curve.status_cyclic"), _ => { foreach(var g in groups) CurveEdit.ToggleCyclic(g.spline); });
+    }
+
+    public void SwitchDirectionSelected()
+    {
+        var groups = ActivePointGroups();
+        if(groups.Sum(g => g.points.Count) == 0) return;
+        Edit(I18n.T("curve.status_direction"), _ => { foreach(var g in groups) CurveEdit.SwitchDirection(g.spline); Selection.Clear(); });
+    }
+
+    /// <summary>Deletes the selected curve control points (if any). Returns true when handled.</summary>
     public bool DeleteSelected()
     {
-        if(!EditMode || NodePath || Curve is not { } curve) return false;
+        if(!EditMode || NodePath || Curve is not { } curve || Selection.Count == 0) return false;
         var groups = SelectedSplines(curve, pointsOnly: true).OrderByDescending(g => g.index).ToList();
         if(groups.Count == 0) return false;
-        if(groups.Sum(g => g.points.Count) == curve.Splines.Sum(s => s.Points.Count))
+        bool removesAll = curve.Splines.Select((s, i) => s.Points.Count - (groups.FirstOrDefault(g => g.index == i).points?.Count ?? 0)).All(n => n <= 0);
+        if(removesAll)
         {
-            // RemoveCurve takes the undo snapshot and detaches tracks using the intact path.
             _tl.RemoveCurve(curve);
             CurveId = null;
-            _status("曲线已没有控制点，已删除。", false);
+            _status(I18n.T("curve.status_empty_deleted"), false);
         }
         else
         {
@@ -466,166 +526,315 @@ public sealed class CurveTool
 
     // ---------------------------------------------------------------- panel
 
-    public void DrawPanel(bool gpose)
+    private void DrawAddCurvePopup(string popupId)
     {
-        ImGui.TextDisabled("曲线与镜头节点都是世界坐标。参照 Blender：物体模式整体移动/旋转/缩放，编辑模式点选控制点与贝塞尔手柄。");
-        if(ImGui.Checkbox("在游戏内显示编辑框", ref Active)) Selection.Clear();
-        if(ImGui.IsItemHovered()) ImGui.SetTooltip("开启后在游戏内显示所选曲线的控制点（方块）和手柄（圆点）、物体模式的整体手柄、节点路径的手柄。\n变换手柄作用于最后选中的对象：点选曲线节点就编辑曲线，点选镜头节点就编辑镜头，单击空白处取消选择。\n被当前轨道跟随的曲线，其控制点始终可以点选。");
-        ImGui.SameLine();
-        ImGui.BeginDisabled(!gpose);
-        ImGui.SetNextItemWidth(130);
-        ImGui.Combo("##addkind", ref _addKind, "贝塞尔曲线\0贝塞尔圆环\0路径（NURBS）\0");
-        ImGui.SameLine();
-        if(ImGui.Button("添加曲线")) Add((CurvePrimitive)_addKind);
-        ImGui.EndDisabled();
+        if(!ImGui.BeginPopup(popupId)) return;
+        if(ImGui.MenuItem(I18n.T("curve.prim.bezier"))) Add(CurvePrimitive.Bezier);
+        if(ImGui.MenuItem(I18n.T("curve.prim.circle"))) Add(CurvePrimitive.Circle);
+        if(ImGui.MenuItem(I18n.T("curve.prim.nurbs"))) Add(CurvePrimitive.Path);
+        ImGui.EndPopup();
+    }
 
-        if(ImGui.BeginListBox("##curves", new Vector2(-1, 110)))
+    /// <summary>Compact path list card rendered inside the right N-Panel.</summary>
+    public void DrawSidebarSummary(bool gpose, bool brioTheme = true, bool windowOpen = false, Action? onToggleWindow = null)
+    {
+        float s = XcpStyle.Scale;
+        string title = _tl.Curves.Count > 0 ? I18n.T("curve.list_title_count", _tl.Curves.Count) : I18n.T("curve.list_title");
+        if(UiWidgets.SectionHeaderAction(title, FontAwesomeIcon.ExternalLinkAlt, "goto_path",
+            windowOpen ? I18n.T("curve.win_close_tip") : I18n.T("curve.win_open_tip"), windowOpen, brioTheme, FontAwesomeIcon.Route))
+            onToggleWindow?.Invoke();
+
+        // Compact quick controls: wide Add Curve button + eye icon toggle for Path Gizmo
+        float h = ImGui.GetFrameHeight();
+        float eyeW = MathF.Max(h, 28f * s);
+        float addW = MathF.Max(100f * s, UiWidgets.InnerAvailWidth - eyeW - 5f * s);
+        ImGui.BeginDisabled(!gpose);
+        if(UiWidgets.IconTextButton("np_add_curve", FontAwesomeIcon.Plus, I18n.T("curve.btn_add"),
+            I18n.T("curve.btn_add_tip"), size: new Vector2(addW, h), brioTheme: brioTheme, dropdownCaret: true))
+            ImGui.OpenPopup("##np_add_curve_popup");
+        ImGui.EndDisabled();
+        DrawAddCurvePopup("##np_add_curve_popup");
+
+        ImGui.SameLine(0, 5f * s);
+        if(UiWidgets.IconButton("np_path_axis", Active ? FontAwesomeIcon.Eye : FontAwesomeIcon.EyeSlash,
+            Active ? I18n.T("curve.axis_on_tip") : I18n.T("curve.axis_off_tip"),
+            new Vector2(eyeW, h), active: Active, brioTheme: brioTheme))
+        {
+            Active = !Active;
+            Selection.Clear();
+        }
+
+        ImGui.Spacing();
+
+        void DrawEntries(float itemW)
         {
             bool following = _tl.ActiveTrack.FollowPath != null;
-            if(ImGui.Selectable($"「{_tl.ActiveTrack.Name}」节点路径（自动生成）{(following ? " · 已跟随曲线" : "")}", EditingNodePath))
+            string nodePathLabel = following
+                ? I18n.T("curve.node_path_overridden", _tl.ActiveTrack.Name)
+                : I18n.T("curve.node_path_item", _tl.ActiveTrack.Name);
+            if(ImGui.Selectable($"{nodePathLabel}##np_nodepath", EditingNodePath,
+                ImGuiSelectableFlags.None, new Vector2(itemW, 0)))
             { CurveId = null; NodePath = true; EditMode = true; Selection.Clear(); }
+            UiWidgets.Tooltip(I18n.T("curve.node_path_tip"));
+
             foreach(var curve in _tl.Curves)
             {
                 var users = _tl.Tracks.Where(t => t.FollowPath?.CurveId == curve.Id).Select(t => t.Name).ToList();
-                string label = $"{curve.Name}  ({SplineSummary(curve)}){(users.Count > 0 ? " · 被 " + string.Join("、", users) + " 跟随" : "")}##{curve.Id}";
-                if(ImGui.Selectable(label, curve.Id == CurveId)) { CurveId = curve.Id; NodePath = false; Selection.Clear(); }
+                string summary = SplineSummary(curve);
+                string suffix = users.Count > 0 ? $" · {I18n.T("curve.following_tag")}" : $" · {summary}";
+                if(ImGui.Selectable($"{curve.Name}{suffix}##np_{curve.Id}", curve.Id == CurveId,
+                    ImGuiSelectableFlags.None, new Vector2(itemW, 0)))
+                { CurveId = curve.Id; NodePath = false; Selection.Clear(); }
+                UiWidgets.Tooltip($"{curve.Name} ({summary})" + (users.Count > 0 ? "\n" + I18n.T("curve.followed_by_tip", string.Join(I18n.T("common.list_sep"), users)) : ""));
             }
-            ImGui.EndListBox();
         }
 
-        if(EditingNodePath) { DrawNodePathPanel(); return; }
-        if(Curve is not { } c) { ImGui.TextDisabled("选择一条曲线进行编辑，或添加新曲线。"); return; }
-
-        string name = c.Name;
-        ImGui.SetNextItemWidth(200);
-        if(ImGui.InputText("名称", ref name, 64)) c.Name = name;
-        ImGui.SameLine();
-        if(ImGui.Button("删除曲线")) { _tl.RemoveCurve(c); CurveId = null; Selection.Clear(); return; }
-        int mode = EditMode ? 1 : 0;
-        if(ImGui.RadioButton("物体模式", ref mode, 0)) { EditMode = false; Selection.Clear(); }
-        ImGui.SameLine();
-        if(ImGui.RadioButton("编辑模式", ref mode, 1)) EditMode = true;
-        ImGui.SameLine();
-        ImGui.TextDisabled(EditMode ? "| 游戏内：点选控制点/手柄后用变换手柄移动（移动/旋转/缩放围绕所选中心）" : "| 游戏内：变换手柄整体移动/旋转/缩放");
-
-        // object transform (Blender N panel)
-        var loc = c.Location;
-        ImGui.SetNextItemWidth(260);
-        if(ImGui.DragFloat3("位置 (米)", ref loc, .01f)) { c.Location = GizmoEditor.ClampRange(loc); c.Touch(); _tl.Touch(); }
-        if(ImGui.IsItemActivated()) _tl.Snapshot();
-        var euler = ShotCurves.Euler(c.Rotation);
-        ImGui.SetNextItemWidth(260);
-        if(ImGui.DragFloat3("旋转 偏航/俯仰/滚转 (°)", ref euler, .25f))
+        if(_tl.Curves.Count > 4)
         {
-            const float rad = MathF.PI / 180;
-            c.Rotation = Quaternion.Normalize(Quaternion.CreateFromYawPitchRoll(euler.X * rad, euler.Y * rad, euler.Z * rad)); c.Touch(); _tl.Touch();
+            if(ImGui.BeginChild("##np_curve_scroll", new Vector2(UiWidgets.InnerAvailWidth, 118f * s), false))
+                DrawEntries(0f);
+            ImGui.EndChild();
         }
-        if(ImGui.IsItemActivated()) _tl.Snapshot();
-        var scale = c.Scale;
-        ImGui.SetNextItemWidth(260);
-        if(ImGui.DragFloat3("缩放", ref scale, .01f, .001f, 1000f)) { c.Scale = scale; c.Touch(); _tl.Touch(); }
-        if(ImGui.IsItemActivated()) _tl.Snapshot();
+        else
+            DrawEntries(UiWidgets.InnerAvailWidth);
+    }
 
-        var spline = c.Splines.Count > 0 ? c.Splines[Math.Clamp(Selection.FirstOrDefault().Spline, 0, c.Splines.Count - 1)] : null;
-        if(spline != null)
+    public void DrawPanel(bool gpose, bool brioTheme = true)
+    {
+        float s = XcpStyle.Scale;
+
+        // ---- top bar ----
+        ImGui.BeginDisabled(!gpose);
+        if(UiWidgets.IconTextButton("add_curve_btn", FontAwesomeIcon.Plus, I18n.T("curve.btn_add"),
+            I18n.T("curve.btn_add_tip"), brioTheme: brioTheme, dropdownCaret: true))
+            ImGui.OpenPopup("##add_curve_popup");
+        ImGui.EndDisabled();
+        DrawAddCurvePopup("##add_curve_popup");
+
+        ImGui.SameLine();
+        if(UiWidgets.TogglePill("edit_cage", I18n.T("curve.axis_toggle"), Active,
+            I18n.T("curve.axis_panel_tip"),
+            FontAwesomeIcon.DrawPolygon, brioTheme: brioTheme))
         {
-            ImGui.TextDisabled($"样条：{TypeName(spline.Type)}，{spline.Points.Count} 个控制点{(c.Splines.Count > 1 ? $"（共 {c.Splines.Count} 条样条，跟随路径只使用第一条）" : "")}");
-            int res = spline.Resolution;
-            ImGui.SetNextItemWidth(100);
-            if(ImGui.InputInt("分辨率", ref res)) Edit("已修改分辨率。", _ => spline.Resolution = Math.Clamp(res, 1, 64));
-            if(spline.Type == SplineType.Nurbs)
+            Active = !Active;
+            Selection.Clear();
+        }
+
+        ImGui.SameLine();
+        UiWidgets.HelpMarker(I18n.T("curve.panel_help"));
+
+        ImGui.Spacing();
+
+        // ---- split: curve list (left) + properties (right) ----
+        float availH = MathF.Max(180f * s, ImGui.GetContentRegionAvail().Y);
+        float listW = Math.Clamp(ImGui.GetContentRegionAvail().X * 0.34f, 170f * s, 260f * s);
+
+        if(ImGui.BeginChild("##curve_list_pane", new Vector2(listW, availH), true, ImGuiWindowFlags.AlwaysUseWindowPadding))
+        {
+            UiWidgets.SectionHeader(I18n.T("curve.list_title"), brioTheme, FontAwesomeIcon.Route);
+            bool following = _tl.ActiveTrack.FollowPath != null;
+            string npLabel = following
+                ? I18n.T("curve.node_path_overridden", _tl.ActiveTrack.Name)
+                : I18n.T("curve.node_path_item", _tl.ActiveTrack.Name);
+            if(ImGui.Selectable($"{npLabel}##nodepath", EditingNodePath))
+            { CurveId = null; NodePath = true; EditMode = true; Selection.Clear(); }
+            UiWidgets.Tooltip(I18n.T("curve.node_path_tip"));
+
+            if(_tl.Curves.Count > 0) ImGui.Separator();
+            foreach(var curve in _tl.Curves)
             {
-                ImGui.SameLine(); int order = spline.Order; ImGui.SetNextItemWidth(100);
-                if(ImGui.InputInt("阶数", ref order)) Edit("已修改 NURBS 阶数。", _ => spline.Order = Math.Clamp(order, 2, 6));
-                ImGui.SameLine(); bool endpoint = spline.Endpoint;
-                if(ImGui.Checkbox("端点", ref endpoint)) Edit("已修改 NURBS 端点。", _ => spline.Endpoint = endpoint);
+                var users = _tl.Tracks.Where(t => t.FollowPath?.CurveId == curve.Id).Select(t => t.Name).ToList();
+                string summary = SplineSummary(curve);
+                string tagText = users.Count > 0 ? I18n.T("curve.following_tag") : summary.Split(' ')[0];
+                if(ImGui.Selectable($"{curve.Name}##{curve.Id}", curve.Id == CurveId))
+                { CurveId = curve.Id; NodePath = false; Selection.Clear(); }
+                UiWidgets.Tooltip($"{summary}" + (users.Count > 0 ? "\n" + I18n.T("curve.followed_by_tip", string.Join(I18n.T("common.list_sep"), users)) : ""));
+                float tagW = ImGui.CalcTextSize(tagText).X + 8f * s;
+                ImGui.SameLine(MathF.Max(ImGui.GetCursorPosX() + 6f * s, ImGui.GetContentRegionAvail().X - tagW));
+                ImGui.TextDisabled(tagText);
+            }
+        }
+        ImGui.EndChild();
+
+        ImGui.SameLine();
+
+        if(ImGui.BeginChild("##curve_prop_pane", new Vector2(0, availH), false))
+        {
+            if(EditingNodePath) DrawNodePathPanel(brioTheme);
+            else if(Curve is not { } c) ImGui.TextDisabled(I18n.T("curve.select_hint"));
+            else DrawCurveProperties(c, brioTheme);
+        }
+        ImGui.EndChild();
+    }
+
+    private void DrawCurveProperties(CurveObject c, bool brioTheme)
+    {
+        float s = XcpStyle.Scale;
+
+        // ---- card 1: identity & mode ----
+        using(UiWidgets.Card("curve_hdr", brioTheme))
+        {
+            string name = c.Name;
+            string delLabel = I18n.T("common.delete");
+            float delW = MathF.Max(72f * s, ImGui.CalcTextSize(delLabel).X + 30f * s);
+            ImGui.SetNextItemWidth(MathF.Max(100f * s, UiWidgets.InnerAvailWidth - delW - 6f * s));
+            if(ImGui.InputText("##cname", ref name, 64)) c.Name = name;
+            ImGui.SameLine(0, 6f * s);
+            if(UiWidgets.DangerButton("del_curve", FontAwesomeIcon.TrashAlt, delLabel, I18n.T("curve.del_tip"), new Vector2(delW, 0), brioTheme))
+            { _tl.RemoveCurve(c); CurveId = null; Selection.Clear(); return; }
+
+            ImGui.Spacing();
+            int mode = EditMode ? 1 : 0;
+            if(UiWidgets.Segmented("curve_mode", ref mode, [I18n.T("curve.mode.object"), I18n.T("curve.mode.edit")], brioTheme, UiWidgets.InnerAvailWidth,
+                [I18n.T("curve.mode.object_tip"), I18n.T("curve.mode.edit_tip")]))
+            {
+                EditMode = mode == 1;
+                if(!EditMode) Selection.Clear();
+            }
+        }
+
+        ImGui.Spacing();
+
+        // ---- card 2: object transform & spline ----
+        using(UiWidgets.Card("curve_xform", brioTheme))
+        {
+            UiWidgets.SectionHeader(I18n.T("curve.xform_title"), brioTheme, FontAwesomeIcon.Cube);
+            string posLbl = I18n.T("inspector.pos_m"), rotLbl = I18n.T("inspector.rot_deg"), scLbl = I18n.T("common.scale");
+            float maxLblW = MathF.Max(MathF.Max(ImGui.CalcTextSize(posLbl).X, ImGui.CalcTextSize(rotLbl).X), ImGui.CalcTextSize(scLbl).X);
+            float fieldW = MathF.Max(120f * s, UiWidgets.InnerAvailWidth - maxLblW - 14f * s);
+
+            var loc = c.Location;
+            ImGui.SetNextItemWidth(fieldW);
+            if(ImGui.DragFloat3($"{posLbl}##cpos", ref loc, .01f)) { c.Location = GizmoEditor.ClampRange(loc); c.Touch(); _tl.Touch(); }
+            if(ImGui.IsItemActivated()) _tl.Snapshot();
+
+            var euler = ShotCurves.Euler(c.Rotation);
+            ImGui.SetNextItemWidth(fieldW);
+            if(ImGui.DragFloat3($"{rotLbl}##crot", ref euler, .25f))
+            {
+                const float rad = MathF.PI / 180;
+                c.Rotation = Quaternion.Normalize(Quaternion.CreateFromYawPitchRoll(euler.X * rad, euler.Y * rad, euler.Z * rad));
+                c.Touch(); _tl.Touch();
+            }
+            if(ImGui.IsItemActivated()) _tl.Snapshot();
+
+            var scale = c.Scale;
+            ImGui.SetNextItemWidth(fieldW);
+            if(ImGui.DragFloat3($"{scLbl}##csc", ref scale, .01f, .001f, 1000f)) { c.Scale = scale; c.Touch(); _tl.Touch(); }
+            if(ImGui.IsItemActivated()) _tl.Snapshot();
+
+            var spline = c.Splines.Count > 0 ? c.Splines[Math.Clamp(Selection.FirstOrDefault().Spline, 0, c.Splines.Count - 1)] : null;
+            if(spline != null)
+            {
+                ImGui.Spacing();
+                UiWidgets.SectionHeader(I18n.T("curve.spline_header", TypeName(spline.Type), spline.Points.Count), brioTheme, FontAwesomeIcon.BezierCurve);
+                int res = spline.Resolution;
+                ImGui.SetNextItemWidth(90f * s);
+                if(ImGui.InputInt($"{I18n.T("curve.resolution")}##cres", ref res)) Edit(I18n.T("curve.status_resolution"), _ => spline.Resolution = Math.Clamp(res, 1, 64));
+                if(spline.Type == SplineType.Nurbs)
+                {
+                    ImGui.SameLine();
+                    int order = spline.Order;
+                    ImGui.SetNextItemWidth(80f * s);
+                    if(ImGui.InputInt($"{I18n.T("curve.order")}##cord", ref order)) Edit(I18n.T("curve.status_order"), _ => spline.Order = Math.Clamp(order, 2, 6));
+                    ImGui.SameLine();
+                    bool endpoint = spline.Endpoint;
+                    if(ImGui.Checkbox($"{I18n.T("curve.endpoint")}##cend", ref endpoint)) Edit(I18n.T("curve.status_endpoint"), _ => spline.Endpoint = endpoint);
+                }
             }
         }
 
         if(!EditMode) return;
-        ImGui.Separator();
-        ImGui.TextUnformatted($"编辑模式 · 已选 {Selection.Count}");
-        ImGui.BeginDisabled(Selection.Count == 0);
-        DrawPointCommands(false);
-        DrawHandleTypeControl();
+        ImGui.Spacing();
 
-        var selectedPoints = SelectedSplines(c).SelectMany(x => x.points.Where(i => i < x.spline.Points.Count).Select(i => x.spline.Points[i])).Distinct().ToList();
-        DrawPointProperties(c, selectedPoints);
-        ImGui.EndDisabled();
+        // ---- card 3: edit mode actions ----
+        using(UiWidgets.Card("curve_edit", brioTheme))
+        {
+            UiWidgets.SectionHeader(I18n.T("curve.edit_header", Selection.Count), brioTheme, FontAwesomeIcon.Pen);
+            ImGui.BeginDisabled(Selection.Count == 0);
+            DrawPointCommands(false, brioTheme);
+            ImGui.Spacing();
+            DrawHandleTypeControl(brioTheme);
+            var selectedPoints = SelectedSplines(c).SelectMany(x => x.points.Where(i => i < x.spline.Points.Count).Select(i => x.spline.Points[i])).Distinct().ToList();
+            if(selectedPoints.Count > 0)
+            {
+                ImGui.Spacing();
+                DrawPointProperties(c, selectedPoints);
+            }
+            ImGui.EndDisabled();
+        }
     }
 
-    public void DrawPointContextCommands() => DrawPointCommands(true);
+    public void DrawPointContextCommands() => DrawPointCommands(true, true);
 
-    private void DrawPointCommands(bool menu)
+    private void DrawPointCommands(bool menu, bool brioTheme)
     {
         if(!EditMode || NodePath || Curve is not { } curve) return;
-        var groups = SelectedSplines(curve, pointsOnly: true).ToList();
+        var groups = ActivePointGroups();
         int count = groups.Sum(g => g.points.Count);
         if(menu && count == 0) return;
         if(menu) ImGui.Separator();
-        bool Item(string label, bool enabled, string help)
+
+        bool Item(string id, FontAwesomeIcon icon, string label, bool enabled, string help)
         {
             ImGui.BeginDisabled(!enabled);
-            bool clicked = menu ? ImGui.MenuItem(label) : ImGui.Button(label);
+            bool clicked = menu
+                ? ImGui.MenuItem(label)
+                : UiWidgets.IconTextButton(id, icon, label, help, brioTheme: brioTheme);
             ImGui.EndDisabled();
-            if(ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled)) ImGui.SetTooltip(help);
+            if(menu) UiWidgets.Tooltip(help);
             return clicked;
         }
-        bool canExtrude = groups.Any(g => !g.spline.Cyclic && (g.points.Contains(0) || g.points.Contains(g.spline.Points.Count - 1)));
-        if(Item("挤出", canExtrude, "从所选开放样条的端点延伸出新的控制点。"))
-            Edit("已挤出并选中新控制点。", _ =>
-            {
-                Selection.Clear();
-                foreach(var (s, si, points) in groups.Where(g => !g.spline.Cyclic))
-                {
-                    var ends = points.Where(p => p == 0 || p == s.Points.Count - 1).OrderDescending().ToArray();
-                    var added = new List<CurvePoint>();
-                    foreach(int end in ends) added.Add(s.Points[CurveEdit.Extrude(s, end)]);
-                    foreach(var point in added) Selection.Add(new CurveSelection(si, s.Points.IndexOf(point)));
-                }
-            });
+
+        if(Item("c_ext", FontAwesomeIcon.PlusCircle, I18n.T("curve.cmd.extrude"), CanExtrude, I18n.T("curve.cmd.extrude_tip")))
+            ExtrudeSelected();
         if(!menu) ImGui.SameLine();
-        bool adjacent = groups.Any(g => g.spline.Points.Count > 1 && g.points.Any(i => i < g.spline.SegmentCount && g.points.Contains((i + 1) % g.spline.Points.Count)));
-        if(Item("细分", adjacent, "请选择同一样条上相邻的两个控制点。"))
-            Edit("已细分所选相邻控制点之间的线段。", _ =>
-            {
-                Selection.Clear();
-                foreach(var (s, si, points) in groups)
-                    foreach(int i in CurveEdit.Subdivide(s, points)) Selection.Add(new CurveSelection(si, i));
-            });
+        if(Item("c_sub", FontAwesomeIcon.Stream, I18n.T("curve.cmd.subdivide"), CanSubdivide, I18n.T("curve.cmd.subdivide_tip")))
+            SubdivideSelected();
         if(!menu) ImGui.SameLine();
-        if(Item("切换闭合", groups.Any(g => g.spline.Points.Count >= 2), "闭合或打开所选控制点所属的样条。"))
-            Edit("已切换闭合。", _ => { foreach(var g in groups) CurveEdit.ToggleCyclic(g.spline); });
+        if(Item("c_cyc", FontAwesomeIcon.Sync, I18n.T("curve.cmd.toggle_cyclic"), CanToggleCyclic, I18n.T("curve.cmd.toggle_cyclic_tip")))
+            ToggleCyclicSelected();
         if(!menu) ImGui.SameLine();
-        if(Item("切换方向", count > 0, "反转所选控制点所属样条的方向。"))
-            Edit("已反转样条方向。", _ => { foreach(var g in groups) CurveEdit.SwitchDirection(g.spline); Selection.Clear(); });
+        if(Item("c_dir", FontAwesomeIcon.ExchangeAlt, I18n.T("curve.cmd.switch_dir"), CanSwitchDirection, I18n.T("curve.cmd.switch_dir_tip")))
+            SwitchDirectionSelected();
         if(!menu) ImGui.SameLine();
-        if(Item(count > 1 ? $"删除所选 {count} 个节点" : "删除节点", count > 0, "删除所选控制点。")) DeleteSelected();
+        if(Item("c_del", FontAwesomeIcon.TrashAlt, count > 1 ? I18n.T("inspector.delete_count", count) : I18n.T("common.delete"), count > 0, I18n.T("curve.cmd.delete_tip")))
+            DeleteSelected();
     }
 
-    private void DrawNodePathPanel()
+    private void DrawNodePathPanel(bool brioTheme)
     {
+        using var card = UiWidgets.Card("node_path_card", brioTheme);
+        UiWidgets.SectionHeader(I18n.T("curve.node_path_title", _tl.ActiveTrack.Name), brioTheme, FontAwesomeIcon.BezierCurve,
+            I18n.T("curve.node_path_help"));
+
         if(_tl.ActiveTrack.FollowPath != null)
-        { ImGui.TextDisabled("当前轨道正在跟随曲线：节点位置由曲线上的路径进度决定（首 0%、末 100%），节点路径不参与输出。移除约束后可再编辑节点路径。"); return; }
-        ImGui.TextDisabled("节点路径是由镜头节点自动生成的贝塞尔曲线：控制点就是镜头节点，默认自动（Auto）手柄。");
-        ImGui.TextDisabled("在游戏内点选节点处的手柄（圆点）拖动调整曲率；拖动自动手柄会变为对齐。点选控制点会选中镜头节点。");
+        {
+            ImGui.TextColored(XcpStyle.Warning, I18n.T("curve.node_path_overridden_warn"));
+            return;
+        }
+
         var nodes = PathNodes;
-        var points = Selection.Select(s => s.Point).Where(i => i < nodes.Count).Distinct().ToList();
+        var points = Selection.Select(s => s.Point).Where(i => i < nodes.Count)
+            .Concat(nodes.Select((n, idx) => (n, idx)).Where(x => _tl.SelectedNodes.Contains(x.n.Id)).Select(x => x.idx))
+            .Distinct().ToList();
+        ImGui.TextDisabled(points.Count == 0 ? I18n.T("curve.node_path_empty_hint") : I18n.T("curve.node_path_selected_count", points.Count));
+        ImGui.Spacing();
         ImGui.BeginDisabled(points.Count == 0);
-        ImGui.SetNextItemWidth(110);
-        ImGui.Combo("##nodehtype", ref _handleType, "自由\0自动\0矢量\0对齐\0");
+        ImGui.SetNextItemWidth(115f * XcpStyle.Scale);
+        ImGui.Combo("##nodehtype", ref _handleType, I18n.Combo("curve.handle.free", "curve.handle.auto", "curve.handle.vector", "curve.handle.aligned"));
         ImGui.SameLine();
-        if(ImGui.Button("设置所选节点手柄类型"))
+        if(ImGui.Button($"{I18n.T("curve.node_path_apply_handle")}##np_apply_h"))
         {
             _tl.Snapshot();
             foreach(int i in points) ShotOf(nodes[i])?.SetPathHandleType(nodes[i], (CurveHandle)_handleType);
             _tl.Touch();
-            _status($"已设置 {points.Count} 个节点的路径手柄类型。", false);
+            _status(I18n.T("curve.node_path_handle_set", points.Count), false);
         }
         ImGui.EndDisabled();
     }
 
-    private static string TypeName(SplineType t) => t switch { SplineType.Bezier => "贝塞尔", SplineType.Nurbs => "NURBS", _ => "多段线" };
-    private static string SplineSummary(CurveObject c) => c.Splines.Count == 0 ? "空" :
-        string.Join(" + ", c.Splines.Select(s => $"{TypeName(s.Type)}{(s.Cyclic ? "环" : "")} {s.Points.Count} 点"));
+    private static string TypeName(SplineType t) => t switch { SplineType.Bezier => I18n.T("curve.type.bezier"), SplineType.Nurbs => I18n.T("curve.type.nurbs"), _ => I18n.T("curve.type.poly") };
+    private static string SplineSummary(CurveObject c) => c.Splines.Count == 0 ? I18n.T("curve.summary.empty") :
+        string.Join(" + ", c.Splines.Select(s => I18n.T(s.Cyclic ? "curve.summary.part_cyclic" : "curve.summary.part", TypeName(s.Type), s.Points.Count)));
 }

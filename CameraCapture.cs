@@ -24,10 +24,10 @@ public static unsafe class CameraCapture
     {
         basePos = default; baseRot = Quaternion.Identity; name = ""; error = "";
         var go = targets.GPoseTarget;
-        if(go == null) { error = "没有 GPose 目标（请在 GPose 中选中一个角色）"; return false; }
+        if(go == null) { error = I18n.T("capture.cam.no_gpose_target"); return false; }
 
         var native = (GameObjectStruct*)go.Address;
-        if(native == null || native->DrawObject == null) { error = "目标没有 DrawObject"; return false; }
+        if(native == null || native->DrawObject == null) { error = I18n.T("capture.cam.no_draw_object"); return false; }
 
         var obj = &native->DrawObject->Object;
         basePos = new Vector3(obj->Position.X, obj->Position.Y, obj->Position.Z);
@@ -43,9 +43,9 @@ public static unsafe class CameraCapture
             return false;
 
         var mgr = CameraManager.Instance();
-        if(mgr == null) { error = "CameraManager 不可用"; return false; }
+        if(mgr == null) { error = I18n.T("capture.cam.no_manager"); return false; }
         var cam = mgr->GetActiveCamera();
-        if(cam == null) { error = "没有活动相机"; return false; }
+        if(cam == null) { error = I18n.T("capture.cam.no_active"); return false; }
 
         var scene = &cam->CameraBase.SceneCamera;
         var render = scene->RenderCamera;
@@ -57,7 +57,7 @@ public static unsafe class CameraCapture
 
         if(!XcpMath.DecomposeView(view, out var wp, out var wr))
         {
-            error = $"视图矩阵无效：{XcpMath.Dump(view)}";
+            error = I18n.T("capture.cam.invalid_view", XcpMath.Dump(view));
             return false;
         }
 

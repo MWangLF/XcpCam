@@ -73,17 +73,18 @@ public sealed class TimelineBake
 
         if(_brio.FrameMax < lastFrame) _brio.FrameMax = lastFrame;
 
-        string pitchNote = "";
+        bool pitchEnabled = false;
         if(maxPitch > 1.5f && !_brio.GetDelimitAngle(cam))
         {
             _brio.SetDelimitAngle(cam, true);
-            pitchNote = "；俯仰角超过 ±86°，已为该相机开启 Brio 的「解除角度限制」";
+            pitchEnabled = true;
         }
 
         _brio.EnsureInTimeline(cam);
         _brio.ApplyTimelineFrame();
 
-        Status = $"已烘焙 {keys.Count} 个关键帧到「{cam.Name}」（第 {firstFrame}–{lastFrame} 帧 @ {fps}fps，{cuts} 处硬切）{pitchNote}";
+        string pitchNote = pitchEnabled ? I18n.T("brio.bake.pitch_note") : "";
+        Status = I18n.T("brio.bake.done", keys.Count, cam.Name, firstFrame, lastFrame, fps, cuts, pitchNote);
         _log.Info($"TimelineBake: {keys.Count} keys into {cam.Name}, frames {firstFrame}-{lastFrame} @ {fps}fps, cuts {cuts}, baseFov {BaseFov}");
     }
 
@@ -93,7 +94,7 @@ public sealed class TimelineBake
         _brio.RestoreTrackKeyframes(_undoCam, _undoKeys);
         _brio.FrameMax = _undoFrameMax;
         _brio.ApplyTimelineFrame();
-        Status = $"已撤销对「{_undoCam.Name}」的烘焙";
+        Status = I18n.T("brio.bake.undone", _undoCam.Name);
         _undoCam = null;
         _undoKeys = null;
     }

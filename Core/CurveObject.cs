@@ -228,7 +228,7 @@ public sealed class Spline
 public sealed class CurveObject
 {
     public Guid Id = Guid.NewGuid();
-    public string Name = "曲线";
+    public string Name = I18n.T("core.curve.default");
     public Vector3 Location;
     public Quaternion Rotation = Quaternion.Identity;
     public Vector3 Scale = Vector3.One;

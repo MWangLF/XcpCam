@@ -36,21 +36,21 @@ public sealed unsafe class AnimationClock
     {
         sample = default; error = "";
         var go = _actor();
-        if(go == null) { error = "找不到绑定的角色（没有 GPose 目标，或所选角色已不在场景中）"; return null; }
+        if(go == null) { error = I18n.T("capture.anim.no_actor"); return null; }
         var native = (GameObjectStruct*)go.Address;
-        if(native == null || native->DrawObject == null) { error = "目标没有模型"; return null; }
-        if(native->DrawObject->Object.GetObjectType() != ObjectType.CharacterBase) { error = "目标不是角色"; return null; }
+        if(native == null || native->DrawObject == null) { error = I18n.T("capture.anim.no_model"); return null; }
+        if(native->DrawObject->Object.GetObjectType() != ObjectType.CharacterBase) { error = I18n.T("capture.anim.not_char"); return null; }
         var skel = ((CharacterBase*)native->DrawObject)->Skeleton;
-        if(skel == null || skel->PartialSkeletonCount <= 0) { error = "目标没有骨骼"; return null; }
+        if(skel == null || skel->PartialSkeletonCount <= 0) { error = I18n.T("capture.anim.no_skeleton"); return null; }
         var animated = skel->PartialSkeletons[0].GetHavokAnimatedSkeleton(0);
-        if(animated == null || animated->AnimationControls.Length <= 0) { error = "目标没有动画控制器"; return null; }
+        if(animated == null || animated->AnimationControls.Length <= 0) { error = I18n.T("capture.anim.no_ctrl"); return null; }
         var control = animated->AnimationControls[0].Value;
-        if(control == null) { error = "目标当前没有播放动画"; return null; }
+        if(control == null) { error = I18n.T("capture.anim.not_playing"); return null; }
         var binding = control->Binding.ptr;
-        if(binding == null || binding->Animation.ptr == null) { error = "目标当前没有播放动画"; return null; }
+        if(binding == null || binding->Animation.ptr == null) { error = I18n.T("capture.anim.not_playing"); return null; }
         var anim = binding->Animation.ptr;
         if(!float.IsFinite(anim->Duration) || anim->Duration <= 0 || !float.IsFinite(control->LocalTime))
-        { error = "动画时长或进度无效"; return null; }
+        { error = I18n.T("capture.anim.invalid_time"); return null; }
         sample = new AnimationSample(new AnimationIdentity(go.Address, go.GameObjectId, (nint)control, (nint)binding, (nint)anim),
             control->LocalTime, anim->Duration, control->OverflowCount, control->UnderflowCount);
         return control;
@@ -88,7 +88,7 @@ public sealed unsafe class AnimationClock
         catch(Exception ex)
         {
             Reset();
-            Status = $"读取动画失败：{ex.Message}";
+            Status = I18n.T("capture.anim.read_failed", ex.Message);
         }
     }
 

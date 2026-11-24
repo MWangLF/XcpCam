@@ -6,6 +6,7 @@ using System.IO;
 using System.Linq;
 using System.Numerics;
 using System.Reflection;
+using XcpCam.Core;
 
 namespace XcpCam.BrioInterop;
 
@@ -24,7 +25,8 @@ public sealed class BrioBridge
     private Assembly? _asm;
     private DateTime _nextResolve = DateTime.MinValue;
 
-    public string Status { get; private set; } = "未连接";
+    private Func<string> _status = () => I18n.T("brio.bridge.disconnected");
+    public string Status => _status();
     public string? Version { get; private set; }
     public bool IsConnected => _timeline != null;
     public List<string> Missing { get; } = [];
@@ -58,7 +60,7 @@ public sealed class BrioBridge
 
             if(asm == null)
             {
-                Reset("未找到已加载的 Brio");
+                Reset(() => I18n.T("brio.bridge.not_found"));
                 return;
             }
 
@@ -68,15 +70,16 @@ public sealed class BrioBridge
         }
         catch(Exception ex)
         {
-            Reset($"连接 Brio 失败：{ex.Message}");
+            var msg = ex.Message;
+            Reset(() => I18n.T("brio.bridge.connect_failed", msg));
             _log.Warning(ex, "BrioBridge resolve failed");
         }
     }
 
-    private void Reset(string status)
+    private void Reset(Func<string> status)
     {
         _asm = null; _timeline = _cutscene = _config = _vcm = null;
-        Status = status; Version = null;
+        _status = status; Version = null;
     }
 
     private static IServiceProvider? GetServices(Assembly a)
@@ -148,7 +151,9 @@ public sealed class BrioBridge
         Member(_tCameraEntity, "CameraType", "CameraEntity.CameraType");
         Member(_tVirtualCamera, "FreeCamValues", "VirtualCamera.FreeCamValues");
 
-        Status = IsConnected ? $"已连接 Brio {Version}" : "Brio 已加载，但未找到 TimelineService";
+        var ver = Version;
+        bool connected = IsConnected;
+        _status = connected ? () => I18n.T("brio.bridge.connected", ver) : () => I18n.T("brio.bridge.no_timeline_svc");
         _log.Info($"BrioBridge: {Status}; missing=[{string.Join(", ", Missing)}]");
     }
 
@@ -210,14 +215,14 @@ public sealed class BrioBridge
         set
         {
             var cfg = Get(Get(_config, "Configuration"), "Timeline")
-                ?? throw new InvalidOperationException("Brio 时间轴循环设置不可用");
+                ?? throw new InvalidOperationException(I18n.T("brio.bridge.loop_unavailable"));
             Set(cfg, "Loop", value);
         }
     }
 
     public void StopTimeline()
     {
-        if(_timeline == null) throw new InvalidOperationException("Brio 时间轴未连接");
+        if(_timeline == null) throw new InvalidOperationException(I18n.T("brio.bridge.timeline_disconnected"));
         Call(_timeline, "Stop");
     }
 
@@ -343,7 +348,7 @@ public sealed class BrioBridge
     /// <summary>Loads an .xcp into Brio's XAT player exactly like Brio's own "Browse" button does.</summary>
     public void LoadCutsceneFile(string path)
     {
-        if(_cutscene == null || _tXatFile == null) throw new InvalidOperationException("Brio XAT 播放器不可用");
+        if(_cutscene == null || _tXatFile == null) throw new InvalidOperationException(I18n.T("brio.bridge.xat_unavailable"));
         using var fs = File.OpenRead(path);
         using var br = new BinaryReader(fs);
         var file = Activator.CreateInstance(_tXatFile, br);
@@ -440,8 +445,8 @@ public sealed class BrioBridge
     /// <summary>Writes free-cam keyframes into the camera's timeline track (linear: Bezier with straight handles; Step for cuts).</summary>
     public void AddCameraKeys(FreeCam cam, IEnumerable<FreeCamKey> keys)
     {
-        var track = Get(cam.Capability, "_track") ?? throw new InvalidOperationException("找不到相机轨道");
-        var add = _tTrack!.GetMethod("AddCameraKeyframe", Inst) ?? throw new InvalidOperationException("找不到 AddCameraKeyframe");
+        var track = Get(cam.Capability, "_track") ?? throw new InvalidOperationException(I18n.T("brio.bridge.no_cam_track"));
+        var add = _tTrack!.GetMethod("AddCameraKeyframe", Inst) ?? throw new InvalidOperationException(I18n.T("brio.bridge.no_add_keyframe"));
         var all = Enum.Parse(_tCamComponents!, "All");
         var bezier = Enum.Parse(_tInterp!, "Bezier");
         var step = Enum.Parse(_tInterp!, "Step");

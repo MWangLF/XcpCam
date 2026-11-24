@@ -24,12 +24,17 @@ public sealed unsafe class BoneSource : ITrackTargetSource
     private readonly Dictionary<string, Vector3?> _tick = new();
     private readonly Dictionary<nint, Dictionary<string, int>> _boneIndex = new();
 
-    /// <summary>Common bones listed first in the picker.</summary>
-    public static readonly (string Bone, string Label)[] Common =
+    /// <summary>Common bones listed first in the picker (with i18n label keys).</summary>
+    public static readonly (string Bone, string Key)[] CommonKeys =
     [
-        ("j_kao", "头"), ("j_kubi", "颈"), ("j_sebo_c", "胸"), ("j_sebo_b", "背"), ("j_kosi", "腰"),
-        ("j_te_l", "左手"), ("j_te_r", "右手"), ("j_asi_e_l", "左脚"), ("j_asi_e_r", "右脚"), ("n_hara", "根骨骼"),
+        ("j_kao", "capture.bone.head"), ("j_kubi", "capture.bone.neck"), ("j_sebo_c", "capture.bone.chest"),
+        ("j_sebo_b", "capture.bone.spine"), ("j_kosi", "capture.bone.waist"), ("j_te_l", "capture.bone.hand_l"),
+        ("j_te_r", "capture.bone.hand_r"), ("j_asi_e_l", "capture.bone.foot_l"), ("j_asi_e_r", "capture.bone.foot_r"),
+        ("n_hara", "capture.bone.root"),
     ];
+
+    public static IEnumerable<(string Bone, string Label)> Common
+        => CommonKeys.Select(x => (x.Bone, I18n.T(x.Key)));
 
     public BoneSource(IObjectTable objects, ITargetManager targets, IClientState clientState)
     {
@@ -124,7 +129,7 @@ public sealed unsafe class BoneSource : ITrackTargetSource
     {
         error = "";
         var cb = CharacterBaseOf(go);
-        if(cb == null) { error = "角色没有模型或骨骼"; return null; }
+        if(cb == null) { error = I18n.T("capture.bone.no_model"); return null; }
         var skel = cb->Skeleton;
         for(int p = 0; p < skel->PartialSkeletonCount; p++)
         {
@@ -148,7 +153,7 @@ public sealed unsafe class BoneSource : ITrackTargetSource
             var world = position + Vector3.Transform(new Vector3(tr.X, tr.Y, tr.Z) * scale, rotation);
             return XcpMath.IsFinite(world) ? world : null;
         }
-        error = $"找不到骨骼 {bone}";
+        error = I18n.T("capture.bone.not_found", bone);
         return null;
     }
 }

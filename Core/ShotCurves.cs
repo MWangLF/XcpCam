@@ -34,7 +34,7 @@ public sealed class MotionInterval
             if(value?.Curves == null || value.Indices == null || value.Curves.Length is < 1 or > 3 ||
                 value.Indices.Count != 3 || value.Indices.Values.Any(i => (uint)i >= value.Curves.Length) ||
                 value.Indices.Values.Distinct().Count() != value.Curves.Length)
-                throw new System.IO.InvalidDataException("无效的运动通道映射。");
+                throw new System.IO.InvalidDataException(I18n.T("core.invalid_channel_map"));
             Channels = value.Indices.ToDictionary(p => p.Key, p => value.Curves[p.Value]);
         }
     }
@@ -216,7 +216,7 @@ public sealed class ShotCurves
     public Guid Id = Guid.NewGuid();
     public Guid AnchorNodeId;
     public int Start, End;
-    public string Name = "镜头段";
+    public string Name = I18n.T("core.shot_default");
     public List<MotionInterval> Intervals = [];
     internal Dictionary<Guid, CurveInterpolation> CutRestore = new();
     internal Dictionary<Guid, bool> CutObserved = new();
@@ -230,7 +230,7 @@ public sealed class ShotCurves
         if(poses == null || CutObserved == null || CutRestore == null || ManualFactors == null || Space.DirtyTangents == null ||
             nodes.Any(n => !owned.Contains(n.Id)) || nodes.Select(n => n.Id).Distinct().Count() != nodes.Count ||
             !SeededNodes.SetEquals(nodes.Select(n => n.Id)))
-            throw new System.IO.InvalidDataException("镜头段内部节点无效。");
+            throw new System.IO.InvalidDataException(I18n.T("core.invalid_shot_internal"));
     }
 
     internal void RebindProjectNodes(Dictionary<Guid, Keyframe> keys)
@@ -1412,7 +1412,7 @@ public static class CurveModel
             int next = g + 1 < groups.Count ? groups[g + 1][0].Frame : int.MaxValue;
             long end = Math.Min((long)next - 1, (long)nodes[^1].Frame + Math.Max(0, nodes[^1].HoldFrames));
             shot.End = (int)Math.Clamp(end, shot.Start, int.MaxValue);
-            shot.Name = $"镜头段 {g + 1}（F{shot.Start}–F{shot.End}）";
+            shot.Name = I18n.T("core.shot_name", g + 1, shot.Start, shot.End);
             shot.HoldRegions = nodes.Where(n => n.HoldFrames > 0).Select(n =>
                 (n.Frame, (int)Math.Min((long)n.Frame + n.HoldFrames, nodes.Where(k => k.Frame > n.Frame).Select(k => k.Frame).DefaultIfEmpty(shot.End).Min()))).ToList();
             shot.Bind(nodes);

@@ -112,7 +112,7 @@ public static class LegacySpatialPath
                     key.Right = new Vector2((float)(r - mapped), key.Right.Y);
                 }
                 if(output[c].Keys.GroupBy(k => k.Frame).Any(g => g.Count() > 1))
-                    throw new InvalidOperationException("现有空间参数精度不足以恢复旧版路径，请在新的镜头段中生成默认路径。");
+                    throw new InvalidOperationException(I18n.T("core.legacy_precision"));
             }
         }
         foreach(var c in wanted) shot.Space.Channels[c] = output[c];

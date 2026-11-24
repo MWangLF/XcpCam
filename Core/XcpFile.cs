@@ -27,10 +27,10 @@ public static class XcpFile
         using var file = File.OpenRead(path);
         using var reader = new BinaryReader(file);
         if(file.Length < 8 || reader.ReadUInt32() != CameraMagic)
-            throw new InvalidDataException("无效的 XCP1 文件头");
+            throw new InvalidDataException(I18n.T("core.xcp.invalid_header"));
         var count = reader.ReadUInt32();
         if(count == 0 || count > MaxRecords || 32L * count > file.Length - file.Position)
-            throw new InvalidDataException("XCP 帧数无效或帧记录不完整");
+            throw new InvalidDataException(I18n.T("core.xcp.invalid_frames"));
         var frames = new XcpFrame[count];
         for(int i = 0; i < frames.Length; i++)
         {
@@ -45,10 +45,10 @@ public static class XcpFile
         try
         {
             if(reader.ReadUInt32() != ProjectMagic || reader.ReadInt32() != Version)
-                throw new InvalidDataException("未知工程尾块或版本");
+                throw new InvalidDataException(I18n.T("core.xcp.unknown_trailer"));
             int effective = reader.ReadInt32();
             if(effective < 1 || effective != count - 1 || frames[^1] != frames[^2])
-                throw new InvalidDataException("有效帧数或兼容末帧不匹配");
+                throw new InvalidDataException(I18n.T("core.xcp.frame_count_mismatch"));
             var pos = ReadPosition(reader);
             var rot = ReadRotation(reader);
             ValidateBase(pos, rot);
@@ -56,23 +56,23 @@ public static class XcpFile
             int packedSize = reader.ReadInt32();
             if(rawSize is < 1 or > MaxJson || packedSize is < 1 or > MaxCompressed ||
                 file.Length - file.Position != packedSize + DigestSize)
-                throw new InvalidDataException("工程长度无效");
+                throw new InvalidDataException(I18n.T("core.xcp.invalid_project_len"));
             byte[] packed = reader.ReadBytes(packedSize);
             long digestOffset = file.Position;
             byte[] expected = reader.ReadBytes(DigestSize);
             if(!Digest(file, digestOffset).AsSpan().SequenceEqual(expected))
-                throw new InvalidDataException("工程文件摘要不匹配");
+                throw new InvalidDataException(I18n.T("core.xcp.checksum_mismatch"));
             byte[] json = new byte[rawSize];
             using var decoder = new BrotliDecoder();
             if(decoder.Decompress(packed, json, out int consumed, out int written) != OperationStatus.Done ||
                 consumed != packed.Length || written != json.Length)
-                throw new InvalidDataException("工程压缩数据无效");
+                throw new InvalidDataException(I18n.T("core.xcp.invalid_compressed"));
             ValidateJson(json);
             return new(new ArraySegment<XcpFrame>(frames, 0, effective), json, null, pos, rot);
         }
         catch(Exception e) when(e is InvalidDataException or EndOfStreamException)
         {
-            return new(frames, null, "无法读取工程，已保留全部 XCP 帧：" + e.Message, Vector3.Zero, Quaternion.Identity);
+            return new(frames, null, I18n.T("core.xcp.project_read_warn", e.Message), Vector3.Zero, Quaternion.Identity);
         }
     }
 
@@ -80,7 +80,7 @@ public static class XcpFile
     {
         int count = frames.Count;
         if(count < 1 || count >= MaxRecords)
-            throw new InvalidDataException("导出帧数超出范围");
+            throw new InvalidDataException(I18n.T("core.xcp.export_frame_range"));
         if(project != null)
         {
             ValidateBase(basePos, baseRot);
@@ -118,7 +118,7 @@ public static class XcpFile
                         encoder.Write(project);
                     long end = file.Position;
                     int packedSize = checked((int)(end - sizeOffset - sizeof(int)));
-                    if(packedSize > MaxCompressed) throw new InvalidDataException("压缩工程过大");
+                    if(packedSize > MaxCompressed) throw new InvalidDataException(I18n.T("core.xcp.compressed_too_large"));
                     file.Position = sizeOffset;
                     writer.Write(packedSize);
                     writer.Write(Digest(file, end)); // Digest leaves the stream positioned at end.
@@ -151,23 +151,23 @@ public static class XcpFile
 
     static void ValidateJson(byte[] json)
     {
-        if(json.Length is < 1 or > MaxJson) throw new InvalidDataException("工程 JSON 长度无效");
+        if(json.Length is < 1 or > MaxJson) throw new InvalidDataException(I18n.T("core.xcp.invalid_json_len"));
         try { using var document = JsonDocument.Parse(json); }
-        catch(JsonException e) { throw new InvalidDataException("工程 JSON 无效", e); }
+        catch(JsonException e) { throw new InvalidDataException(I18n.T("core.xcp.invalid_json"), e); }
     }
 
     static void ValidateFrame(XcpFrame frame)
     {
         if(!XcpMath.IsFinite(frame.Pos) || !XcpMath.IsFinite(frame.Rot) || !float.IsFinite(frame.Fov))
-            throw new InvalidDataException("帧数据包含 NaN/Infinity");
+            throw new InvalidDataException(I18n.T("core.xcp.nan_frame"));
         float norm = frame.Rot.LengthSquared();
-        if(!(norm > 1e-20f) || !float.IsFinite(norm)) throw new InvalidDataException("帧数据包含无效旋转");
+        if(!(norm > 1e-20f) || !float.IsFinite(norm)) throw new InvalidDataException(I18n.T("core.xcp.invalid_rot"));
     }
 
     static void ValidateBase(Vector3 pos, Quaternion rot)
     {
         if(!XcpMath.IsFinite(pos) || !XcpMath.IsFinite(rot) || !(rot.LengthSquared() > 0) || !float.IsFinite(rot.LengthSquared()))
-            throw new InvalidDataException("导出基准无效");
+            throw new InvalidDataException(I18n.T("core.xcp.invalid_base"));
     }
 
     static Vector3 ReadPosition(BinaryReader r) => new(r.ReadSingle(), r.ReadSingle(), r.ReadSingle());

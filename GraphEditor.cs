@@ -1,4 +1,5 @@
 using Dalamud.Bindings.ImGui;
+using Dalamud.Interface;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -33,28 +34,48 @@ public sealed class GraphEditor
     private readonly record struct Hit(Ref Item, bool Handle, bool Right, Vector2 Point);
     private static readonly uint[] Colors = [0xFF6666EF, 0xFF70CE70, 0xFFEF9870];
 
-    public void Draw(ShotCurves shot, CamTimeline timeline, ShortcutBindings shortcuts)
+    public void Draw(ShotCurves shot, CamTimeline timeline, ShortcutBindings shortcuts, bool brioTheme = true)
     {
         int timing = shot.FollowTimingSignature(), count = shot.SeededNodes.Count;
-        DrawGraph(shot, timeline, shortcuts);
+        DrawGraph(shot, timeline, shortcuts, brioTheme);
         if(count == shot.SeededNodes.Count && timing != shot.FollowTimingSignature() && timeline.SyncCurveAnchorsFromEditor(shot))
-            Status = "速度曲线已生效，曲线节点的时间轴位置已按实际经过帧同步。";
+            Status = I18n.T("graph.status_anchors_synced");
     }
 
-    private void DrawGraph(ShotCurves shot, CamTimeline timeline, ShortcutBindings shortcuts)
+    private void DrawGraph(ShotCurves shot, CamTimeline timeline, ShortcutBindings shortcuts, bool brioTheme)
     {
         PlayheadChanged = false;
-        if(ImGui.Button(shot.EditorMode == CurveEditorMode.Advanced ? "高级曲线 · 当前" : "使用高级曲线"))
-        { End(); spatial.EndGesture(); if(shot.EditorMode != CurveEditorMode.Advanced) { timeline.Snapshot(); shot.SetEditorMode(CurveEditorMode.Advanced); timeline.Touch(); } }
+        float s = XcpStyle.Scale;
+
+        int editorMode = shot.EditorMode == CurveEditorMode.Advanced ? 0 : 1;
+        string modeCh = I18n.T("graph.mode.channel"), modeTm = I18n.T("graph.mode.timing");
+        float modeW = MathF.Max(190f * s, MathF.Max(ImGui.CalcTextSize(modeCh).X, ImGui.CalcTextSize(modeTm).X) * 2f + 28f * s);
+        if(UiWidgets.Segmented("ge_mode", ref editorMode, [modeCh, modeTm], brioTheme, modeW,
+            [I18n.T("graph.mode.channel_tip"), I18n.T("graph.mode.timing_tip")]))
+        {
+            End(); spatial.EndGesture();
+            var targetMode = editorMode == 0 ? CurveEditorMode.Advanced : CurveEditorMode.Simple;
+            if(shot.EditorMode != targetMode) { timeline.Snapshot(); shot.SetEditorMode(targetMode); timeline.Touch(); }
+        }
         ImGui.SameLine();
-        if(ImGui.Button(shot.EditorMode == CurveEditorMode.Simple ? "简单曲线 · 当前" : "使用简单曲线"))
-        { End(); spatial.EndGesture(); if(shot.EditorMode != CurveEditorMode.Simple) { timeline.Snapshot(); shot.SetEditorMode(CurveEditorMode.Simple); timeline.Touch(); } }
-        ImGui.TextDisabled(shot.EditorMode == CurveEditorMode.Advanced ? "高级曲线生效：直接控制数值、速度和节点帧；简单曲线锁定。" : "简单曲线生效：高级曲线锁定且保留。切换不会重建高级数据。");
+        UiWidgets.HelpMarker(I18n.T("graph.mode_help"));
+
         if(shot.UsesTimeAnchors)
-            ImGui.TextDisabled("曲线已锚定时间轴：编辑速度会同步曲线节点的经过帧；拖动曲线节点则按新锚点重新定时。");
-        if(shot.EditorMode == CurveEditorMode.Advanced) { spatial.Draw(shot, timeline, shortcuts); Status = spatial.Status; return; }
+        {
+            ImGui.SameLine();
+            UiWidgets.Chip("ge_anchor_badge", I18n.T("graph.badge_anchored"), XcpStyle.Info,
+                I18n.T("graph.badge_anchored_tip"));
+        }
+        if(shot.EditorMode == CurveEditorMode.Advanced)
+        {
+            ImGui.Spacing();
+            spatial.Draw(shot, timeline, shortcuts, brioTheme);
+            Status = spatial.Status;
+            return;
+        }
+
         if(shotId != shot.Id) { shotId = shot.Id; selected.Clear(); fit = true; End(); selectionRevision = -1; }
-        if(shot.Intervals.Count == 0) { ImGui.TextDisabled("此连续段只有一个节点，没有运动曲线。"); return; }
+        if(shot.Intervals.Count == 0) { ImGui.Spacing(); ImGui.TextDisabled(I18n.T("graph.single_node_empty")); return; }
         bool linked = shot.Intervals.All(i => i.Linked);
         if(linked) { visible.Clear(); visible.Add(CameraChannel.Position); }
         IEnumerable<CameraChannel> channels = linked ? [CameraChannel.Position] : Enum.GetValues<CameraChannel>();
@@ -67,88 +88,143 @@ public sealed class GraphEditor
         }
         selected.IntersectWith(refs.Select(r => r.Key.Id));
         ImGui.PushID("WholeShot" + shot.Id);
-        ImGui.TextDisabled($"整条轨道的连续段 F{shot.Start}–F{shot.End}（切镜为恒定插值，不拆段） · 已选节点 {timeline.SelectedNodes.Count}");
+
         if(timeline.Tracks.FirstOrDefault(t => t.Shots.Contains(shot)) is { RotationDriven: true } driven)
-            ImGui.TextColored(new System.Numerics.Vector4(0.6f, 0.9f, 1, 1), driven.FovDriven
-                ? "旋转与 FoV 由追踪约束控制：这里的旋转 / FoV 节奏只影响节点自身的值，最终朝向和 FoV 由约束决定。"
-                : "旋转由追踪约束控制：这里的旋转节奏只影响节点自身的旋转，最终朝向由约束决定。");
+        {
+            ImGui.SameLine();
+            UiWidgets.Chip("ge_drv", driven.FovDriven ? I18n.T("graph.driven_rot_fov") : I18n.T("graph.driven_rot"), XcpStyle.Warning,
+                I18n.T("graph.driven_simple_tip"));
+        }
+
+        ImGui.Spacing();
+
+        // ---- Row 1: channels + link/unlink + smooth + frame all ----
+        float sqH = ImGui.GetFrameHeight();
+        var sq = new Vector2(sqH, sqH);
+        bool firstCh = true;
         foreach(var c in channels)
         {
+            if(!firstCh) ImGui.SameLine(0, 6f * s);
+            firstCh = false;
             ImGui.PushID((int)c);
             bool show = visible.Contains(c), isLocked = locked.Contains(c);
-            if(ImGui.Checkbox(linked ? "共享进度" : Label(c), ref show)) { if(show) visible.Add(c); else visible.Remove(c); }
-            ImGui.SameLine();
-            if(ImGui.Checkbox("锁定", ref isLocked)) { if(isLocked) locked.Add(c); else locked.Remove(c); End(); }
-            ImGui.SameLine(); ImGui.PopID();
+            var tint = ImGui.ColorConvertU32ToFloat4(Colors[(int)c]);
+            if(UiWidgets.TogglePill("vis", linked ? I18n.T("graph.ch.shared") : Label(c), show, I18n.T("graph.vis_tip"),
+                show ? FontAwesomeIcon.Eye : FontAwesomeIcon.EyeSlash, activeColor: tint, brioTheme: brioTheme))
+            { if(show) visible.Remove(c); else visible.Add(c); }
+            ImGui.SameLine(0, 2f * s);
+            if(UiWidgets.IconButton("lck", isLocked ? FontAwesomeIcon.Lock : FontAwesomeIcon.LockOpen,
+                isLocked ? I18n.T("graph.locked_tip") : I18n.T("graph.lock_tip"), sq, active: isLocked, subtle: !isLocked, activeColor: XcpStyle.Warning, brioTheme: brioTheme))
+            { if(isLocked) locked.Remove(c); else locked.Add(c); End(); }
+            ImGui.PopID();
         }
-        ImGui.NewLine();
+
+        ImGui.SameLine(0, 10f * s);
         if(linked)
         {
             ImGui.BeginDisabled(locked.Count > 0);
-            if(ImGui.Button("解除联动")) { End(); timeline.Snapshot(); foreach(var i in shot.Intervals) i.Unlink(); visible.UnionWith(Enum.GetValues<CameraChannel>()); timeline.Touch(); }
+            if(UiWidgets.IconTextButton("unlink", FontAwesomeIcon.Unlink, I18n.T("graph.unlink"),
+                I18n.T("graph.unlink_tip"), brioTheme: brioTheme))
+            { End(); timeline.Snapshot(); foreach(var i in shot.Intervals) i.Unlink(); visible.UnionWith(Enum.GetValues<CameraChannel>()); timeline.Touch(); }
             ImGui.EndDisabled();
         }
         else
         {
-            ImGui.SetNextItemWidth(100); ImGui.Combo("联动来源", ref linkSource, "位置\0旋转\0FoV\0"); ImGui.SameLine();
+            ImGui.SetNextItemWidth(86f * s);
+            ImGui.Combo("##linksrc", ref linkSource, I18n.Combo("graph.ch.pos", "graph.ch.rot", "graph.ch.fov"));
+            UiWidgets.Tooltip(I18n.T("graph.link_src_tip"));
+            ImGui.SameLine(0, 3f * s);
             ImGui.BeginDisabled(locked.Count > 0);
-            if(ImGui.Button("联动并替换其他节奏"))
+            if(UiWidgets.IconTextButton("link", FontAwesomeIcon.Link, I18n.T("graph.link"),
+                I18n.T("graph.link_tip"), brioTheme: brioTheme))
             { End(); timeline.Snapshot(); foreach(var i in shot.Intervals) { i.Link((CameraChannel)linkSource); i.MarkManual(); } timeline.Touch(); }
             ImGui.EndDisabled();
-            ImGui.TextDisabled("联动会用来源替换另外两组节奏，可撤销。");
         }
+
         ImGui.SameLine();
         ImGui.BeginDisabled(locked.Count > 0);
-        if(ImGui.Button("恢复按时间平滑")) { End(); timeline.Snapshot(); SmoothTiming.Apply(shot, true); shot.ActivateSimpleTiming(); timeline.Touch(); Status = "已恢复整段按时间平滑：首尾缓入缓出，中间节点平滑通过。"; }
+        if(UiWidgets.IconTextButton("smooth", FontAwesomeIcon.WaveSquare, I18n.T("graph.auto_smooth"),
+            I18n.T("graph.auto_smooth_tip"), brioTheme: brioTheme))
+        { End(); timeline.Snapshot(); SmoothTiming.Apply(shot, true); shot.ActivateSimpleTiming(); timeline.Touch(); Status = I18n.T("graph.status_smoothed"); }
         ImGui.EndDisabled();
-        ImGui.SameLine(); if(ImGui.Button("适配整段")) fit = true;
-        ImGui.SetNextItemWidth(100); ImGui.Combo("插值", ref interpolation, "贝塞尔\0线性\0恒定\0"); ImGui.SameLine();
-        ImGui.SetNextItemWidth(100); ImGui.Combo("范围", ref scope, "所选关键帧\0可见时间组\0整段\0"); ImGui.SameLine();
-        if(ImGui.Button("应用插值")) Apply(shot, timeline, refs, false);
+
+        ImGui.SameLine();
+        if(UiWidgets.IconTextButton("fit_simple", FontAwesomeIcon.Expand, I18n.T("common.fit_all"), I18n.T("graph.fit_simple_tip"), brioTheme: brioTheme))
+            fit = true;
+
+        // ---- Row 2: interpolation + handles + insert/delete ----
+        ImGui.SetNextItemWidth(92f * s); ImGui.Combo("##s_interp", ref interpolation, I18n.Combo("graph.interp.bezier", "graph.interp.linear", "graph.interp.constant"));
+        UiWidgets.Tooltip(I18n.T("graph.interp_tip"));
+        ImGui.SameLine(0, 3f * s);
+        ImGui.SetNextItemWidth(116f * s); ImGui.Combo("##s_scope", ref scope, I18n.Combo("graph.scope.selected", "graph.scope.visible", "graph.scope.shot"));
+        UiWidgets.Tooltip(I18n.T("graph.scope_tip"));
+        ImGui.SameLine(0, 3f * s);
+        if(ImGui.Button($"{I18n.T("graph.apply_interp")}##s_app_i")) Apply(shot, timeline, refs, false);
+
+        ImGui.SameLine(0, 8f * s);
         ImGui.BeginDisabled(interpolation != 0);
-        ImGui.SetNextItemWidth(120); ImGui.Combo("手柄模式", ref handleMode, "自动钳制\0自动\0对齐\0自由\0向量\0"); ImGui.SameLine();
-        if(ImGui.Button("应用手柄")) Apply(shot, timeline, refs, true);
+        ImGui.SetNextItemWidth(108f * s); ImGui.Combo("##s_handle", ref handleMode, I18n.Combo("graph.hmode.auto_clamped", "graph.hmode.auto", "graph.hmode.aligned", "graph.hmode.free", "graph.hmode.vector"));
+        UiWidgets.Tooltip(I18n.T("graph.hmode_tip"));
+        ImGui.SameLine(0, 3f * s);
+        if(ImGui.Button($"{I18n.T("graph.apply_handle")}##s_app_h")) Apply(shot, timeline, refs, true);
         ImGui.EndDisabled();
-        ImGui.TextDisabled("贝塞尔只是一种插值；手柄模式独立设置。默认节奏按整段计算，不在每个节点重新缓入缓出。");
+
+        ImGui.SameLine(0, 10f * s);
         int cursor = (int)Math.Round(timeline.Playhead);
-        ImGui.SetNextItemWidth(90); if(ImGui.InputInt("播放帧", ref cursor)) { timeline.Playhead = Math.Clamp(cursor, 0, timeline.Length); PlayheadChanged = true; }
-        ImGui.SameLine(); if(ImGui.Button("添加关键帧/相机节点"))
+        ImGui.SetNextItemWidth(68f * s);
+        if(ImGui.InputInt("##s_cur", ref cursor, 0)) { timeline.Playhead = Math.Clamp(cursor, 0, timeline.Length); PlayheadChanged = true; }
+        UiWidgets.Tooltip(I18n.T("graph.playhead_tip"));
+        ImGui.SameLine(0, 3f * s);
+        if(UiWidgets.IconTextButton("s_ins", FontAwesomeIcon.Plus, I18n.T("graph.insert_node"), I18n.T("graph.insert_node_tip"), brioTheme: brioTheme))
         {
-            if(locked.Count > 0) Status = "添加节点会同步全部通道，请先解除锁定。";
+            if(locked.Count > 0) Status = I18n.T("graph.insert_node_locked");
             else try { timeline.AddSampledNode(shot, cursor); selectionRevision = -1; }
                 catch(InvalidOperationException ex) { Status = ex.Message; }
             ImGui.PopID(); return;
         }
-        ImGui.SameLine(); if(ImGui.Button("删除所选节点")) { Delete(timeline, refs); ImGui.PopID(); return; }
+        ImGui.SameLine(0, 3f * s);
+        if(UiWidgets.IconButton("s_del", FontAwesomeIcon.TrashAlt, I18n.T("graph.delete_node_tip"), brioTheme: brioTheme))
+        { Delete(timeline, refs); ImGui.PopID(); return; }
+
         var primary = refs.FirstOrDefault(r => selected.Contains(r.Key.Id));
         if(primary.Key != null)
         {
             int f = primary.Key.Frame; double value = Global(shot, primary, primary.Key.Value) * 100;
-            ImGui.SetNextItemWidth(90); bool changed = ImGui.InputInt("关键帧", ref f, 1, 10, "%d", ImGuiInputTextFlags.EnterReturnsTrue);
-            ImGui.SameLine(); ImGui.BeginDisabled(primary.Key.NodeId.HasValue); ImGui.SetNextItemWidth(110);
-            bool valueChanged = ImGui.InputDouble("整段进度 %", ref value, 0, 0, "%.4f", ImGuiInputTextFlags.EnterReturnsTrue); ImGui.EndDisabled();
+            ImGui.SetNextItemWidth(76f * s); bool changed = ImGui.InputInt($"{I18n.T("common.frame")}##skf", ref f, 1, 10, "%d", ImGuiInputTextFlags.EnterReturnsTrue);
+            ImGui.SameLine(); ImGui.BeginDisabled(primary.Key.NodeId.HasValue); ImGui.SetNextItemWidth(96f * s);
+            bool valueChanged = ImGui.InputDouble($"{I18n.T("graph.progress_pct")}##skv", ref value, 0, 0, "%.3f", ImGuiInputTextFlags.EnterReturnsTrue); ImGui.EndDisabled();
             if(changed || valueChanged) Move(shot, timeline, primary, f, Local(shot, primary, value / 100), false);
+            ImGui.SameLine(); ImGui.TextDisabled($"· {Label(primary.Channel)} · F{shot.Start}–F{shot.End}");
         }
-        var origin = ImGui.GetCursorScreenPos(); float width = Math.Max(300, ImGui.GetContentRegionAvail().X), h = 340;
-        var plot = origin + new Vector2(0, 24); var end = origin + new Vector2(width, h);
+
+        ImGui.Spacing();
+        float statusReserve = string.IsNullOrEmpty(Status) ? 4f * s : ImGui.GetTextLineHeightWithSpacing() + 6f * s;
+        var origin = ImGui.GetCursorScreenPos();
+        float width = MathF.Max(260f * s, ImGui.GetContentRegionAvail().X);
+        float h = MathF.Max(210f * s, ImGui.GetContentRegionAvail().Y - statusReserve);
+        float rulerH = 23f * s;
+        var plot = origin + new Vector2(0, rulerH); var end = origin + new Vector2(width, h);
         if(fit) { left = shot.Start - Math.Max(2, (shot.End - shot.Start) * .04); span = Math.Max(4, (shot.End - shot.Start) * 1.08); bottom = -.1; height = 1.2; fit = false; }
         float X(double f) => origin.X + (float)((f - left) / span * width);
-        float Y(double v) => end.Y - (float)((v - bottom) / height * (h - 24));
+        float Y(double v) => end.Y - (float)((v - bottom) / height * (h - rulerH));
         double F(float x) => left + (x - origin.X) / width * span;
-        double V(float y) => bottom + (end.Y - y) / (h - 24) * height;
+        double V(float y) => bottom + (end.Y - y) / (h - rulerH) * height;
         ImGui.InvisibleButton("##shotcanvas", new Vector2(width, h), ImGuiButtonFlags.MouseButtonLeft | ImGuiButtonFlags.MouseButtonMiddle);
         bool hovered = ImGui.IsItemHovered(); var io = ImGui.GetIO(); var mouse = io.MousePos;
         if(hovered && io.MouseWheel != 0)
         {
             ViewportMath.Wheel(ref left, ref span, ref bottom, ref height, io.MouseWheel,
                 shortcuts.Held(Shortcut.ZoomX) || shortcuts.Held(Shortcut.ZoomY),
-                shortcuts.Held(Shortcut.ScrollY) || shortcuts.Held(Shortcut.ZoomY), (mouse.X - origin.X) / width, (end.Y - mouse.Y) / (h - 24));
+                shortcuts.Held(Shortcut.ScrollY) || shortcuts.Held(Shortcut.ZoomY), (mouse.X - origin.X) / width, (end.Y - mouse.Y) / (h - rulerH));
         }
-        var dl = ImGui.GetWindowDrawList(); dl.PushClipRect(origin, end, true); dl.AddRectFilled(origin, end, 0xFF202020);
+        var dl = ImGui.GetWindowDrawList();
+        dl.PushClipRect(origin, end, true);
+        dl.AddRectFilled(origin, end, XcpStyle.CanvasBg(brioTheme));
+        dl.AddRectFilled(origin, new Vector2(end.X, plot.Y), XcpStyle.CanvasRuler(brioTheme));
         double step = Math.Max(1, Math.Pow(10, Math.Floor(Math.Log10(span / 10))));
         for(double f = Math.Ceiling(left / step) * step; f <= left + span; f += step)
-        { dl.AddLine(new(X(f), plot.Y), new(X(f), end.Y), 0x304F4F4F); dl.AddText(new(X(f) + 2, origin.Y + 2), 0xFFAAAAAA, f.ToString("0")); }
-        for(int n = 0; n <= 4; n++) { float y = Y(n / 4.0); dl.AddLine(new(origin.X, y), new(end.X, y), 0x304F4F4F); dl.AddText(new(origin.X + 2, y), 0xFF888888, $"{n * 25}%"); }
+        { dl.AddLine(new(X(f), plot.Y), new(X(f), end.Y), XcpStyle.CanvasGrid(brioTheme)); dl.AddText(new(X(f) + 3, origin.Y + 2), 0xFFC0C0CC, f.ToString("0")); }
+        for(int n = 0; n <= 4; n++) { float y = Y(n / 4.0); dl.AddLine(new(origin.X, y), new(end.X, y), XcpStyle.CanvasGrid(brioTheme)); dl.AddText(new(origin.X + 3, y + 1), 0xFF8C8C9A, $"{n * 25}%"); }
         foreach(var hold in shot.Holds) dl.AddRectFilled(new(X(hold.start), plot.Y), new(X(hold.end), end.Y), 0x3040B0E0);
         Hit? hit = null; float nearest = 9;
         void Candidate(Hit item) { float d = Vector2.Distance(item.Point, mouse); if(hovered && d < nearest) { nearest = d; hit = item; } }
@@ -188,12 +264,13 @@ public sealed class GraphEditor
                 }
             }
         }
-        dl.AddLine(new(X(timeline.Playhead), origin.Y), new(X(timeline.Playhead), end.Y), 0xFF5555FF, 2);
+        dl.AddLine(new(X(timeline.Playhead), origin.Y), new(X(timeline.Playhead), end.Y), XcpStyle.CanvasPlayhead(brioTheme), 2);
         if(box is Vector2 b0) dl.AddRect(Vector2.Min(b0, mouse), Vector2.Max(b0, mouse), 0xFFFFFF55);
         dl.PopClipRect();
+        dl.AddRect(origin, end, XcpStyle.CardBorderU32(brioTheme), 3f * s, ImDrawFlags.None, 1f);
         if(hovered && ImGui.IsMouseClicked(ImGuiMouseButton.Middle)) { panning = true; lastMouse = mouse; }
         if(panning && (ImGui.IsMouseDown(ImGuiMouseButton.Middle) || ImGui.IsMouseDown(ImGuiMouseButton.Left)))
-        { left -= (mouse.X - lastMouse.X) / width * span; bottom += (mouse.Y - lastMouse.Y) / (h - 24) * height; lastMouse = mouse; }
+        { left -= (mouse.X - lastMouse.X) / width * span; bottom += (mouse.Y - lastMouse.Y) / (h - rulerH) * height; lastMouse = mouse; }
         if(!ImGui.IsMouseDown(ImGuiMouseButton.Middle) && !ImGui.IsMouseDown(ImGuiMouseButton.Left)) panning = false;
         if(hovered && ImGui.IsMouseClicked(ImGuiMouseButton.Left))
         {
@@ -228,7 +305,7 @@ public sealed class GraphEditor
                 if(dragHandle)
                 {
                     Before(timeline); shot.ActivateSimpleTiming(); var curve = r.Leg.Curve(r.Channel);
-                    double value = Local(shot, r, Global(shot, r, originalHandle.Y) + (press.Y - mouse.Y) / (h - 24) * height);
+                    double value = Local(shot, r, Global(shot, r, originalHandle.Y) + (press.Y - mouse.Y) / (h - rulerH) * height);
                     curve.SetHandle(r.Key, dragRight, new Vector2(originalHandle.X + (mouse.X - press.X) / width * (float)span, (float)value));
                     ProgressCurve.Constrain(curve, r.Leg.Start, r.Leg.End); r.Leg.MarkManual(); timeline.Touch();
                 }
@@ -257,8 +334,8 @@ public sealed class GraphEditor
             blankClick = false;
             End();
         }
-        if(hovered && hit is Hit hover) ImGui.SetTooltip($"{Label(hover.Item.Channel)} · F{hover.Item.Key.Frame} · 整段进度 {Global(shot, hover.Item, hover.Item.Key.Value) * 100:0.###}%");
-        ImGui.TextWrapped(Status);
+        if(hovered && hit is Hit hover) ImGui.SetTooltip(I18n.T("graph.hover_simple", Label(hover.Item.Channel), hover.Item.Key.Frame, $"{Global(shot, hover.Item, hover.Item.Key.Value) * 100:0.###}"));
+        if(!string.IsNullOrEmpty(Status)) ImGui.TextDisabled(Status);
         ImGui.PopID();
     }
 
@@ -273,7 +350,7 @@ public sealed class GraphEditor
             var targets = starts.ToDictionary(p => p.Key, p => p.Value + delta);
             if(targets.All(p => timeline.AllKeys.Any(k => k.Id == p.Key && k.Frame == p.Value))) return;
             if(gesture) Before(timeline); else timeline.Snapshot();
-            if(!timeline.MoveNodes(targets)) Status = "移动被拒绝：节点顺序、时间范围或进度键碰撞。";
+            if(!timeline.MoveNodes(targets)) Status = I18n.T("graph.move_rejected");
             return;
         }
         var curve = item.Leg.Curve(item.Channel);
@@ -310,7 +387,7 @@ public sealed class GraphEditor
     }
     private void Delete(CamTimeline timeline, List<Ref> refs)
     {
-        if(locked.Count > 0) { Status = "删除节点会同步全部通道，请先解除锁定。"; return; }
+        if(locked.Count > 0) { Status = I18n.T("graph.delete_locked"); return; }
         var ids = refs.Where(r => selected.Contains(r.Key.Id) && r.Key.NodeId.HasValue).Select(r => r.Key.NodeId!.Value)
             .Concat(timeline.SelectedNodes).Distinct().ToArray();
         End(); timeline.DeleteNodes(ids); selected.Clear(); selectionRevision = -1;
@@ -327,5 +404,5 @@ public sealed class GraphEditor
     private static double Local(ShotCurves shot, Ref item, double global) { var w = Weight(shot, item.Leg, item.Channel); return (global - w.start) / w.size; }
     private void Before(CamTimeline timeline) { if(!snapshot) { timeline.Snapshot(); snapshot = true; } }
     private void End() { drag = null; scrubbing = false; box = null; snapshot = false; }
-    private static string Label(CameraChannel channel) => channel switch { CameraChannel.Position => "位置", CameraChannel.Rotation => "旋转", _ => "FoV" };
+    private static string Label(CameraChannel channel) => channel switch { CameraChannel.Position => I18n.T("graph.ch.pos"), CameraChannel.Rotation => I18n.T("graph.ch.rot"), _ => I18n.T("graph.ch.fov") };
 }

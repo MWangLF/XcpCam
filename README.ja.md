@@ -1,7 +1,7 @@
 # XcpCam - FFXIV GPose ビジュアルカメラワーク編集プラグイン
 
 <p>
-  <a href="https://github.com/MWangLF/XcpCam/releases"><img alt="Release" src="https://img.shields.io/github/v/release/MWangLF/XcpCam?include_prereleases&style=flat-square&label=Release&color=blue"></a>
+  <a href="https://github.com/MWangLF/XcpCam/releases"><img alt="Release" src="https://img.shields.io/github/v/release/MWangLF/XcpCam?style=flat-square&label=Release&color=blue"></a>
   <a href="https://github.com/MWangLF/XcpCam/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/MWangLF/XcpCam/total?style=flat-square&label=Downloads&color=blue"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/MWangLF/XcpCam?style=flat-square&label=License&color=blue"></a>
 </p>
@@ -13,16 +13,19 @@
   <a href="README.ko.md"><img alt="한국어" src="https://img.shields.io/badge/%ED%95%9C%EA%B5%AD%EC%96%B4-lightgrey?style=flat-square"></a>
 </p>
 
-> **現在のバージョン：0.0.6.4（Pre-release）**。継続的に開発中のため、不具合報告やご要望は [GitHub Issues](https://github.com/MWangLF/XcpCam/issues) までお寄せください。
+> **現在のバージョン：0.1.0.0**。継続的に開発中のため、不具合報告やご要望は [GitHub Issues](https://github.com/MWangLF/XcpCam/issues) までお寄せください。
 
 **XcpCam** は、FFXIV のグループポーズ（GPose）内でカメラワークを直感的に作成・編集できる Dalamud プラグインです。ゲーム画面上にカメラノード、Blender 風の 3D カーブ、ボーン追従コンストレイントを配置し、フレーム単位のマルチトラックタイムラインとグラフエディタで自在に調整できます。XAT / Brio 互換の `.xcp` 書き出しはもちろん、**Brio** の Vivacity タイムラインやアニメーションとのリアルタイム連携にも対応しています。
 
 ## 主な特徴・機能
 
+- **モダンなワークスペース＆多言語 UI**
+  - **Brio Dark ＋ Blender 風 N パネル**の左右分割レイアウトを採用（Dalamud テーマ追従に切替可能）。パス・コンストレイント・Brio 連携・設定は独立したサブウィンドウで開け、タイムライン編集を妨げません。
+  - メインウィンドウを閉じても操作できる**画面下部固定のミニタイムライン**と**フローティングツールバー**を搭載。**簡体字中国語 / English / 日本語 / 한국어**の 4 言語に対応し、標準でゲーム内言語に自動追従（設定からいつでも変更可能）。
 - **ゲーム画面上でそのまま編集**
   - カメラ軌道（速度に応じた青〜赤の色分け表示）、カメラ視錐台、カット位置、ターゲット照準線をリアルタイム表示。
   - カメラノード・カーブ制御点・ベジェハンドルを直接クリック選択。ギズモが選択対象に自動追従し、移動・回転・拡縮、ローカル座標、スナップ、複数選択グループの一括移動・回転に対応。
-  - プレビューノードの右クリックメニュー、GPose 開始時の自動起動（設定で切替可）、ショートカットの自由なカスタマイズに対応。
+  - プレビューノードの右クリックメニュー、GPose の開始／終了に合わせた自動開閉（手動で開いた場合は自動終了しません）、ショートカットの自由なカスタマイズに対応。
 - **マルチトラックタイムラインとカット編集**
   - フレーム単位の複数トラック管理に対応。優先度レイヤー、ミュート／ソロ、ドラッグによるタイミング調整、ホールドフレーム、範囲選択、複数ステップのアンドゥ／リドゥが可能。
   - **同一トラック内カット**と**複数トラック切り替えカット**の両方に対応し、ライブプレビューや Brio へのベイクでは完全な瞬間カットを実現。
